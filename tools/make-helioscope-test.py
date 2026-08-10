@@ -91,25 +91,22 @@ def ring(poly, lat0, lon0, alt):
     return " ".join("%.8f,%.8f,%.2f" % (lon, lat, alt) for lat, lon in pts)
 
 
-def build_vector_kml(lat0, lon0):
-    out = ['<?xml version="1.0" encoding="UTF-8"?>',
-           '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>',
-           "<name>Eagle Eye — HelioScope VECTOR probe</name>",
-           "<description>%s</description>" % esc(
-               "Vector geometry probe. The SCALE BAR is exactly 20.000 m. "
-               "Heights are encoded in placemark names and in ExtendedData. "
-               "Anchor %.6f, %.6f. Plan +Y is true north." % (lat0, lon0)),
-           '<Style id="ee-obst"><LineStyle><color>ff37afd4</color><width>2</width></LineStyle>'
-           "<PolyStyle><color>5537afd4</color></PolyStyle></Style>",
-           '<Style id="ee-outline"><LineStyle><color>ffe8f0f4</color><width>3</width></LineStyle>'
-           "<PolyStyle><fill>0</fill></PolyStyle></Style>",
-           "<Folder><name>Roof outline</name><Placemark><name>Roof outline 40 x 30 m</name>"
-           "<styleUrl>#ee-outline</styleUrl><Polygon><extrude>0</extrude>"
-           "<altitudeMode>clampToGround</altitudeMode><outerBoundaryIs><LinearRing><coordinates>"
-           + ring(ROOF, lat0, lon0, 0) +
-           "</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Folder>",
-           "<Folder><name>Obstructions</name>"]
+LABEL_LIFT = 1.0     # metres a floating name hangs above its object
 
+STYLES = (
+    '<Style id="ee-obst"><LineStyle><color>ff37afd4</color><width>2</width></LineStyle>'
+    "<PolyStyle><color>5537afd4</color></PolyStyle></Style>"
+    '<Style id="ee-outline"><LineStyle><color>ffe8f0f4</color><width>3</width></LineStyle>'
+    "<PolyStyle><fill>0</fill></PolyStyle></Style>"
+    # scale 0 hides the pin; the text and its tether are the whole point
+    '<Style id="ee-label"><IconStyle><scale>0</scale><Icon></Icon></IconStyle>'
+    "<LabelStyle><scale>0.95</scale><color>ffffffff</color></LabelStyle>"
+    "<LineStyle><color>99ffffff</color><width>2</width></LineStyle></Style>"
+)
+
+
+def obstruction_placemarks(lat0, lon0):
+    out = []
     for name, h, poly in SHAPES:
         out.append(
             "<Placemark><name>%s</name><styleUrl>#ee-obst</styleUrl>"
@@ -121,9 +118,85 @@ def build_vector_kml(lat0, lon0):
             "<outerBoundaryIs><LinearRing><coordinates>%s</coordinates></LinearRing>"
             "</outerBoundaryIs></Polygon></Placemark>"
             % (esc(name), h, len(poly), ring(poly, lat0, lon0, h)))
+    return "".join(out)
 
-    out.append("</Folder></Document></kml>")
-    return "\n".join(out)
+
+def label_placemarks(lat0, lon0):
+    """Names hung in the air above each object, on a tether.
+
+    A label drawn on the ground disappears under the first thing placed on top of
+    it. relativeToGround altitude lifts it clear, and extrude keeps a line down to
+    the object so it still reads as attached when the view tilts.
+    """
+    out = []
+    for name, h, poly in SHAPES:
+        cx = sum(q[0] for q in poly) / len(poly)
+        cy = sum(q[1] for q in poly) / len(poly)
+        lat, lon = to_lat_lon(cx, cy, lat0, lon0)
+        out.append(
+            "<Placemark><name>%s</name><styleUrl>#ee-label</styleUrl>"
+            "<Point><extrude>1</extrude><altitudeMode>relativeToGround</altitudeMode>"
+            "<coordinates>%.8f,%.8f,%.2f</coordinates></Point></Placemark>"
+            % (esc(name), lon, lat, h + LABEL_LIFT))
+    return "".join(out)
+
+
+def outline_placemark(lat0, lon0):
+    return ("<Placemark><name>Roof outline 40 x 30 m</name>"
+            "<styleUrl>#ee-outline</styleUrl><Polygon><extrude>0</extrude>"
+            "<altitudeMode>clampToGround</altitudeMode><outerBoundaryIs><LinearRing>"
+            "<coordinates>%s</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>"
+            % ring(ROOF, lat0, lon0, 0))
+
+
+def build_vector_kml(lat0, lon0):
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+            "<name>Eagle Eye — HelioScope VECTOR probe</name>"
+            "<description>%s</description>%s"
+            "<Folder><name>Roof outline</name>%s</Folder>"
+            "<Folder><name>Obstructions</name>%s</Folder>"
+            "<Folder><name>Labels</name>%s</Folder>"
+            "</Document></kml>"
+            % (esc("Vector probe. SCALE BAR is exactly 20.000 m. Heights are in the "
+                   "placemark names and in ExtendedData, and the Labels folder floats "
+                   "each name %.2f m above its object so it is not buried by anything "
+                   "placed on the deck. Anchor %.6f, %.6f. Plan +Y is true north."
+                   % (LABEL_LIFT, lat0, lon0)),
+               STYLES, outline_placemark(lat0, lon0),
+               obstruction_placemarks(lat0, lon0), label_placemarks(lat0, lon0)))
+
+
+def build_combined_kml(lat0, lon0):
+    """Everything in one document: tracing base, 3D volumes, floating names.
+
+    This is what the app itself now emits, so the probe tests the real product
+    rather than a simplified stand-in.
+    """
+    m_lat, m_lon = metres_per_deg(lat0)
+    north = lat0 + (CENTRE[1] + EXT_H / 2) / m_lat
+    south = lat0 + (CENTRE[1] - EXT_H / 2) / m_lat
+    east = lon0 + (CENTRE[0] + EXT_W / 2) / m_lon
+    west = lon0 + (CENTRE[0] - EXT_W / 2) / m_lon
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+            "<name>Eagle Eye — HelioScope COMBINED probe</name>"
+            "<description>%s</description>%s"
+            "<GroundOverlay><name>Deck</name><drawOrder>0</drawOrder>"
+            "<Icon><href>files/overlay.png</href></Icon>"
+            "<LatLonBox><north>%.9f</north><south>%.9f</south>"
+            "<east>%.9f</east><west>%.9f</west><rotation>0</rotation>"
+            "</LatLonBox></GroundOverlay>"
+            "<Folder><name>Roof outline</name>%s</Folder>"
+            "<Folder><name>Obstructions</name>%s</Folder>"
+            "<Folder><name>Labels</name>%s</Folder>"
+            "</Document></kml>"
+            % (esc("Deck raster to trace on, 3D volumes standing on it, and names "
+                   "floating %.2f m clear of both. Scale bar 20.000 m."
+                   % LABEL_LIFT),
+               STYLES, north, south, east, west,
+               outline_placemark(lat0, lon0),
+               obstruction_placemarks(lat0, lon0), label_placemarks(lat0, lon0)))
 
 
 # ---------------------------------------------------------------- raster KMZ
@@ -186,18 +259,16 @@ def build_overlay_png(path):
     d.line(ring_px, fill=DARK, width=12)
     d.line(ring_px, fill=MAGENTA, width=6)
 
-    f_lbl = font(30, True)
+    # Light fill only. This raster is something to TRACE ON, so the roof beneath
+    # has to stay readable; and no per-object text, because a name painted on the
+    # deck is buried the moment anything is placed over it. Names ride in the
+    # vector layer instead, floating above each object.
     for name, h, poly in SHAPES:
         if name.startswith("SCALE BAR"):
             continue                              # drawn separately, below
         pts = [P(*q) for q in poly]
-        d.polygon(pts, fill=(212, 175, 55, 150), outline=DARK)
+        d.polygon(pts, fill=(212, 175, 55, 40), outline=DARK)
         d.line(pts + [pts[0]], fill=(232, 201, 106, 255), width=4)
-        cx = sum(q[0] for q in poly) / len(poly)
-        cy = sum(q[1] for q in poly) / len(poly)
-        tx, ty = P(cx, cy)
-        d.text((tx + 10, ty - 46), name, font=f_lbl, fill=(255, 255, 255, 250),
-               stroke_width=5, stroke_fill=(0, 0, 0, 220))
 
     # Scale bar as alternating 5 m blocks — the one mark that must be unambiguous
     # on any background, so it is drawn black-and-white with a hard border.
@@ -270,7 +341,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     vec = os.path.join(a.out, "helioscope-probe-vector.kml")
     png = os.path.join(a.out, "overlay.png")
-    kmz = os.path.join(a.out, "helioscope-probe-overlay.kmz")
+    kmz = os.path.join(a.out, "helioscope-probe-combined.kmz")
 
     with open(vec, "w", encoding="utf-8") as fh:
         fh.write(build_vector_kml(a.lat, a.lon))
@@ -279,13 +350,13 @@ def main():
 
     # KMZ is a plain zip: exactly one .kml at the root, images by relative path.
     with zipfile.ZipFile(kmz, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("doc.kml", build_overlay_kml(a.lat, a.lon))
+        z.writestr("doc.kml", build_combined_kml(a.lat, a.lon))
         z.write(png, "files/overlay.png")
 
     print("anchor        %.6f, %.6f" % (a.lat, a.lon))
     print("vector KML    %s  (%.1f KB)" % (vec, os.path.getsize(vec) / 1024))
     print("overlay PNG   %s  (%d x %d px, %.1f KB)" % (png, w, h, os.path.getsize(png) / 1024))
-    print("raster KMZ    %s  (%.1f KB)" % (kmz, os.path.getsize(kmz) / 1024))
+    print("combined KMZ  %s  (%.1f KB)" % (kmz, os.path.getsize(kmz) / 1024))
     verify(a.lat, a.lon, vec, kmz, w, h)
 
 
@@ -317,10 +388,21 @@ def verify(lat0, lon0, vec_path, kmz_path, px_w, px_h):
     ok &= abs(length - 20.0) < 0.002 and abs(width - 0.6) < 0.002
 
     n_pm = len(re.findall(r"<Placemark>", kml))
-    print("  vector placemarks  %d  (1 outline + %d obstructions)" % (n_pm, len(SHAPES)))
-    ok &= n_pm == len(SHAPES) + 1
+    want = 1 + 2 * len(SHAPES)          # outline + obstruction + label per shape
+    print("  vector placemarks  %d  (1 outline + %d obstructions + %d labels)"
+          % (n_pm, len(SHAPES), len(SHAPES)))
+    ok &= n_pm == want
     ok &= "RTU-1 h=1.22m" in kml
     print("  heights in names   %s" % ("yes" if "RTU-1 h=1.22m" in kml else "MISSING"))
+
+    # labels must hang above their object, not on the deck
+    alts = [float(c.rsplit(",", 1)[1]) for c in
+            re.findall(r"<Point><extrude>1</extrude><altitudeMode>relativeToGround"
+                       r"</altitudeMode><coordinates>([^<]+)</coordinates>", kml)]
+    print("  floating labels    %d, altitudes %.2f-%.2f m (lift %.2f)"
+          % (len(alts), min(alts), max(alts), LABEL_LIFT))
+    ok &= len(alts) == len(SHAPES) and min(alts) >= LABEL_LIFT - 1e-9
+    ok &= abs(max(alts) - (max(h for _, h, _ in SHAPES) + LABEL_LIFT)) < 1e-6
 
     # --- raster: does the LatLonBox imply the same metres per pixel? ---
     with zipfile.ZipFile(kmz_path) as z:

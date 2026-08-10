@@ -147,19 +147,38 @@ Overlay:
 
 | file | result |
 |---|---|
-| **KMZ** | lands at **true scale**, correctly placed |
-| **KML** | lands at **true scale**, correctly placed |
+| **KMZ** | true scale, correctly placed |
+| **KML** | true scale, correctly placed, renders as **3D extruded volumes** at their real heights |
 | bare **PNG** | *unscaled* — has to be placed by hand |
 
-The PNG result is not a defect: a PNG contains no coordinates, so there is nothing for
-HelioScope to scale it by. That is the entire reason the KMZ exists — it is the same image
-plus a `LatLonBox` saying where its corners belong. **Use the KMZ.** The bare PNG is only
-worth having as a movable fallback when the georeferencing itself is suspect.
+Two things follow, and they shape the export.
 
-**KMZ overlay** *(Export tab, primary)* — the traced plan rendered north-up as a transparent
-PNG with a 20.000 m scale bar, north arrow, 5 m grid and every object labelled with its
-height, wrapped with a `GroundOverlay` at `rotation=0`. Sampling is chosen to stay inside
-HelioScope's ~3600 × 2400 px guidance; a 40 × 30 m roof comes out around 370 KB.
+**Imported geometry is not editable.** It is a *reference to trace over* — you redraw
+HelioScope's own obstructions on top of it and assign heights there. So the export is
+optimised for tracing, not for looking finished: light fills you can see the roof through,
+crisp outlines, and a scale bar to check against.
+
+**The PNG result is not a defect.** A PNG contains no coordinates, so there is nothing for
+HelioScope to scale it by. That is the entire reason the KMZ exists — the same image plus a
+`LatLonBox` saying where its corners belong. **Use the KMZ.** A bare PNG is only worth having
+as a movable fallback when the georeferencing itself is suspect.
+
+**KMZ** *(Export tab, primary)* — one file, three layers:
+
+1. **Deck raster** — the plan north-up as a transparent PNG: 5 m grid, 20.000 m scale bar,
+   north arrow, object outlines with a barely-there fill. `drawOrder 0`, so it sits under
+   everything.
+2. **3D volumes** — extruded polygons at each object's real height.
+3. **Floating labels** — each name hangs above its object on a tether, `relativeToGround`.
+
+That third layer exists because names *painted on the deck* are underneath the first thing
+placed over them. A `Point` at `h + lift` hangs the name in the air where it stays readable,
+and `extrude` draws a line down so it still reads as attached when the view tilts. The pin
+icon is suppressed; only the text and its leader are wanted. Lift is adjustable on the Export
+tab (default 1.0 m) — raise it to clear racking.
+
+Sampling is chosen to stay inside HelioScope's ~3600 × 2400 px guidance; a 40 × 30 m roof
+comes out around 350 KB.
 
 Rendered in **east/north**, not plan coordinates, because a `LatLonBox` is axis-aligned in
 lat/lon and its `<rotation>` is a separate spin about the box centre in an unspecified frame.
@@ -300,7 +319,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 175 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 189 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

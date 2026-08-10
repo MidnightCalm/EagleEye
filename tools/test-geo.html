@@ -619,17 +619,23 @@ function near(name, a, b, tol) {
   };
   var kml = EE.buildKML(project, { unit: 'm', nameTemplate: '{name} h={h}{u}', circleSegments: 24 });
   ok('kml produced', !!kml && kml.indexOf('<kml') === 0 === false && kml.indexOf('<kml') > 0);
-  ok('kml has three placemarks', (kml.match(/<Placemark>/g) || []).length === 3);
+  /* three geometries plus a floating label for each */
+  ok('kml has six placemarks', (kml.match(/<Placemark>/g) || []).length === 6,
+     (kml.match(/<Placemark>/g) || []).length);
   ok('kml encodes height in the name', kml.indexOf('RTU-1 h=1.2m') > 0);
   ok('kml carries ExtendedData height', kml.indexOf('<Data name="height_m"><value>1.200</value>') > 0);
   ok('kml extrudes obstructions', kml.indexOf('<extrude>1</extrude>') > 0);
   ok('outline is clamped, not extruded', kml.indexOf('clampToGround') > 0);
 
   /* Rings, in document order: the outline folder is written first, then the
-     obstructions in list order — outline, rect, cylinder. */
-  var all = kml.match(/<coordinates>([^<]+)<\/coordinates>/g).map(function (s) {
-    return s.replace(/<\/?coordinates>/g, '').trim().split(/\s+/);
-  });
+     obstructions in list order — outline, rect, cylinder.
+
+     Parsed rather than regexed, because label Points carry <coordinates> too and
+     a naive match counts them as rings. */
+  var kdoc = new DOMParser().parseFromString(kml, 'application/xml');
+  ok('kml is well-formed', !kdoc.querySelector('parsererror'));
+  var all = Array.prototype.map.call(kdoc.querySelectorAll('LinearRing > coordinates'),
+    function (n) { return n.textContent.trim().split(/\s+/); });
   ok('three rings emitted', all.length === 3, 'got ' + all.length);
   ok('ring is closed', all[0][0] === all[0][all[0].length - 1]);
 
@@ -652,6 +658,50 @@ function near(name, a, b, tol) {
   }, { unit: 'm', nameTemplate: '{name}' }).indexOf('A &amp; &lt;B&gt;') > 0);
 
   ok('no anchor -> no kml', EE.buildKML({ name: 'x', objects: [] }, {}) === null);
+
+  /* ---- floating labels ----
+     A name painted on the deck is buried by the first thing placed over it, so
+     labels hang above their object on a tether instead. */
+  var labelFolder = Array.prototype.filter.call(kdoc.querySelectorAll('Folder'), function (f) {
+    return f.querySelector('name').textContent === 'Labels';
+  })[0];
+  ok('a Labels folder exists', !!labelFolder);
+
+  var labels = {};
+  Array.prototype.forEach.call(labelFolder.querySelectorAll('Placemark'), function (pm) {
+    var c = pm.querySelector('Point > coordinates').textContent.split(',');
+    labels[pm.querySelector('name').textContent] = {
+      lon: +c[0], lat: +c[1], alt: +c[2],
+      mode: pm.querySelector('Point > altitudeMode').textContent,
+      tether: pm.querySelector('Point > extrude').textContent
+    };
+  });
+  ok('one label per named object', Object.keys(labels).length === 3, Object.keys(labels).join(' | '));
+
+  var lr = labels['RTU-1 h=1.2m'];
+  ok('label carries the formatted name with its height', !!lr, Object.keys(labels).join(' | '));
+  near('label floats at object height + default lift', lr.alt, 1.2 + 1.0, 1e-9);
+  ok('altitude is relative to ground', lr.mode === 'relativeToGround');
+  ok('a tether is drawn down to the deck', lr.tether === '1');
+  ok('the taller stack gets a higher label', labels['Stack h=2.5m'].alt > lr.alt,
+     labels['Stack h=2.5m'].alt);
+  ok('a flat outline still gets a readable lift', labels['Roof'].alt >= 1.0, labels['Roof'].alt);
+  ok('the pin icon is suppressed, leaving text and tether', /<IconStyle><scale>0<\/scale>/.test(kml));
+
+  near('label sits over its object centre (lon)', lr.lon, -79.5083, 1e-9);
+  near('label sits over its object centre (lat)', lr.lat, 43.7615, 1e-9);
+
+  /* lift is configurable, and can be switched off entirely */
+  var lifted = EE.buildKML(project, { unit: 'm', nameTemplate: '{name} h={h}{u}', labelLift: 3.5 });
+  var ld = new DOMParser().parseFromString(lifted, 'application/xml');
+  var alts = Array.prototype.map.call(ld.querySelectorAll('Point > coordinates'), function (n) {
+    return +n.textContent.split(',')[2];
+  });
+  near('a bigger lift raises every label', Math.min.apply(null, alts), 3.5, 1e-9);
+
+  var bare = EE.buildKML(project, { unit: 'm', nameTemplate: '{name}', labels: false });
+  ok('labels can be switched off', bare.indexOf('<Point>') < 0 &&
+     (bare.match(/<Placemark>/g) || []).length === 3);
 
   var ft = EE.fmtName('{name} h={h}{u}', 'RTU', 1.2192, 'ft');
   ok('name template converts to feet', ft === 'RTU h=4ft', ft);

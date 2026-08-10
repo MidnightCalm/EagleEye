@@ -1017,14 +1017,13 @@ var EE = (function () {
     };
   }
 
-  function buildGroundOverlayKML(box, opts) {
+  /* The overlay on its own, so it can either stand alone or be dropped into a
+     Document alongside the vector geometry — one KMZ carrying the tracing base,
+     the 3D volumes and the floating labels together. */
+  function groundOverlayFragment(box, opts) {
     opts = opts || {};
-    return '<?xml version="1.0" encoding="UTF-8"?>\n' +
-      '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' +
-      '<name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
-      '<description>' + xmlEsc(opts.description || '') + '</description>' +
-      '<GroundOverlay><name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
-      '<drawOrder>1</drawOrder>' +
+    return '<GroundOverlay><name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
+      '<drawOrder>0</drawOrder>' +
       '<Icon><href>' + xmlEsc(opts.href || 'files/plan.png') + '</href></Icon>' +
       '<LatLonBox>' +
       '<north>' + box.north.toFixed(9) + '</north>' +
@@ -1032,7 +1031,50 @@ var EE = (function () {
       '<east>' + box.east.toFixed(9) + '</east>' +
       '<west>' + box.west.toFixed(9) + '</west>' +
       '<rotation>0</rotation>' +
-      '</LatLonBox></GroundOverlay></Document></kml>';
+      '</LatLonBox></GroundOverlay>';
+  }
+
+  function buildGroundOverlayKML(box, opts) {
+    opts = opts || {};
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' +
+      '<name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
+      '<description>' + xmlEsc(opts.description || '') + '</description>' +
+      groundOverlayFragment(box, opts) +
+      '</Document></kml>';
+  }
+
+  /* A name floating above the object rather than painted on the roof.
+
+     Ground-drawn labels are unreadable the moment anything is placed on the deck —
+     they are underneath it. A Point at relativeToGround altitude hangs the name in
+     the air above its unit, and extrude draws a tether down so it stays attached
+     to something when the view tilts. The icon is suppressed; only the text and
+     its leader are wanted. */
+  function labelPlacemark(o, anchor, opts) {
+    var c = o.kind === 'cylinder' || o.kind === 'rect'
+      ? { x: o.cx, y: o.cy }
+      : (function () {
+        var pts = o.pts || [];
+        if (!pts.length) return null;
+        var sx = 0, sy = 0;
+        pts.forEach(function (q) { sx += q.x; sy += q.y; });
+        return { x: sx / pts.length, y: sy / pts.length };
+      })();
+    if (!c) return '';
+
+    var ll = localToLatLon(c, anchor);
+    var lift = opts.labelLift == null ? 1.0 : opts.labelLift;
+    var alt = (o.kind === 'outline' ? 0 : (o.h || 0)) + lift;
+    var text = o.kind === 'outline'
+      ? o.name
+      : fmtName(opts.nameTemplate, o.name, o.h || 0, opts.unit);
+
+    return '<Placemark><name>' + xmlEsc(text) + '</name>' +
+      '<styleUrl>#ee-label</styleUrl>' +
+      '<Point><extrude>1</extrude><altitudeMode>relativeToGround</altitudeMode>' +
+      '<coordinates>' + ll.lon.toFixed(8) + ',' + ll.lat.toFixed(8) + ',' + alt.toFixed(2) +
+      '</coordinates></Point></Placemark>';
   }
 
   function buildKML(project, opts) {
@@ -1043,12 +1085,19 @@ var EE = (function () {
     var outlines = project.objects.filter(function (o) { return o.kind === 'outline'; });
     var obst = project.objects.filter(function (o) { return o.kind !== 'outline'; });
 
-    var folder = function (name, list) {
+    var folder = function (name, list, fn) {
       if (!list.length) return '';
       return '<Folder><name>' + xmlEsc(name) + '</name>' +
-        list.map(function (o) { return placemark(o, anchor, opts); }).join('') +
+        list.map(function (o) { return fn(o, anchor, opts); }).join('') +
         '</Folder>';
     };
+
+    var labels = '';
+    if (opts.labels !== false) {
+      labels = folder('Labels', project.objects.filter(function (o) {
+        return o.kind !== 'point' && o.name;
+      }), labelPlacemark);
+    }
 
     return '<?xml version="1.0" encoding="UTF-8"?>\n' +
       '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' +
@@ -1061,8 +1110,14 @@ var EE = (function () {
       '<PolyStyle><color>5537afd4</color></PolyStyle></Style>' +
       '<Style id="ee-outline"><LineStyle><color>ffe8f0f4</color><width>3</width></LineStyle>' +
       '<PolyStyle><fill>0</fill></PolyStyle></Style>' +
-      folder('Roof outline', outlines) +
-      folder('Obstructions', obst) +
+      /* scale 0 hides the pin: the text and its tether are the whole point */
+      '<Style id="ee-label"><IconStyle><scale>0</scale><Icon></Icon></IconStyle>' +
+      '<LabelStyle><scale>0.95</scale><color>ffffffff</color></LabelStyle>' +
+      '<LineStyle><color>99ffffff</color><width>2</width></LineStyle></Style>' +
+      (opts.groundOverlay || '') +
+      folder('Roof outline', outlines, placemark) +
+      folder('Obstructions', obst, placemark) +
+      labels +
       '</Document></kml>';
   }
 
@@ -1106,7 +1161,7 @@ var EE = (function () {
     anchorFromTwoPoints: anchorFromTwoPoints,
     buildKML: buildKML, fmtName: fmtName, xmlEsc: xmlEsc,
     planToEastNorth: planToEastNorth, eastNorthBox: eastNorthBox,
-    buildGroundOverlayKML: buildGroundOverlayKML,
+    buildGroundOverlayKML: buildGroundOverlayKML, groundOverlayFragment: groundOverlayFragment,
     fmtLen: fmtLen, fmtArea: fmtArea, toM: toM, fromM: fromM
   };
 })();

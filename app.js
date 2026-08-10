@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.2.0';
+var VERSION = '1.3.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -60,6 +60,7 @@ var DEFAULTS = {
 
   /* The survey's declared error model. These three numbers decide the trusted
      radius of every standpoint, and therefore where coverage is green. */
+  labelLift: 1.0,      /* metres a floating name hangs above its object */
   tolerance: 0.25,     /* metres of position error the survey will accept */
   attSigma: 0.5,       /* degrees of attitude error assumed, 1-sigma */
   deckUnc: 0.08,       /* metres the deck may depart from the assumed plane */
@@ -987,11 +988,20 @@ function tplExport(p) {
     '<div class="kv"><span>Circle segments</span><span>' + s.circleSegments + '</span></div>' +
     '<div class="kv"><span>Photos on device</span><span>' + fmtBytes(ui.storageBytes) + '</span></div></div>' +
 
-    '<div class="btn-row"><button class="btn primary" data-act="export-kmz"' + (p.anchor ? '' : ' disabled') + '>Export KMZ overlay</button></div>' +
-    '<div class="hint">Confirmed on 2026-08-10: HelioScope takes a <b>KMZ at true scale</b> via ' +
-    'Designer → Advanced → Overlays. A bare PNG carries no coordinates, so it lands unscaled — ' +
-    'use the KMZ.</div>' +
-    '<div class="btn-row"><button class="btn ghost-gold" data-act="export-kml"' + (p.anchor ? '' : ' disabled') + '>Vector KML</button></div>' +
+    '<div class="panel"><span class="p-tag">FLOATING LABELS</span>' +
+    '<div class="p-body">Names hang <b>above</b> each object on a tether instead of being ' +
+    'painted on the deck, so they stay readable once modules are placed over them.</div>' +
+    '<div class="field"><label>HEIGHT ABOVE THE OBJECT</label><div class="unit-suffix">' +
+    '<input class="inp mono" id="lbl-lift" inputmode="decimal" value="' +
+    EE.fromM(s.labelLift, U()).toFixed(2) + '"><span>' + U() + '</span></div></div>' +
+    '<button class="btn ghost-gold sm" data-act="save-lift">Apply</button></div>' +
+
+    '<div class="btn-row"><button class="btn primary" data-act="export-kmz"' + (p.anchor ? '' : ' disabled') + '>Export KMZ</button></div>' +
+    '<div class="hint">One file, three layers: the flat <b>deck raster</b> to trace on, the ' +
+    '<b>3D volumes</b> standing on it, and the <b>names floating</b> clear of both.<br>' +
+    'Confirmed 2026-08-10 — KMZ and KML both land at true scale; a bare PNG carries no ' +
+    'coordinates and lands unscaled.</div>' +
+    '<div class="btn-row"><button class="btn ghost-gold" data-act="export-kml"' + (p.anchor ? '' : ' disabled') + '>Vector KML only</button></div>' +
     '<div class="btn-row">' +
     '<button class="btn ghost-gold" data-act="export-csv">Schedule CSV</button>' +
     '<button class="btn ghost" data-act="export-json">Backup JSON</button></div>' +
@@ -2394,6 +2404,11 @@ function handle(el, e) {
 
     case 'export-kml': return exportKml();
     case 'export-kmz': return exportKmz();
+    case 'save-lift': {
+      var lv = EE.toM(parseFloat($('#lbl-lift').value), U());
+      if (lv >= 0 && lv < 30) { db.settings.labelLift = lv; save(); toast('Labels float ' + EE.fmtLen(lv, U(), 2) + ' above'); }
+      return render();
+    }
     case 'export-csv': return exportCsv();
     case 'export-json': return exportJson();
   }
@@ -2923,7 +2938,9 @@ function exportKml() {
   var kml = EE.buildKML({ name: p.name, address: p.address, anchor: p.anchor, objects: placed }, {
     unit: db.settings.nameUnit,
     nameTemplate: db.settings.nameTemplate,
-    circleSegments: db.settings.circleSegments
+    circleSegments: db.settings.circleSegments,
+    labels: true,
+    labelLift: db.settings.labelLift
   });
   if (!kml) return toast('Could not build the KML');
   deliver(slug(p.name) + '.kml', kml, 'application/vnd.google-earth.kml+xml');
@@ -3103,13 +3120,17 @@ function renderPlanRaster(p) {
       g.moveTo(q0.x, q0.y - 12 * s); g.lineTo(q0.x, q0.y + 12 * s); g.stroke();
       return;
     }
-    g.fillStyle = 'rgba(212,175,55,0.55)'; g.fill();
+    /* Barely-there fill. This raster is a tracing base: the roof underneath has
+       to stay visible, because the whole job is drawing HelioScope's own
+       obstructions on top of it. A heavy fill hides the thing being traced. */
+    g.fillStyle = 'rgba(212,175,55,0.16)'; g.fill();
     g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 7 * s; g.stroke();
     g.strokeStyle = '#E8C96A'; g.lineWidth = 3.5 * s; g.stroke();
 
-    var c = EN({ x: o.cx, y: o.cy });
-    stroked(EE.fmtName(db.settings.nameTemplate, o.name || '', o.h || 0, db.settings.nameUnit),
-      c.x + 8 * s, c.y - 6 * s, '#FFFFFF', 26 * s);
+    /* No name painted here. A label baked into the ground image is underneath
+       everything the moment modules are placed over it, which is exactly the
+       complaint. Names ride in the vector layer instead, floating above each
+       object on a tether. */
   });
 
   /* Scale bar, alternating 5 m blocks — the one mark that has to be unambiguous
@@ -3146,22 +3167,33 @@ function exportKmz() {
     if (!png) return toast('Could not render the overlay');
     png.arrayBuffer().then(function (buf) {
       var box = EE.eastNorthBox(r.bounds, p.anchor);
-      var doc = EE.buildGroundOverlayKML(box, {
-        name: p.name + ' — plan',
-        href: 'files/plan.png',
-        description: (p.address || '') +
-          '\nNorth-up plan overlay at ' + r.gsd.toFixed(3) + ' m/px. ' +
-          'The scale bar is exactly 20.000 m. Traced with Eagle Eye ' + VERSION + '.' +
-          (p.scaleRef ? '\nScale from a ' + p.scaleRef.method + ' baseline of ' +
-            EE.fmtLen(p.scaleRef.lengthM, 'm') + ' (±' + (p.scaleRef.relSigma * 100).toFixed(3) + '%).' : '') +
-          '\nDeck assumed flat to ±' + EE.fmtLen(db.settings.deckUnc, 'm', 2) + '.'
-      });
+
+      /* One archive, three layers, drawn in the order they are wanted:
+         the flat tracing base, the 3D volumes standing on it, and the names
+         floating clear of both. */
+      var doc = EE.buildKML(
+        {
+          name: p.name, address: p.address, anchor: p.anchor,
+          objects: placedObjects(p).filter(function (o) { return o.kind !== 'point'; })
+        },
+        {
+          unit: db.settings.nameUnit,
+          nameTemplate: db.settings.nameTemplate,
+          circleSegments: db.settings.circleSegments,
+          labels: true,
+          labelLift: db.settings.labelLift,
+          groundOverlay: EE.groundOverlayFragment(box, {
+            name: p.name + ' — deck', href: 'files/plan.png'
+          })
+        });
+      if (!doc) return toast('Could not build the KMZ');
+
       var blob = zipStore([
         { name: 'doc.kml', data: doc },
         { name: 'files/plan.png', data: new Uint8Array(buf) }
       ]);
-      deliverBlob(slug(p.name) + '-plan.kmz', blob);
-      toast('KMZ · ' + r.w + '×' + r.h + ' px at ' + r.gsd.toFixed(3) + ' m/px');
+      deliverBlob(slug(p.name) + '.kmz', blob);
+      toast('KMZ · overlay + 3D + floating labels · ' + r.w + '×' + r.h);
     });
   }, 'image/png');
 }
