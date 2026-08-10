@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.9.0';
+var VERSION = '1.9.1';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -2369,6 +2369,8 @@ function sheetSettings() {
     '<div class="field"><label>PHOTO LONG EDGE (PX)</label>' +
     '<input class="inp mono" id="set-maxpx" inputmode="numeric" value="' + s.maxPx + '"></div>' +
     '<div class="kv"><span>Photos stored</span><span>' + fmtBytes(ui.storageBytes) + '</span></div>' +
+    '<div class="kv"><span>Version</span><span>' + VERSION + '</span></div>' +
+    '<button class="btn ghost-gold sm" data-act="check-update">Check for an update</button>' +
     '<div class="btn-row"><button class="btn primary" data-act="save-settings">Save</button></div>' +
     '<div class="btn-row"><button class="btn danger" data-act="purge-photos">Drop all photos</button></div>' +
     '<div class="hint">Dropping photos keeps every measurement and frees the space. You lose ' +
@@ -3178,7 +3180,13 @@ function snapTap(st, ip) {
   var c = EE.bestCorner(gray, N, N, 7);
   if (!c || c.ratio < 6 || c.lambda < 400) return ip;
 
-  return { x: sx + c.x, y: sy + c.y, snapped: true, moved: c.dist };
+  /* bestCorner picks the right pixel; this finds where inside it the corner
+     really is. Roughly a tenth of a pixel, against about three for a finger. */
+  var r = EE.refineCorner(gray, N, N, c.x, c.y, 5, 8);
+  return {
+    x: sx + r.x, y: sy + r.y, snapped: true,
+    moved: Math.hypot(sx + r.x - ip.x, sy + r.y - ip.y)
+  };
 }
 
 function addTap(ip) {
@@ -3369,6 +3377,7 @@ function handle(el, e) {
       toast('Trusted radius now ' + EE.fmtLen(trustedRadius(), U(), 1));
       return render();
     }
+    case 'check-update': return checkForUpdate(true);
     case 'save-settings': return saveSettings();
     case 'purge-photos': ui.sheet = { kind: 'confirm', title: 'Drop all photos?', body: 'Every measurement is kept. You lose only the ability to trace more from the shots already taken.', yes: 'Drop photos', on: 'purge' }; return render();
     case 'confirm-yes': return confirmYes();
@@ -4288,8 +4297,56 @@ if (!needsMotionPermission()) startSensors();
 
 render();
 
+/* ================= updates =================
+
+   Registering a worker is not the same as shipping an update, and on an installed
+   iOS web app the gap between them is where releases go to die. Three things have
+   to happen, and only the first was here:
+
+   1. A new worker is fetched and installed. skipWaiting() in sw.js does that.
+   2. Something has to ASK. An installed home-screen app resumes from a suspended
+      state rather than navigating, so nothing triggers an update check on its own
+      — hence the check on every foreground.
+   3. The page has to reload. A new worker taking control changes what the NEXT
+      request would get; the tab is still running the old bundle it parsed
+      minutes or days ago. Without this reload the app can be fully up to date on
+      disk and still behave like the old version indefinitely. */
+var swReg = null, updateReloading = false;
+
+function pokeWaiting(reg) {
+  if (reg && reg.waiting) { try { reg.waiting.postMessage({ type: 'SKIP_WAITING' }); } catch (e) { } }
+}
+
+function checkForUpdate(manual) {
+  if (!swReg) { if (manual) toast('Updates are handled by the browser here'); return; }
+  swReg.update().then(function () {
+    pokeWaiting(swReg);
+    if (manual && !swReg.waiting && !swReg.installing) toast('Already on ' + VERSION);
+  }).catch(function () { if (manual) toast('Could not reach the server'); });
+}
+
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function () {
-    navigator.serviceWorker.register('sw.js').catch(function () { });
+    navigator.serviceWorker.register('sw.js').then(function (reg) {
+      swReg = reg;
+      pokeWaiting(reg);
+      reg.addEventListener('updatefound', function () {
+        var nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', function () {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) pokeWaiting(reg);
+        });
+      });
+    }).catch(function () { });
+  });
+
+  navigator.serviceWorker.addEventListener('controllerchange', function () {
+    if (updateReloading) return;      /* controllerchange can fire more than once */
+    updateReloading = true;
+    location.reload();
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) checkForUpdate(false);
   });
 }

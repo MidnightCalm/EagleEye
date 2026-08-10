@@ -937,6 +937,58 @@ var EE = (function () {
     };
   }
 
+  /* Refine a corner to sub-pixel, the way a fiducial detector would.
+
+     bestCorner picks the right PIXEL; this finds where inside it the corner
+     actually is. The idea is one line of geometry: at a true corner, the image
+     gradient at every nearby pixel is perpendicular to the vector pointing back
+     at the corner. So every pixel votes with grad.(q - p) = 0, and the
+     least-squares solution of all those votes is the corner.
+
+     This is what makes printed markers accurate — not the pattern, but that their
+     edges are hard, straight and high-contrast, so the votes agree. It works just
+     as well on a kerb edge, and it takes tap error from around 3 px to a fraction
+     of one. */
+  function refineCorner(gray, w, h, x0, y0, win, iters) {
+    win = win || 5;
+    iters = iters || 8;
+    var px = x0, py = y0;
+    var sigma2 = 2 * (win * 0.5) * (win * 0.5);
+
+    for (var it = 0; it < iters; it++) {
+      var cx = Math.round(px), cy = Math.round(py);
+      var a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0;
+
+      for (var dy = -win; dy <= win; dy++) {
+        for (var dx = -win; dx <= win; dx++) {
+          var X = cx + dx, Y = cy + dy;
+          if (X < 1 || Y < 1 || X >= w - 1 || Y >= h - 1) continue;
+          var i = Y * w + X;
+          var gx = (gray[i + 1] - gray[i - 1]) * 0.5;
+          var gy = (gray[i + w] - gray[i - w]) * 0.5;
+          var wt = Math.exp(-(dx * dx + dy * dy) / sigma2);
+          var gxx = gx * gx * wt, gxy = gx * gy * wt, gyy = gy * gy * wt;
+          a11 += gxx; a12 += gxy; a22 += gyy;
+          b1 += gxx * X + gxy * Y;
+          b2 += gxy * X + gyy * Y;
+        }
+      }
+
+      var det = a11 * a22 - a12 * a12;
+      if (Math.abs(det) < 1e-9) break;          /* an edge, not a corner */
+      var nx = (a22 * b1 - a12 * b2) / det;
+      var ny = (a11 * b2 - a12 * b1) / det;
+      if (!isFinite(nx) || !isFinite(ny)) break;
+      /* A solution that leaves the window is the fit diverging, not a discovery. */
+      if (Math.hypot(nx - x0, ny - y0) > win + 1) break;
+
+      var moved = Math.hypot(nx - px, ny - py);
+      px = nx; py = ny;
+      if (moved < 0.01) break;
+    }
+    return { x: px, y: py, moved: Math.hypot(px - x0, py - y0) };
+  }
+
   /* ================= shape fitting ================= */
 
   function hull(pts) {
@@ -1507,7 +1559,7 @@ var EE = (function () {
     det3: det3, orientH: orientH, homographyFromPose: homographyFromPose,
     focalFromHomography: focalFromHomography, horizonLine: horizonLine,
     referenceQuality: referenceQuality, steppedReferenceError: steppedReferenceError,
-    meanAngleMod90: meanAngleMod90, bestCorner: bestCorner,
+    meanAngleMod90: meanAngleMod90, bestCorner: bestCorner, refineCorner: refineCorner,
     normalFromAttitude: normalFromAttitude, deckTiltDeg: deckTiltDeg, deckBasis: deckBasis,
     jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
     clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,

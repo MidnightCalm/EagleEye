@@ -420,6 +420,62 @@ function near(name, a, b, tol) {
   ok('rejects a tiny patch', EE.bestCorner(new Float32Array(16), 4, 4, 2) === null);
 })();
 
+/* ---- sub-pixel corner refinement ---- */
+(function () {
+  var N = 41;
+  /* An anti-aliased quadrant corner: each pixel takes the fraction of its area
+     that falls inside the dark quadrant, so the true corner sits at an exact
+     fractional position and can be recovered or missed measurably. */
+  var mk = function (cx, cy, noise) {
+    var g = new Float32Array(N * N);
+    var cl = function (v) { return v < 0 ? 0 : v > 1 ? 1 : v; };
+    for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) {
+      /* Sample index x IS the pixel centre, so its area runs x-0.5 to x+0.5.
+         Treating it as x to x+1 puts the synthetic corner half a pixel off and
+         makes a correct refiner look biased. */
+      var cover = cl(cx - x + 0.5) * cl(cy - y + 0.5);
+      var v = 235 - 195 * cover;
+      if (noise) v += ((x * 7919 + y * 104729) % 13 - 6) * noise;
+      g[y * N + x] = v;
+    }
+    return g;
+  };
+
+  [[20.0, 20.0], [20.37, 19.62], [21.5, 18.25]].forEach(function (c) {
+    var g = mk(c[0], c[1], 0);
+    var r = EE.refineCorner(g, N, N, Math.round(c[0]), Math.round(c[1]), 5, 10);
+    var err = Math.hypot(r.x - c[0], r.y - c[1]);
+    ok('refines a corner at ' + c[0] + ',' + c[1] + ' to under 0.15 px', err < 0.15,
+       'off by ' + err.toFixed(3) + ' px (' + r.x.toFixed(2) + ',' + r.y.toFixed(2) + ')');
+  });
+
+  /* The point of it: better than the whole-pixel answer it starts from. */
+  var target = [20.42, 19.63];
+  var g2 = mk(target[0], target[1], 0);
+  var whole = Math.hypot(20 - target[0], 20 - target[1]);
+  var refined = EE.refineCorner(g2, N, N, 20, 20, 5, 10);
+  ok('beats rounding to the nearest pixel',
+     Math.hypot(refined.x - target[0], refined.y - target[1]) < whole / 3,
+     whole.toFixed(3) + ' px -> ' + Math.hypot(refined.x-target[0], refined.y-target[1]).toFixed(3) + ' px');
+
+  /* Robust to sensor noise. */
+  var noisy = EE.refineCorner(mk(20.3, 19.7, 1.2), N, N, 20, 20, 5, 10);
+  ok('survives noise', Math.hypot(noisy.x - 20.3, noisy.y - 19.7) < 0.4,
+     Math.hypot(noisy.x-20.3, noisy.y-19.7).toFixed(3) + ' px');
+
+  /* A straight edge has no corner to find, and the solve must not invent one. */
+  var edge = new Float32Array(N * N);
+  for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) edge[y * N + x] = x < 20 ? 40 : 235;
+  var e = EE.refineCorner(edge, N, N, 20, 20, 5, 10);
+  ok('an edge does not drag the point away', e.moved < 1.5, e.moved.toFixed(2) + ' px');
+
+  /* Nor does a blank patch. */
+  var blank = new Float32Array(N * N);
+  for (var i = 0; i < blank.length; i++) blank[i] = 128;
+  var b = EE.refineCorner(blank, N, N, 20, 20, 5, 10);
+  ok('a blank patch stays put', b.x === 20 && b.y === 20, b.x + ',' + b.y);
+})();
+
 /* ---- reference quality: pixels, not metres ---- */
 (function () {
   var quad = function (wPx, hPx) {

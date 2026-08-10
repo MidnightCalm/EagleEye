@@ -14,7 +14,7 @@
    revalidation, so an unchanged file still costs only a 304.
 
    Fonts are cache-first: immutable and versioned by URL. */
-const CACHE = 'eagle-eye-1.9.0';
+const CACHE = 'eagle-eye-1.9.1';
 const ASSETS = [
   './',
   'index.html',
@@ -29,6 +29,14 @@ const ASSETS = [
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+});
+
+/* The page asks for this when it finds a worker waiting. Belt and braces beside
+   the skipWaiting() on install: a worker that installed while an older one was
+   still controlling a tab would otherwise sit waiting until every tab closed —
+   which, for a home-screen app that is only ever suspended, may be never. */
+self.addEventListener('message', e => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', e => {
