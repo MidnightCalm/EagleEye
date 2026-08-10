@@ -393,6 +393,12 @@ textarea.inp { min-height: 72px; resize: vertical; }
   display: flex; flex-direction: column; gap: 11px;
   max-height: 46%; overflow-y: auto; -webkit-overflow-scrolling: touch;
 }
+/* Nothing in the footer shrinks. This is the same trap the home screen documents:
+   in a flex column every child squashes once the content overflows, and a .seg
+   has no intrinsic height to defend itself — so the reference presets and the
+   mode selector collapsed to gold slivers a few pixels tall and looked like they
+   had been removed. They were there the whole time, crushed. */
+.full-foot > * { flex: 0 0 auto; }
 
 /* ============ shutter ============ */
 .shutter-row { display: flex; align-items: center; justify-content: center; gap: 26px; }

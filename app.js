@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.10.2';
+var VERSION = '1.11.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -317,6 +317,36 @@ function calMap(st) {
    The pose comes from fitting the ray model (evaluated at a nominal 1 m) onto
    the same four reference corners: the similarity scale of that fit IS the
    camera height, and its residual says whether the tilt can be trusted. */
+/* Which tapped edge is which physical dimension.
+
+   The old fields asked for "width (first edge)" and "length (second edge)", which
+   silently required the tap order to match the order the numbers were typed. Tap
+   a bank card starting along its LONG side while the fields say 54 mm then
+   85.6 mm, and the plane is told the image is 1.59x squashed in one axis. The
+   quad still looks perfect on the photo — every corner is exactly where it was
+   put — while the vanishing line, and therefore everything measured from it, is
+   wrong. A real 0.5 m square then traces as 0.35 x 0.52.
+
+   Nothing about that is the user's mistake to make. The projected edges already
+   say which is longer, so assign the longer real dimension to the longer tapped
+   edge and show the result. A rectangle would have to be viewed at an extreme
+   angle for the projection to invert the order, and the swap control covers it. */
+function assignRefEdges(quadPix, a, b, swap) {
+  var d = function (p, q) { return Math.hypot(q.x - p.x, q.y - p.y); };
+  var e1 = d(quadPix[0], quadPix[1]);      /* the "first" edge, 1 -> 2 */
+  var e2 = d(quadPix[1], quadPix[2]);      /* the "second" edge, 2 -> 3 */
+  var lo = Math.min(a, b), hi = Math.max(a, b);
+  var firstIsLong = e1 >= e2;
+  if (swap) firstIsLong = !firstIsLong;
+  return {
+    first: firstIsLong ? hi : lo,
+    second: firstIsLong ? lo : hi,
+    e1: e1, e2: e2, firstIsLong: firstIsLong,
+    projAspect: e2 > 0 ? e1 / e2 : Infinity,
+    realAspect: lo > 0 ? hi / lo : Infinity
+  };
+}
+
 function calibrateQuad(st, quadPix, refW, refL) {
   var ref = EE.rectRefCorners(refW, refL);
   var H = EE.homographyFromQuad(quadPix, ref);
@@ -1838,10 +1868,32 @@ function tplTraceCal(st, t) {
         esc(r.label) + '</button>';
     }).join('') + '</div>';
 
+    /* Say out loud which tapped edge got which number. The old labels made this
+       an invisible assumption, and getting it backwards wrecks the plane while
+       leaving the quad looking perfect. */
+    var edgeNote = '';
+    if (n >= 4 && curW > 0 && curL > 0) {
+      var asg = assignRefEdges(t.taps.slice(0, 4), curW, curL, t.refSwap);
+      /* Projected aspect is NOT expected to match the real one — foreshortening
+         legitimately turns a 1.59 card into 2.27 on screen at a 32 degree
+         depression. Only an inversion is suspicious. */
+      var mismatch = false;
+      edgeNote = '<div class="panel ' + (mismatch ? 'warn' : '') + '">' +
+        '<span class="p-tag">WHICH EDGE IS WHICH</span>' +
+        '<div class="kv"><span>Edge 1→2 &nbsp;<i style="opacity:.55">' + Math.round(asg.e1) + ' px</i></span>' +
+        '<span>' + EE.fmtLen(asg.first, U(), 3) + '</span></div>' +
+        '<div class="kv"><span>Edge 2→3 &nbsp;<i style="opacity:.55">' + Math.round(asg.e2) + ' px</i></span>' +
+        '<span>' + EE.fmtLen(asg.second, U(), 3) + '</span></div>' +
+        '<div class="p-body">Assigned by which edge is longer on screen, so tap order does ' +
+        'not matter. Foreshortening means the on-screen ratio (' + asg.projAspect.toFixed(2) +
+        ':1) need not match the real one (' + asg.realAspect.toFixed(2) + ':1).</div>' +
+        '<button class="btn ghost-gold sm" data-act="swap-ref">Swap the two</button></div>';
+    }
+
     var refFields = '<div class="row2">' +
-      '<div class="field"><label>WIDTH (first edge)</label><div class="unit-suffix">' +
+      '<div class="field"><label>ONE SIDE</label><div class="unit-suffix">' +
       '<input class="inp mono" id="ref-w" inputmode="decimal" value="' + esc(t.refW) + '"><span>' + U() + '</span></div></div>' +
-      '<div class="field"><label>LENGTH (second edge)</label><div class="unit-suffix">' +
+      '<div class="field"><label>THE OTHER SIDE</label><div class="unit-suffix">' +
       '<input class="inp mono" id="ref-l" inputmode="decimal" value="' + esc(t.refL) + '"><span>' + U() + '</span></div></div>' +
       '</div>';
 
@@ -1870,7 +1922,7 @@ function tplTraceCal(st, t) {
             '<b>pixels</b> it spans, not the metres. Fill more of the frame with it, or use ' +
             'something longer.</div>' : '')
           : '<div class="p-body">Tap four corners first.</div>') +
-        '</div>' + presets + refFields;
+        '</div>' + presets + refFields + edgeNote;
     }
     return modeSeg + body +
       '<div class="btn-row">' +
@@ -2876,26 +2928,64 @@ function paintTrace() {
      horizon — or the real roof edge, when the horizon is out of frame — nothing
      from this shot is worth keeping, and no amount of scale correction will fix
      it. Drawn in both steps, because it is most useful while calibrating. */
+  var drawHorizon = function (line, col, label, dash) {
+    if (!line) return null;
+    var a = img2cv(v, { x: line.x0, y: line.y0 }), b = img2cv(v, { x: line.x1, y: line.y1 });
+    g.save();
+    g.strokeStyle = col; g.lineWidth = 2.5; g.setLineDash(dash);
+    g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+    g.setLineDash([]);
+    g.font = '600 12px ui-monospace, monospace';
+    var tw = g.measureText(label).width;
+    var ly = Math.max(14, Math.min(h - 6, a.y - 8));
+    g.fillStyle = 'rgba(12,10,16,0.82)';
+    g.fillRect(6, ly - 12, tw + 12, 17);
+    g.fillStyle = col;
+    g.fillText(label, 12, ly);
+    g.restore();
+    return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+  };
+
+  /* Two horizons, deliberately.
+
+     The calibration's horizon comes from the four tapped corners. The gravity one
+     comes from the phone's own attitude and needs no calibration at all — and,
+     usefully, no camera height either: the vanishing line of the deck is the
+     third row of the pose homography, which h never touches.
+
+     So they are independent, and their disagreement is a direct read on whether
+     the calibration is sound. If the phone was upright and the red line is
+     tilted, the reference rectangle is wrong — which is exactly the failure a
+     swapped pair of side lengths produces. */
   var calH = map ? (st.cal.mode === 'quad' ? st.cal.H : stationH(st)) : null;
+  var calAng = null, gravAng = null;
+  if (st.att) {
+    var Rg = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var fg = (st.cal && st.cal.f) || EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+    var Hg = EE.homographyFromPose(Rg, 1, fg, st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
+    gravAng = drawHorizon(EE.horizonLine(Hg, st.imgW, st.imgH),
+      'rgba(110,210,154,0.85)', 'horizon · gravity', [4, 5]);
+  }
   if (calH) {
-    var hz = EE.horizonLine(calH, st.imgW, st.imgH);
-    if (hz) {
-      var a = img2cv(v, { x: hz.x0, y: hz.y0 }), b = img2cv(v, { x: hz.x1, y: hz.y1 });
+    calAng = drawHorizon(EE.horizonLine(calH, st.imgW, st.imgH),
+      'rgba(224,137,125,0.95)', 'horizon · calibration', [12, 7]);
+  }
+  if (calAng != null && gravAng != null) {
+    var dA = Math.abs(((calAng - gravAng + 180) % 180 + 180) % 180);
+    if (dA > 90) dA = 180 - dA;
+    t.horizonDisagree = dA;
+    if (dA > 3) {
       g.save();
-      g.strokeStyle = 'rgba(201,106,94,0.9)'; g.lineWidth = 2.5; g.setLineDash([12, 7]);
-      g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
-      g.setLineDash([]);
-      g.fillStyle = 'rgba(12,10,16,0.8)';
-      var lab = 'horizon';
       g.font = '600 12px ui-monospace, monospace';
-      var lw2 = g.measureText(lab).width;
-      var ly = Math.max(14, Math.min(h - 6, a.y - 8));
-      g.fillRect(6, ly - 12, lw2 + 12, 17);
-      g.fillStyle = 'rgba(224,137,125,0.95)';
-      g.fillText(lab, 12, ly);
+      var m2 = 'horizons disagree by ' + dA.toFixed(0) + '°';
+      var mw = g.measureText(m2).width;
+      g.fillStyle = 'rgba(201,106,94,0.92)';
+      g.fillRect(6, h - 26, mw + 12, 19);
+      g.fillStyle = '#2A0F0B';
+      g.fillText(m2, 12, h - 13);
       g.restore();
     }
-  }
+  } else t.horizonDisagree = null;
 
   /* Metric grid warped back onto the photo. Nothing else tells you at a glance
      that a calibration is sound — if these squares do not sit flat and square on
@@ -3495,6 +3585,7 @@ function handle(el, e) {
       return render();
     }
     case 'toggle-diag': ui.trace.showDiag = !ui.trace.showDiag; return render();
+    case 'swap-ref': ui.trace.refSwap = !ui.trace.refSwap; return render();
     case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
     case 'level-up': return startLevel(false);
     case 'level-down': return startLevel(true);
@@ -3885,13 +3976,52 @@ function applyQuad() {
   var l = EE.toM(parseFloat($('#ref-l').value), U());
   if (!(w > 0) || !(l > 0)) return toast('Enter both sides of the rectangle');
 
-  var cal = calibrateQuad(st, t.taps.slice(0, 4), w, l);
+  /* Match the numbers to the edges they actually belong to, rather than to the
+     order they were typed in. */
+  var asg = assignRefEdges(t.taps.slice(0, 4), w, l, t.refSwap);
+  var quad = t.taps.slice(0, 4);
+  var cal;
+  var q0 = EE.referenceQuality(quad, 3);
+  var small = q0 && q0.minSpanPx < 150;
+
+  /* A small reference cannot fix the vanishing line. Two of a homography's eight
+     numbers ARE that line, and across a card spanning eighty pixels they are
+     decided by noise — which is why the horizon comes out askew even when every
+     corner was tapped perfectly. Swapping the sides cannot cause that; it only
+     relabels the ground axes and leaves the third row alone.
+
+     Gravity has the opposite strengths: it fixes the plane exactly and carries no
+     length. So for a small reference, take the plane from the phone's attitude
+     and use the rectangle for nothing but scale — the pairing that makes a bank
+     card viable at all. */
+  if (small && st.att && db.settings.fovAt) {
+    var Rp = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var fp = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+    var unit = quad.map(function (qp) {
+      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fp, effAngle(st)),
+        Rp, 1, 0, deckNormalOf(st));
+    });
+    var fitP = unit.every(Boolean)
+      ? EE.similarity2D(unit, EE.rectRefCorners(asg.first, asg.second)) : null;
+    if (fitP && fitP.scale > 0.2 && fitP.scale < 30) {
+      cal = { mode: 'ray', camH: fitP.scale, f: fp, ok: true, source: 'gravity+scale' };
+      st.cal = cal;
+      touchProject(p); save();
+      coverageCache = { key: null, val: null };
+      toast('Plane from gravity, scale from your ' + EE.fmtLen(asg.first, U(), 3) +
+        ' edge — camera height ' + EE.fmtLen(fitP.scale, U(), 2));
+      t.step = 'trace'; t.taps = []; t.view = null;
+      return render();
+    }
+  }
+
+  cal = calibrateQuad(st, quad, asg.first, asg.second);
   if (!cal.ok) return toast(cal.err);
 
   st.cal = cal;
   touchProject(p); save();
 
-  var msg = 'Calibrated from ' + EE.fmtLen(w, U()) + ' × ' + EE.fmtLen(l, U());
+  var msg = 'Calibrated from ' + EE.fmtLen(asg.first, U(), 3) + ' × ' + EE.fmtLen(asg.second, U(), 3);
 
   /* Adopt the measured lens, but only from a quad big enough to mean it. A card
      spanning a dozen pixels produces a focal length as unreliable as its own
