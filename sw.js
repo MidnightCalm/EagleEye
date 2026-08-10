@@ -14,7 +14,7 @@
    revalidation, so an unchanged file still costs only a 304.
 
    Fonts are cache-first: immutable and versioned by URL. */
-const CACHE = 'eagle-eye-1.9.1';
+const CACHE = 'eagle-eye-1.9.2';
 const ASSETS = [
   './',
   'index.html',

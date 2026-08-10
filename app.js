@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.9.1';
+var VERSION = '1.9.2';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1775,7 +1775,15 @@ function tplTraceCal(st, t) {
   })) : null;
   var hzNow = Hray && EE.horizonLine(Hray, st.imgW, st.imgH);
 
-  var diag = '<div class="panel ' + (db.settings.fovAt ? 'good' : 'warn') + '">' +
+  /* Collapsed by default. These panels are worth reading once and then never
+     again, and left open they take half the screen away from the photo — which
+     is the thing precision actually depends on. */
+  var summary = '<button class="pill tiny ' + (db.settings.fovAt ? '' : 'gold') + '" data-act="toggle-diag">' +
+    '⚙ ' + fovNow.toFixed(0) + '° ' + (db.settings.fovAt ? 'measured' : 'ASSUMED') +
+    ' · horizon ' + (hzNow ? (hzNow.steep ? 'VERTICAL' : Math.round(hzNow.y0) + 'px') : '—') +
+    (st.angleFix ? ' · fix ' + st.angleFix + '°' : '') + ' ▾</button>';
+
+  var diag = !t.showDiag ? '' : '<div class="panel ' + (db.settings.fovAt ? 'good' : 'warn') + '">' +
     '<span class="p-tag">LENS</span>' +
     '<div class="kv"><span>Field of view in use</span><span>' + fovNow.toFixed(1) + '°</span></div>' +
     '<div class="kv ' + (db.settings.fovAt ? 'good' : 'warn') + '"><span>Source</span><span>' +
@@ -1804,7 +1812,7 @@ function tplTraceCal(st, t) {
     'known distance apart and let the app solve your camera height.</div>';
 
   return modeSeg +
-    (haveAtt ? diag : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
+    (haveAtt ? summary + diag : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
       '<div class="p-body">This shot has no attitude, so it can only be calibrated from a measured rectangle.</div></div>') +
     (haveAtt ? (st.deckN
       ? '<div class="kv good"><span>Deck plane</span><span>from gravity</span></div>'
@@ -2651,11 +2659,26 @@ function paintScene() {
 }
 
 /* ---------- trace ---------- */
+/* The photo's placement inside the canvas.
+
+   This used to be computed once and kept forever, which was a real bug rather
+   than an inefficiency: the footer is much taller while calibrating than while
+   tracing, so the view was fitted to a short canvas and then never grew when the
+   canvas did. The photo sat at 63% of the size it could have been, and since a
+   tap is converted through this same scale, every tap was landing on a coarser
+   grid than it needed to — about 4.7 image pixels per screen pixel instead of
+   2.9. Refit whenever the box changes, unless the user has pinched, in which case
+   their zoom is the intent and must be left alone. */
 function traceView(st, w, h) {
   var t = ui.trace;
-  if (!t.view) {
+  var v = t.view;
+  var stale = !v || (!v.userZoom && (Math.abs(v.boxW - w) > 1 || Math.abs(v.boxH - h) > 1));
+  if (stale && w > 0 && h > 0) {
     var s = Math.min(w / st.imgW, h / st.imgH);
-    t.view = { s: s, ox: (w - st.imgW * s) / 2, oy: (h - st.imgH * s) / 2, base: s };
+    t.view = {
+      s: s, ox: (w - st.imgW * s) / 2, oy: (h - st.imgH * s) / 2,
+      base: s, boxW: w, boxH: h, userZoom: false
+    };
   }
   return t.view;
 }
@@ -3113,6 +3136,7 @@ function bindTrace() {
       v.s = clamp(v.s * k, v.base * 0.5, v.base * 14);
       v.ox = c.x - before.x * v.s + d.x;
       v.oy = c.y - before.y * v.s + d.y;
+      v.userZoom = true;          /* their zoom now outranks any auto-refit */
       paintTrace();
     },
     onUp: function () {
@@ -3278,6 +3302,7 @@ function handle(el, e) {
     case 'save-scale': return saveScaleRef();
     case 'rescale': ui.sheet = { kind: 'rescale', mode: 'object' }; return render();
     case 'howto': ui.sheet = { kind: 'howto' }; return render();
+    case 'toggle-diag': ui.trace.showDiag = !ui.trace.showDiag; return render();
     case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
     case 'level-up': return startLevel(false);
     case 'level-down': return startLevel(true);
@@ -3341,7 +3366,7 @@ function handle(el, e) {
     case 'apply-quad': return applyQuad();
     case 'apply-map': return applyMap();
     case 'apply-ray': return applyRay();
-    case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; return render();
+    case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; ui.trace.view = null; return render();
     case 'commit-shape': return commitShape();
 
     case 'edit-object': ui.sheet = { kind: 'object', id: el.dataset.id || ui.sel }; return render();
@@ -3683,7 +3708,7 @@ function applyQuad() {
   }
   toast(msg);
 
-  t.step = 'trace'; t.taps = [];
+  t.step = 'trace'; t.taps = []; t.view = null;
   render();
 }
 
@@ -3718,7 +3743,7 @@ function applyMap() {
   if (cal.poseRms != null && cal.poseRms > 0.4) msg += ' · tilt disagrees, heights may be off';
   toast(msg);
 
-  t.step = 'trace'; t.taps = [];
+  t.step = 'trace'; t.taps = []; t.view = null;
   render();
 }
 
@@ -3761,7 +3786,7 @@ function applyRay() {
   st.cal = { mode: 'ray', camH: camH, f: f, ok: true };
   db.settings.camH = camH;
   touchProject(p); save();
-  t.step = 'trace'; t.taps = [];
+  t.step = 'trace'; t.taps = []; t.view = null;
   render();
 }
 
