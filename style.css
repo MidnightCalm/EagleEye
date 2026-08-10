@@ -281,6 +281,10 @@ textarea.inp { min-height: 72px; resize: vertical; }
 }
 .swipe-btn.del { background: var(--red); color: #2A0F0B; }
 .swipe-btn.del:active { filter: brightness(1.15); }
+/* The open state must survive a re-render. Without this rule the tray existed in
+   state but not on screen: any render snapped the card shut while ui.swipe still
+   said open, so the next drag started from a -96px baseline and jumped. */
+.card-wrap.open .proj-card { transform: translateX(-96px); transition: transform 0.16s ease; }
 
 /* ============ shot chips ============ */
 .stn-chip { position: relative; }

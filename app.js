@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.11.0';
+var VERSION = '1.12.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -103,6 +103,11 @@ var REF_PRESETS = [
   { label: 'Phone', w: null, l: null },      /* filled from settings */
   { label: 'Paver', w: 0.6096, l: 0.6096 }
 ];
+
+/* Below this many pixels on its shortest edge, a reference cannot pin the
+   vanishing line down and its recovered lens is noise. One number, used
+   everywhere a "big enough" judgement is made. */
+var SMALL_REF_PX = 150;
 
 var db = load();
 
@@ -458,41 +463,6 @@ function calibrateFromMap(st, pixPts, lls) {
   return cal;
 }
 
-/* Golden-section search for the focal length that makes the ray model agree with
-   a measured reference rectangle. Turns any quad calibration into a lens
-   calibration, which is what makes the quick tilt-and-height mode trustworthy
-   afterwards. */
-function solveFocal(st, quadPix, refW, refL) {
-  if (!st.att) return null;
-  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
-  var ref = EE.rectRefCorners(refW, refL);
-  var longPx = Math.max(st.imgW, st.imgH);
-
-  var cost = function (fovDeg) {
-    var f = EE.focalFromFov(fovDeg, longPx);
-    var g = quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, f, effAngle(st)), R, 1, 0, deckNormalOf(st));
-    });
-    if (!g.every(Boolean)) return Infinity;
-    /* The unit-height ray points differ from the reference by exactly the camera
-       height, so scale has to float or the residual measures that gap instead of
-       the lens error the search is trying to null out. */
-    var fit = EE.similarity2D(g, ref);
-    if (!fit || !(fit.scale > 0)) return Infinity;
-    return fit.rms;                          /* metres of disagreement */
-  };
-
-  var lo = 35, hi = 115, gr = (Math.sqrt(5) - 1) / 2;
-  var a = hi - gr * (hi - lo), b = lo + gr * (hi - lo);
-  var fa = cost(a), fb = cost(b);
-  for (var i = 0; i < 60 && hi - lo > 1e-4; i++) {
-    if (fa < fb) { hi = b; b = a; fb = fa; a = hi - gr * (hi - lo); fa = cost(a); }
-    else { lo = a; a = b; fa = fb; b = lo + gr * (hi - lo); fb = cost(b); }
-  }
-  var fov = (lo + hi) / 2, rms = cost(fov);
-  if (!isFinite(rms) || fov < 36 || fov > 114) return null;
-  return { fov: fov, rms: rms };
-}
 
 /* ================= the deck plane =================
 
@@ -853,6 +823,8 @@ function applyScaleCorrection(p, k, note) {
     var c = st.cal;
     if (!c) return;
     if (c.camH) c.camH *= k;
+    /* An absolute length has been supplied; the scale is no longer provisional. */
+    if (c.provisionalScale) c.provisionalScale = false;
     if (c.pose) { c.pose.scale *= k; c.pose.tx *= k; c.pose.ty *= k; }
     if (c.mode === 'quad' && c.H) {
       /* H maps image -> ground; its first two rows ARE the output coordinates,
@@ -1021,6 +993,16 @@ function buildChecklist(p) {
       EE.fmtLen(sp.lo, U(), 2) + ' to ' + EE.fmtLen(sp.hi, U(), 2) + '. The plan will look right ' +
       'and the dimensions will not.', 'scaleagree');
   }
+
+  var prov = p.stations.filter(function (s2) { return s2.cal && s2.cal.provisionalScale; }).length;
+  if (prov) add('warn', prov + (prov === 1 ? ' shot has' : ' shots have') + ' provisional scale',
+    'Plane from gravity but the lens was assumed, so sizes may be uniformly off by ~10%. ' +
+    'One tape measurement of anything already traced trues every shot at once.', 'rescale');
+
+  var susp = p.stations.filter(function (s2) { return s2.cal && s2.cal.suspect; });
+  if (susp.length) add('warn', susp.length + (susp.length === 1 ? ' shot has' : ' shots have') + ' unreliable perspective',
+    'Calibrated from a reference too small to pin the vanishing line down. Recalibrate that shot ' +
+    'from something larger, or enable the tilt sensor so the plane can come from gravity.', 'station', susp[0].id);
 
   if (!p.scaleRef) add('warn', 'No scale reference recorded',
     'Every length in the survey rides on one measured distance. Record which one, and how it was measured.', 'scale');
@@ -1969,11 +1951,22 @@ function tplTraceCal(st, t) {
       return '<button class="' + ((st.angleFix || 0) === a ? 'active' : '') + '" data-anglefix="' + a + '">' +
         (a === 0 ? 'none' : a + '°') + '</button>';
     }).join('') + '</div></div>';
+  /* Pocket-sized known lengths. The golf ball is the odd one out and the
+     interesting one: its visible rim sits one radius above the deck, and layover
+     makes the two-tap solve return exactly h - r — so picking it arms a +21.3 mm
+     correction, which typing any other value clears. 42.67 mm is written into
+     the R&A/USGA rules, so every ball is the same ball. */
   var scaleRow = t.taps.length >= 2
     ? '<div class="field"><label>DISTANCE BETWEEN THE TWO TAPS</label><div class="unit-suffix">' +
-    '<input class="inp mono" id="known-len" inputmode="decimal" value="' + esc(t.knownLen) + '"><span>' + U() + '</span></div></div>'
+    '<input class="inp mono" id="known-len" inputmode="decimal" value="' + esc(t.knownLen) + '"><span>' + U() + '</span></div></div>' +
+    '<div class="seg tight">' +
+    '<button data-knownlen="0.04267" data-knownz="0.02134">Golf ball</button>' +
+    '<button data-knownlen="0.0856" data-knownz="0">Card, long side</button>' +
+    '<button data-knownlen="0.6096" data-knownz="0">Paver 24″</button>' +
+    '</div>'
     : '<div class="hint">Better than trusting the number above: tap <b>two points on the deck</b> a ' +
-    'known distance apart and let the app solve your camera height.</div>';
+    'known distance apart — or the <b>two side edges of a golf ball</b> — and let the app solve ' +
+    'your camera height.</div>';
 
   return modeSeg +
     (haveAtt ? summary + diag : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
@@ -2987,6 +2980,19 @@ function paintTrace() {
     }
   } else t.horizonDisagree = null;
 
+  /* A suspect calibration must LOOK suspect, on the photo, while tracing. */
+  if (st.cal && st.cal.suspect) {
+    g.save();
+    g.font = '600 12px ui-monospace, monospace';
+    var sm = 'perspective unreliable — reference too small; recalibrate on something larger';
+    var smw = g.measureText(sm).width;
+    g.fillStyle = 'rgba(212,175,55,0.94)';
+    g.fillRect(6, 6, smw + 12, 19);
+    g.fillStyle = '#2A0F0B';
+    g.fillText(sm, 12, 19);
+    g.restore();
+  }
+
   /* Metric grid warped back onto the photo. Nothing else tells you at a glance
      that a calibration is sound — if these squares do not sit flat and square on
      the roof, no number taken from this shot is worth having. */
@@ -3196,7 +3202,7 @@ function bind() {
        silently inert — the delegated listener never sees it. */
     var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
       '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
-      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset],[data-anglefix],[data-swipe]');
+      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset],[data-anglefix],[data-swipe],[data-knownlen]');
     if (!el) return;
     handle(el, e);
   };
@@ -3366,6 +3372,10 @@ function bindTrace() {
     el.oninput = function () { (t.mapLL || (t.mapLL = []))[i] = el.value; };
     el.onchange = function () { (t.mapLL || (t.mapLL = []))[i] = el.value; render(); };
   });
+
+  /* A hand-typed length is not a golf ball: clear the resting-height correction. */
+  var kl = $('#known-len');
+  if (kl) kl.oninput = function () { t.knownLen = kl.value; t.knownZ = 0; };
   var p = currentProject();
   var st = findStation(p, t.stationId);
 
@@ -3508,6 +3518,11 @@ function handle(el, e) {
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
   if (el.dataset.srmethod) { ui.sheet.method = el.dataset.srmethod; return render(); }
   if (el.dataset.rsmode) { ui.sheet.mode = el.dataset.rsmode; return render(); }
+  if (el.dataset.knownlen) {
+    ui.trace.knownLen = EE.fromM(parseFloat(el.dataset.knownlen), U()).toFixed(5);
+    ui.trace.knownZ = parseFloat(el.dataset.knownz) || 0;
+    return render();
+  }
   if (el.dataset.anglefix) {
     var stn = findStation(p, ui.trace.stationId);
     stn.angleFix = parseInt(el.dataset.anglefix, 10);
@@ -3538,6 +3553,7 @@ function handle(el, e) {
     if (a === 'geo') { ui.sheet = { kind: 'geo', method: 'two' }; startGps(); return render(); }
     if (a === 'scale') { ui.sheet = { kind: 'scale' }; return render(); }
     if (a === 'scaleagree') { ui.sheet = { kind: 'scaleagree' }; return render(); }
+    if (a === 'rescale') { ui.sheet = { kind: 'rescale', mode: 'object' }; return render(); }
     if (a === 'place') { ui.sheet = { kind: 'place', id: id }; return render(); }
     if (a === 'object') { ui.sel = id; ui.sheet = { kind: 'object', id: id }; return render(); }
     if (a === 'station') return openStation(id);
@@ -3982,7 +3998,7 @@ function applyQuad() {
   var quad = t.taps.slice(0, 4);
   var cal;
   var q0 = EE.referenceQuality(quad, 3);
-  var small = q0 && q0.minSpanPx < 150;
+  var small = q0 && q0.minSpanPx < SMALL_REF_PX;
 
   /* A small reference cannot fix the vanishing line. Two of a homography's eight
      numbers ARE that line, and across a card spanning eighty pixels they are
@@ -3993,8 +4009,16 @@ function applyQuad() {
      Gravity has the opposite strengths: it fixes the plane exactly and carries no
      length. So for a small reference, take the plane from the phone's attitude
      and use the rectangle for nothing but scale — the pairing that makes a bank
-     card viable at all. */
-  if (small && st.att && db.settings.fovAt) {
+     card viable at all.
+
+     The lens does NOT need to be measured first. An assumed field of view leaves
+     the plane exactly right - gravity sets it - and puts a uniform error on the
+     scale only, which the retroactive Correct-the-scale fixes with one tape
+     check. A wrong PLANE is unfixable after the fact; a wrong SCALE is one
+     multiplication. Requiring a measured lens here was the reason a card
+     calibration produced a horizon through the floor for anyone who had not yet
+     calibrated on something big - which is everyone, on day one. */
+  if (small && st.att) {
     var Rp = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
     var fp = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
     var unit = quad.map(function (qp) {
@@ -4004,11 +4028,15 @@ function applyQuad() {
     var fitP = unit.every(Boolean)
       ? EE.similarity2D(unit, EE.rectRefCorners(asg.first, asg.second)) : null;
     if (fitP && fitP.scale > 0.2 && fitP.scale < 30) {
-      cal = { mode: 'ray', camH: fitP.scale, f: fp, ok: true, source: 'gravity+scale' };
+      cal = { mode: 'ray', camH: fitP.scale, f: fp, ok: true, source: 'gravity+scale',
+        provisionalScale: !db.settings.fovAt };
       st.cal = cal;
       touchProject(p); save();
       coverageCache = { key: null, val: null };
-      toast('Plane from gravity, scale from your ' + EE.fmtLen(asg.first, U(), 3) +
+      toast(cal.provisionalScale
+        ? 'Plane from gravity — trace away. Scale is provisional (lens assumed ' +
+        db.settings.fov.toFixed(0) + '°); one tape check under Check → Correct the scale trues every shot.'
+        : 'Plane from gravity, scale from your ' + EE.fmtLen(asg.first, U(), 3) +
         ' edge — camera height ' + EE.fmtLen(fitP.scale, U(), 2));
       t.step = 'trace'; t.taps = []; t.view = null;
       return render();
@@ -4017,6 +4045,13 @@ function applyQuad() {
 
   cal = calibrateQuad(st, quad, asg.first, asg.second);
   if (!cal.ok) return toast(cal.err);
+
+  /* Reaching here with a small reference means the gravity path was unavailable
+     (no attitude) or its fit failed, so the quad's own vanishing line is all
+     there is — and across this few pixels it is noise. Mark it, so the trace
+     screen and the checklist can say so instead of letting garbage look
+     authoritative. */
+  if (small) cal.suspect = st.att ? 'small-ref' : 'small-ref-no-tilt';
 
   st.cal = cal;
   touchProject(p); save();
@@ -4027,8 +4062,7 @@ function applyQuad() {
      spanning a dozen pixels produces a focal length as unreliable as its own
      vanishing line, and writing that into settings would poison every later
      tilt-and-height shot. */
-  var q = EE.referenceQuality(t.taps.slice(0, 4), 3);
-  if (cal.fovMeasured && q && q.minSpanPx >= 150 &&
+  if (cal.fovMeasured && q0 && q0.minSpanPx >= SMALL_REF_PX &&
     (cal.focal.disagree == null || cal.focal.disagree < 0.06)) {
     db.settings.fov = cal.fovMeasured;
     db.settings.fovFrom = (st.cam && st.cam.label) || 'this camera';
@@ -4041,6 +4075,7 @@ function applyQuad() {
   if (cal.poseRms != null && cal.poseRms > 0.3) {
     msg += ' · tilt looks off, heights may be unreliable';
   }
+  if (cal.suspect) msg += ' · perspective unreliable — reference too small';
   toast(msg);
 
   t.step = 'trace'; t.taps = []; t.view = null;
@@ -4098,6 +4133,9 @@ function applyRay() {
       var a = EE.rayForPixel(t.taps[0].x, t.taps[0].y, st.imgW, st.imgH, f, effAngle(st));
       var b = EE.rayForPixel(t.taps[1].x, t.taps[1].y, st.imgW, st.imgH, f, effAngle(st));
       var solved = EE.camHeightFromKnown(a, b, R, known, deckNormalOf(st));
+      /* Two taps on a resting ball's rim measure a chord one radius above the
+         deck; layover makes the solve come back exactly h - r. Hand r back. */
+      if (solved && t.knownZ) solved += t.knownZ;
       /* A plausible handheld camera height is roughly 1.2-1.8 m. Anything far
          outside that almost always means the two taps were NOT on the deck —
          a wall or the side of a unit gets projected onto the roof plane, which
@@ -4137,18 +4175,29 @@ function commitShape() {
     var hgt = map.heightAt(base, t.taps[1].x, t.taps[1].y);
     if (!hgt || hgt <= 0) return toast('Could not measure that — the top must sit above the base');
     t.taps = [];
-    toast('Height ' + EE.fmtLen(hgt, U()) + ' — tap an object to apply it');
+    toast('Height ' + EE.fmtLen(hgt, U()) + ' — it will be applied to the next shape you add');
     ui.lastHeight = hgt;
     return render();
   }
 
-  var gpts = t.taps.map(function (q) { return map.toGround(q.x, q.y); }).filter(Boolean);
-  if (gpts.length < (t.tool === 'point' ? 1 : 3)) return toast('Some taps fell above the horizon — trace nearer the camera');
+  var raw = t.taps.map(function (q) { return map.toGround(q.x, q.y); });
+  var gpts = raw.filter(Boolean);
+  var dropped = raw.length - gpts.length;
+  if (gpts.length < (t.tool === 'point' ? 1 : 3)) {
+    /* The commonest cause is not the user standing wrong — it is a bad
+       calibration whose horizon cuts through the floor, silently disqualifying
+       every tap beyond it. Say which it is. */
+    return toast(dropped
+      ? dropped + (dropped === 1 ? ' tap fell' : ' taps fell') + ' above where this calibration ' +
+      'thinks the horizon is. If the red line looks wrong, recalibrate — a too-small reference does exactly this.'
+      : 'Tap ' + (t.tool === 'point' ? 'a point' : 'at least three corners') + ' first');
+  }
 
-  var o = { id: uid('o'), stationId: st.id, kind: t.tool, name: '', h: ui.lastHeight || 0, note: '' };
+  var o = { id: uid('o'), stationId: st.id, kind: t.tool, name: '', h: ui.lastHeight || 0,
+    hSrc: ui.lastHeight ? 'measured' : undefined, note: '' };
   if (t.tool === 'rect') {
     var r = EE.fitOrientedRect(gpts);
-    if (!r) return toast('Those taps do not enclose an area');
+    if (!r) return toast('Those taps do not enclose an area once projected — if the green grid looks warped, recalibrate');
     o.cx = r.cx; o.cy = r.cy; o.w = r.w; o.l = r.l; o.rot = r.rot;
     o.name = 'RTU-' + (p.objects.filter(function (q) { return q.kind === 'rect'; }).length + 1);
   } else if (t.tool === 'cylinder') {

@@ -373,6 +373,23 @@ They are a rescue, not a plan.
 Stepping a short reference end to end helps, but slowly: length grows as *n* while placement
 error grows as √*n*, so relative error improves only as 1/√*n*.
 
+**A golf ball works too**, through the tilt-and-height two-tap flow: the R&A/USGA rules fix
+its diameter at 42.67 mm, so every ball is the same ball, and its silhouette reads identically
+from every direction — no foreshortening, no which-side-is-which, no need to lie flat. Tap its
+two side edges and pick the **Golf ball** preset. The one systematic is exactly correctable:
+the visible rim sits one radius above the deck, and layover makes the solve return precisely
+*h − r*, so the preset hands the 21.3 mm back. The limit is pixels — ~26 px across at 1.5 m,
+so expect a few percent; the card's long side is twice the ball, and a paver beats both. White
+balls also make excellent landmarks for tying shots together.
+
+**With a small reference, the plane always comes from gravity** (when the tilt sensor is on) —
+even before the lens has been measured. In that case the scale is marked **provisional**
+(uniform, ~10% if the assumed lens is wrong), the Check tab says so, and one tape measurement
+via **Correct the scale** trues every shot and clears the flag. A wrong plane is unfixable
+after the fact; a wrong scale is one multiplication. A small reference with **no** tilt data is
+marked *suspect*, banner and all — its vanishing line is noise and nothing measured through it
+should be trusted.
+
 ## Locking things down
 
 Redundancy beats precision, and the cheapest redundancy on a roof is an assumption you can
