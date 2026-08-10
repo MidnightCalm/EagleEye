@@ -18,6 +18,16 @@
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+/* Without this iOS treats a press-and-drag on the photo as a text selection:
+   it flashes the blue highlight, raises its own magnifier over the loupe, and
+   fires pointercancel — which is what made a traced point land where the drag
+   began rather than where it ended. Inputs opt back in below. */
+#app, .sheet, .scrim, .toast {
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+input, textarea, select { -webkit-user-select: text; user-select: text; }
 html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); overscroll-behavior: none; }
 body {
   color: var(--cream);

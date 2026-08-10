@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.10.1';
+var VERSION = '1.10.2';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -97,11 +97,11 @@ function uid(p) { return (p || 'x') + Date.now().toString(36) + Math.random().to
    though, which the quality readout will say plainly: a pocket reference is a
    rescue, not a plan. Measure your own phone once and it beats any table here. */
 var REF_PRESETS = [
-  { label: 'Bank card', w: 0.0540, l: 0.0856 },
+  { label: 'Card', w: 0.0540, l: 0.0856 },
   { label: 'A4 sheet', w: 0.2100, l: 0.2970 },
   { label: 'Letter', w: 0.2159, l: 0.2794 },
-  { label: 'My phone', w: null, l: null },      /* filled from settings */
-  { label: 'Paver 24"', w: 0.6096, l: 0.6096 }
+  { label: 'Phone', w: null, l: null },      /* filled from settings */
+  { label: 'Paver', w: 0.6096, l: 0.6096 }
 ];
 
 var db = load();
@@ -1823,21 +1823,40 @@ function tplTraceCal(st, t) {
   if (t.calMode === 'quad') {
     var n = t.taps.length;
     var body;
+
+    /* Offered from the first tap, not withheld until the fourth: you choose what
+       you are about to measure BEFORE aiming at it. The highlight reflects the
+       dimensions actually in the fields rather than a remembered click, so typing
+       a custom size correctly clears it. It was never implemented at all before —
+       every preset rendered identically whatever was selected. */
+    var curW = EE.toM(parseFloat(t.refW), U()), curL = EE.toM(parseFloat(t.refL), U());
+    var presets = '<div class="seg tight">' + REF_PRESETS.map(function (r, i) {
+      var pw = r.w == null ? db.settings.phoneW : r.w;
+      var pl = r.l == null ? db.settings.phoneL : r.l;
+      var on = pw > 0 && pl > 0 && Math.abs(curW - pw) < 0.0015 && Math.abs(curL - pl) < 0.0015;
+      return '<button class="' + (on ? 'active' : '') + '" data-refpreset="' + i + '">' +
+        esc(r.label) + '</button>';
+    }).join('') + '</div>';
+
+    var refFields = '<div class="row2">' +
+      '<div class="field"><label>WIDTH (first edge)</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="ref-w" inputmode="decimal" value="' + esc(t.refW) + '"><span>' + U() + '</span></div></div>' +
+      '<div class="field"><label>LENGTH (second edge)</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="ref-l" inputmode="decimal" value="' + esc(t.refL) + '"><span>' + U() + '</span></div></div>' +
+      '</div>';
+
     if (n < 4) {
       body = '<div class="panel warn"><span class="p-tag">IT MUST LIE FLAT ON THE ROOF</span>' +
         '<div class="p-body">A curb top, a paver, a hatch lid, two tapes in an L. <b>Not</b> a wall, ' +
         'a parapet face or the side of a unit — everything here is projected onto the deck, so a ' +
         'vertical reference gives a badly wrong size.</div></div>' +
         '<div class="hint">Tap the <b>four corners</b> in order, going round.<br>' +
-        'Corner <b>' + (n + 1) + ' of 4</b>. Press and drag for the loupe.</div>' + dots(n, 4);
+        'Corner <b>' + (n + 1) + ' of 4</b>. Press and drag for the loupe.</div>' + dots(n, 4) +
+        presets + refFields;
     } else {
       var q = EE.referenceQuality(t.taps.slice(0, 4), 3);
       var qCls = { good: 'good', fair: 'gold', poor: 'warn' }[q ? q.verdict : 'poor'];
       var over = 20;   /* a typical roof span, for making the number concrete */
-
-      var presets = REF_PRESETS.map(function (r, i) {
-        return '<button data-refpreset="' + i + '">' + esc(r.label) + '</button>';
-      }).join('');
 
       body = '<div class="panel ' + qCls + '"><span class="p-tag">REFERENCE QUALITY</span>' +
         (q ? '<div class="kv"><span>Shortest edge</span><span>' + Math.round(q.minSpanPx) + ' px</span></div>' +
@@ -1851,14 +1870,7 @@ function tplTraceCal(st, t) {
             '<b>pixels</b> it spans, not the metres. Fill more of the frame with it, or use ' +
             'something longer.</div>' : '')
           : '<div class="p-body">Tap four corners first.</div>') +
-        '</div>' +
-        '<div class="seg tight">' + presets + '</div>' +
-        '<div class="row2">' +
-        '<div class="field"><label>WIDTH (first edge)</label><div class="unit-suffix">' +
-        '<input class="inp mono" id="ref-w" inputmode="decimal" value="' + esc(t.refW) + '"><span>' + U() + '</span></div></div>' +
-        '<div class="field"><label>LENGTH (second edge)</label><div class="unit-suffix">' +
-        '<input class="inp mono" id="ref-l" inputmode="decimal" value="' + esc(t.refL) + '"><span>' + U() + '</span></div></div>' +
-        '</div>';
+        '</div>' + presets + refFields;
     }
     return modeSeg + body +
       '<div class="btn-row">' +
@@ -3042,7 +3054,9 @@ function attachGestures(el, opts) {
   };
 
   el.addEventListener('pointerdown', function (e) {
-    el.setPointerCapture(e.pointerId);
+    /* Claim the gesture before iOS can decide it was a long-press selection. */
+    if (e.cancelable) e.preventDefault();
+    try { el.setPointerCapture(e.pointerId); } catch (err) { /* already captured */ }
     pts[e.pointerId] = pos(e);
     if (count() === 1 && opts.onDown) opts.onDown(pts[e.pointerId]);
     last = { c: centroid(), d: spread() };
@@ -3058,15 +3072,24 @@ function attachGestures(el, opts) {
     }
     last = { c: c, d: d };
   });
-  var end = function (e) {
+  /* A cancel is NOT a finish, and treating them the same was the bug behind taps
+     landing where the drag started. iOS fires pointercancel when it decides your
+     press was a text selection or a callout — the blue flash and the system
+     magnifier — and the move events stop arriving at that instant. Committing on
+     cancel therefore commits the last position that got through, which is
+     wherever the finger went down. An aborted gesture must place nothing. */
+  var end = function (e, committed) {
     if (!(e.pointerId in pts)) return;
     var p = pts[e.pointerId];
     delete pts[e.pointerId];
-    if (count() === 0) { if (opts.onUp) opts.onUp(p); last = null; }
-    else last = { c: centroid(), d: spread() };
+    if (count() === 0) {
+      if (committed) { if (opts.onUp) opts.onUp(p); }
+      else if (opts.onCancel) opts.onCancel(p);
+      last = null;
+    } else last = { c: centroid(), d: spread() };
   };
-  el.addEventListener('pointerup', end);
-  el.addEventListener('pointercancel', end);
+  el.addEventListener('pointerup', function (e) { end(e, true); });
+  el.addEventListener('pointercancel', function (e) { end(e, false); });
   el.addEventListener('wheel', function (e) {
     e.preventDefault();
     if (opts.onPinch) opts.onPinch(pos(e), { x: 0, y: 0 }, e.deltaY < 0 ? 1.12 : 1 / 1.12);
@@ -3303,6 +3326,12 @@ function bindTrace() {
       }
       t.loupe = null; hideLoupe();
       render();
+    },
+    /* iOS took the gesture for itself. Drop it silently rather than placing a
+       point somewhere the finger was only passing through. */
+    onCancel: function () {
+      t.loupe = null; hideLoupe();
+      paintTrace();
     }
   });
 }
@@ -3402,6 +3431,7 @@ function handle(el, e) {
     if (!(w > 0) || !(l > 0)) { toast('Measure your phone in Settings first'); return; }
     ui.trace.refW = EE.fromM(w, U()).toFixed(4);
     ui.trace.refL = EE.fromM(l, U()).toFixed(4);
+    toast(esc(r.label) + ' — ' + EE.fmtLen(w, U(), 3) + ' × ' + EE.fmtLen(l, U(), 3));
     return render();
   }
   if (el.dataset.station) return openStation(el.dataset.station);
