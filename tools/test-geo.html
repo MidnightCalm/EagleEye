@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Eagle Eye — geo.js tests</title>
+<style>
+  body { background:#0B0910; color:#F4F0E8; font:13px ui-monospace,Menlo,monospace; padding:20px; }
+  h1 { font-size:16px; color:#D4AF37; }
+  .ok { color:#6ED29A; } .bad { color:#E0897D; }
+  #sum { font-size:15px; margin:14px 0; padding:10px; border:1px solid rgba(212,175,55,.4); }
+  div.t { padding:2px 0; }
+</style>
+</head>
+<body>
+<h1>Eagle Eye — geo.js</h1>
+<div id="sum"></div>
+<div id="out"></div>
+<script src="../geo.js"></script>
+<script>
+var pass = 0, fail = 0, lines = [];
+function ok(name, cond, extra) {
+  if (cond) { pass++; lines.push('<div class="t ok">PASS  ' + name + '</div>'); }
+  else { fail++; lines.push('<div class="t bad">FAIL  ' + name + (extra ? '  — ' + extra : '') + '</div>'); }
+}
+function near(name, a, b, tol) {
+  var d = Math.abs(a - b);
+  ok(name, d <= tol, 'got ' + a + ' want ' + b + ' (d=' + d.toExponential(2) + ')');
+}
+
+/* ---- linear solve ---- */
+(function () {
+  var x = EE.solveLinear([[2, 1], [1, 3]], [5, 10]);
+  near('solveLinear x', x[0], 1, 1e-9);
+  near('solveLinear y', x[1], 3, 1e-9);
+  ok('solveLinear singular -> null', EE.solveLinear([[1, 2], [2, 4]], [1, 2]) === null);
+})();
+
+/* ---- rotation matrix ---- */
+(function () {
+  var R = EE.rotFromOrientation(0, 90, 0);
+  var camAxis = EE.applyM3(R, [0, 0, -1]);       /* rear camera looks down device -Z */
+  near('upright phone: camera points north (y)', camAxis[1], 1, 1e-9);
+  near('upright phone: camera level (z)', camAxis[2], 0, 1e-9);
+  var up = EE.applyM3(R, [0, 1, 0]);
+  near('upright phone: screen-top is world up', up[2], 1, 1e-9);
+
+  /* orthonormal for an arbitrary attitude */
+  var Q = EE.rotFromOrientation(37, 62, -18);
+  var I = EE.mul3(Q, EE.transpose3(Q));
+  var err = 0;
+  [1, 0, 0, 0, 1, 0, 0, 0, 1].forEach(function (v, i) { err = Math.max(err, Math.abs(I[i] - v)); });
+  near('rotation is orthonormal', err, 0, 1e-12);
+
+  var Rflat = EE.rotFromOrientation(0, 0, 0);
+  var down = EE.applyM3(Rflat, [0, 0, -1]);
+  near('flat phone: camera points straight down', down[2], -1, 1e-9);
+})();
+
+/* ---- ray cast: closed-form check ---- */
+(function () {
+  /* alpha 0, beta 60 -> camera depressed 30 deg below horizon, facing north. */
+  var R = EE.rotFromOrientation(0, 60, 0);
+  var g = EE.groundPoint([0, 0, -1], R, 1.6, 0);
+  near('groundPoint range matches 1.6/tan30', g.y, 1.6 / Math.tan(30 * Math.PI / 180), 1e-9);
+  near('groundPoint has no east offset', g.x, 0, 1e-12);
+  ok('ray above horizon -> null', EE.groundPoint([0, 0, -1], EE.rotFromOrientation(0, 100, 0), 1.6, 0) === null);
+})();
+
+/* ---- pixel <-> ground round trip, portrait and landscape ---- */
+[0, 90, 180, 270].forEach(function (ang) {
+  var W = 1440, H = 1920, f = EE.focalFromFov(69, Math.max(W, H));
+  var R = EE.rotFromOrientation(23, 58, -7), camH = 1.55;
+  var worst = 0, tested = 0;
+  for (var px = 200; px <= W - 200; px += 400) {
+    for (var py = 200; py <= H - 200; py += 400) {
+      var ray = EE.rayForPixel(px, py, W, H, f, ang);
+      var gp = EE.groundPoint(ray, R, camH, 0);
+      if (!gp) continue;
+      var back = EE.projectToPixel(gp, R, camH, W, H, f, ang, 0);
+      if (!back) { worst = Infinity; continue; }
+      worst = Math.max(worst, Math.hypot(back.x - px, back.y - py));
+      tested++;
+    }
+  }
+  ok('pixel round trip @' + ang + ' deg covered pixels', tested >= 4, 'tested=' + tested);
+  near('pixel round trip @' + ang + ' deg max error px', worst, 0, 1e-6);
+});
+
+/* ---- homography agrees with the ray model ----
+   Synthesise a camera, project four known ground corners into pixels, solve the
+   homography from those alone, then check it reproduces the ray model elsewhere.
+   This cross-validates the two independent engines against each other. */
+(function () {
+  var W = 1440, H = 1920, f = EE.focalFromFov(69, H);
+  var R = EE.rotFromOrientation(15, 55, 4), camH = 1.6;
+
+  var refGround = EE.rectRefCorners(2.4, 1.2).map(function (p) { return { x: p.x + 1, y: p.y + 4 }; });
+  var refPix = refGround.map(function (p) { return EE.projectToPixel(p, R, camH, W, H, f, 0, 0); });
+  ok('reference corners all in front of camera', refPix.every(Boolean));
+
+  var Href = EE.rectRefCorners(2.4, 1.2);
+  var Hm = EE.homographyFromQuad(refPix, Href);
+  ok('homography solved', !!Hm);
+
+  /* Any other pixel: homography result should match the ray model, offset by the
+     same (1,4) shift that separates the two coordinate frames. */
+  var worst = 0;
+  for (var px = 300; px < W - 300; px += 300) {
+    for (var py = 900; py < H - 200; py += 300) {
+      var g = EE.groundPoint(EE.rayForPixel(px, py, W, H, f, 0), R, camH, 0);
+      if (!g) continue;
+      var hp = EE.applyH(Hm, { x: px, y: py });
+      if (!hp) { worst = Infinity; continue; }
+      worst = Math.max(worst, Math.hypot(hp.x - (g.x - 1), hp.y - (g.y - 4)));
+    }
+  }
+  near('homography vs ray model, max disagreement (m)', worst, 0, 1e-6);
+
+  ok('applyH above horizon -> null or far', (function () {
+    var p = EE.applyH(Hm, { x: 720, y: 5 });
+    return p === null || Math.abs(p.y) > 100;
+  })());
+})();
+
+/* ---- camera height from a known length ---- */
+(function () {
+  var W = 1440, H = 1920, f = EE.focalFromFov(69, H);
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.72;
+  var a = { x: -1.5, y: 5 }, b = { x: 1.5, y: 5 };
+  var pa = EE.projectToPixel(a, R, camH, W, H, f, 0, 0);
+  var pb = EE.projectToPixel(b, R, camH, W, H, f, 0, 0);
+  var solved = EE.camHeightFromKnown(
+    EE.rayForPixel(pa.x, pa.y, W, H, f, 0),
+    EE.rayForPixel(pb.x, pb.y, W, H, f, 0), R, 3.0);
+  near('camHeightFromKnown recovers 1.72', solved, 1.72, 1e-9);
+})();
+
+/* ---- object height from base + top pixels ---- */
+(function () {
+  var W = 1440, H = 1920, f = EE.focalFromFov(69, H);
+  var R = EE.rotFromOrientation(0, 62, 0), camH = 1.6;
+  var base = { x: 0.8, y: 7.5 }, objH = 1.35;
+  var pBase = EE.projectToPixel(base, R, camH, W, H, f, 0, 0);
+  var pTop = EE.projectToPixel(base, R, camH, W, H, f, 0, objH);
+  ok('base and top both project', !!pBase && !!pTop);
+  var g = EE.groundPoint(EE.rayForPixel(pBase.x, pBase.y, W, H, f, 0), R, camH, 0);
+  var h = EE.heightFromBaseTop(g, EE.rayForPixel(pTop.x, pTop.y, W, H, f, 0), R, camH);
+  near('heightFromBaseTop recovers 1.35 m', h, 1.35, 1e-8);
+})();
+
+/* ---- oriented rectangle fit ---- */
+(function () {
+  var rot = 0.37, cx = 12, cy = -5, w = 2.0, l = 3.5;
+  var c = Math.cos(rot), s = Math.sin(rot);
+  var pts = [[-w / 2, -l / 2], [w / 2, -l / 2], [w / 2, l / 2], [-w / 2, l / 2]].map(function (p) {
+    return { x: cx + p[0] * c - p[1] * s, y: cy + p[0] * s + p[1] * c };
+  });
+  var r = EE.fitOrientedRect(pts);
+  near('rect fit width', r.w, w, 1e-9);
+  near('rect fit length', r.l, l, 1e-9);
+  near('rect fit cx', r.cx, cx, 1e-9);
+  near('rect fit cy', r.cy, cy, 1e-9);
+  near('rect fit rotation', r.rot, rot, 1e-9);
+
+  /* Tap order must not change the answer. */
+  var r2 = EE.fitOrientedRect([pts[2], pts[0], pts[3], pts[1]]);
+  near('rect fit is tap-order independent', Math.hypot(r2.w - r.w, r2.l - r.l), 0, 1e-9);
+
+  /* Corners must survive a fit -> corners -> fit round trip. */
+  var back = EE.fitOrientedRect(EE.rectCorners(r));
+  near('rectCorners round trip', Math.hypot(back.cx - cx, back.cy - cy), 0, 1e-9);
+
+  /* Three corners of a rectangle still recover it. */
+  var r3 = EE.fitOrientedRect([pts[0], pts[1], pts[2]]);
+  near('rect fit from 3 corners: width', r3.w, w, 1e-9);
+  near('rect fit from 3 corners: length', r3.l, l, 1e-9);
+})();
+
+/* ---- circle fit ---- */
+(function () {
+  var c = EE.fitCircle([{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }]);
+  near('circle fit r', c.r, 1, 1e-9);
+  near('circle fit cx', c.cx, 0, 1e-9);
+
+  var pts = [], cx = 4.2, cy = -1.1, r = 0.63;
+  for (var i = 0; i < 9; i++) {
+    var a = i / 9 * Math.PI * 2;
+    pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+  }
+  var f = EE.fitCircle(pts);
+  near('circle fit many: r', f.r, r, 1e-9);
+  near('circle fit many: centre', Math.hypot(f.cx - cx, f.cy - cy), 0, 1e-9);
+  near('circlePoly area approaches pi r^2', EE.polygonArea(EE.circlePoly(0, 0, 1, 256)), Math.PI, 1e-3);
+  ok('circle fit needs 3 points', EE.fitCircle([{ x: 0, y: 0 }, { x: 1, y: 1 }]) === null);
+})();
+
+/* ---- station registration ---- */
+(function () {
+  var th = 0.83, tx = 14.2, ty = -3.9;
+  var src = [{ x: 0, y: 0 }, { x: 5, y: 1 }, { x: 2, y: 6 }, { x: -3, y: 4 }];
+  var dst = src.map(function (p) {
+    return { x: Math.cos(th) * p.x - Math.sin(th) * p.y + tx, y: Math.sin(th) * p.x + Math.cos(th) * p.y + ty };
+  });
+  var t = EE.rigid2D(src, dst);
+  near('rigid2D theta', t.theta, th, 1e-9);
+  near('rigid2D tx', t.tx, tx, 1e-9);
+  near('rigid2D ty', t.ty, ty, 1e-9);
+  near('rigid2D rms on exact data', t.rms, 0, 1e-9);
+  near('rigid2D scale diagnostic is 1', t.scale, 1, 1e-9);
+
+  /* A station whose calibration is 8% large must be reported as such. */
+  var big = src.map(function (p) { return { x: p.x * 1.08, y: p.y * 1.08 }; });
+  var t2 = EE.rigid2D(big, dst);
+  near('rigid2D detects an 8% scale error', t2.scale, 1 / 1.08, 1e-9);
+
+  var back = EE.applyRigid(t, src[2]);
+  near('applyRigid matches', Math.hypot(back.x - dst[2].x, back.y - dst[2].y), 0, 1e-9);
+  ok('rigid2D needs 2 points', EE.rigid2D([{ x: 0, y: 0 }], [{ x: 1, y: 1 }]) === null);
+})();
+
+/* ---- similarity fit (camera pose from a reference rectangle) ---- */
+(function () {
+  var th = -0.41, sc = 1.6, tx = -2.5, ty = 7.25;
+  var src = [{ x: 0, y: 0 }, { x: 1.4, y: 0.2 }, { x: 0.9, y: 1.9 }, { x: -0.6, y: 1.1 }];
+  var dst = src.map(function (p) {
+    return {
+      x: sc * (Math.cos(th) * p.x - Math.sin(th) * p.y) + tx,
+      y: sc * (Math.sin(th) * p.x + Math.cos(th) * p.y) + ty
+    };
+  });
+  var t = EE.similarity2D(src, dst);
+  near('similarity2D scale', t.scale, sc, 1e-9);
+  near('similarity2D theta', t.theta, th, 1e-9);
+  near('similarity2D tx', t.tx, tx, 1e-9);
+  near('similarity2D ty', t.ty, ty, 1e-9);
+  near('similarity2D rms on exact data', t.rms, 0, 1e-9);
+
+  /* The regression this function exists for: rigid2D cannot fit a scaled pair,
+     and its rms says so. Holding the two apart is the whole point. */
+  var rigid = EE.rigid2D(src, dst);
+  ok('rigid2D refuses to absorb the 1.6x gap (large rms)', rigid.rms > 0.5, 'rms=' + rigid.rms);
+  ok('similarity2D residual is nil where rigid2D fails', t.rms < 1e-9);
+
+  var worst = 0;
+  src.forEach(function (p, i) {
+    var b = EE.applySimilarityInverse(t, dst[i]);
+    worst = Math.max(worst, Math.hypot(b.x - p.x, b.y - p.y));
+  });
+  near('applySimilarityInverse round trip', worst, 0, 1e-9);
+  ok('similarity2D needs 2 points', EE.similarity2D([{ x: 0, y: 0 }], [{ x: 1, y: 1 }]) === null);
+})();
+
+/* ---- geodesy ---- */
+(function () {
+  var anchor = { lat: 43.7615, lon: -79.5083, bearing: 27.5 };   /* Vaughan, ON */
+  var worst = 0;
+  [[0, 0], [50, 0], [0, 80], [-120, 45], [200, -160]].forEach(function (p) {
+    var pt = { x: p[0], y: p[1] };
+    var ll = EE.localToLatLon(pt, anchor);
+    var back = EE.latLonToLocal(ll, anchor);
+    worst = Math.max(worst, Math.hypot(back.x - pt.x, back.y - pt.y));
+  });
+  near('lat/lon round trip max error (m)', worst, 0, 1e-6);
+
+  /* bearing 0 must put plan +Y due north */
+  var n = EE.localToLatLon({ x: 0, y: 100 }, { lat: 43.7615, lon: -79.5083, bearing: 0 });
+  ok('bearing 0: +Y goes north', n.lat > 43.7615 && Math.abs(n.lon + 79.5083) < 1e-9);
+  var e = EE.localToLatLon({ x: 100, y: 0 }, { lat: 43.7615, lon: -79.5083, bearing: 0 });
+  ok('bearing 0: +X goes east', e.lon > -79.5083 && Math.abs(e.lat - 43.7615) < 1e-9);
+  near('100 m north is ~100 m', (n.lat - 43.7615) * EE.metresPerDeg(43.7615).lat, 100, 1e-6);
+})();
+
+/* ---- two-point georeference ---- */
+(function () {
+  var truth = { lat: 43.7615, lon: -79.5083, bearing: 27.5 };
+  var pA = { x: 3, y: -2 }, pB = { x: 47, y: 66 };
+  var llA = EE.localToLatLon(pA, truth), llB = EE.localToLatLon(pB, truth);
+
+  var fit = EE.anchorFromTwoPoints(pA, llA, pB, llB);
+  ok('anchorFromTwoPoints solved', !!fit);
+  near('recovered bearing', fit.anchor.bearing, truth.bearing, 1e-6);
+  near('recovered scale error is nil', fit.scaleError, 0, 1e-6);
+
+  var checkA = EE.localToLatLon(pA, fit.anchor);
+  var checkB = EE.localToLatLon(pB, fit.anchor);
+  near('point A lands on its lat', checkA.lat, llA.lat, 1e-9);
+  near('point A lands on its lon', checkA.lon, llA.lon, 1e-9);
+  near('point B lands on its lat', checkB.lat, llB.lat, 1e-8);
+  near('point B lands on its lon', checkB.lon, llB.lon, 1e-8);
+
+  /* A survey 5% too big must be reported, not silently absorbed. */
+  var bad = EE.anchorFromTwoPoints(pA, llA, { x: pA.x + (pB.x - pA.x) * 1.05, y: pA.y + (pB.y - pA.y) * 1.05 }, llB);
+  near('scaleError reports a 5% oversize', bad.scaleError, 0.05, 1e-6);
+})();
+
+/* ---- KML ---- */
+(function () {
+  var project = {
+    name: 'Test roof', address: '121 Pippin Rd',
+    anchor: { lat: 43.7615, lon: -79.5083, bearing: 0 },
+    objects: [
+      { id: 'a', kind: 'rect', name: 'RTU-1', cx: 0, cy: 0, w: 2, l: 3, rot: 0, h: 1.2 },
+      { id: 'b', kind: 'cylinder', name: 'Stack', cx: 10, cy: 4, r: 0.4, h: 2.5 },
+      { id: 'c', kind: 'outline', name: 'Roof', pts: [{ x: -20, y: -20 }, { x: 20, y: -20 }, { x: 20, y: 20 }, { x: -20, y: 20 }], h: 0 }
+    ]
+  };
+  var kml = EE.buildKML(project, { unit: 'm', nameTemplate: '{name} h={h}{u}', circleSegments: 24 });
+  ok('kml produced', !!kml && kml.indexOf('<kml') === 0 === false && kml.indexOf('<kml') > 0);
+  ok('kml has three placemarks', (kml.match(/<Placemark>/g) || []).length === 3);
+  ok('kml encodes height in the name', kml.indexOf('RTU-1 h=1.2m') > 0);
+  ok('kml carries ExtendedData height', kml.indexOf('<Data name="height_m"><value>1.200</value>') > 0);
+  ok('kml extrudes obstructions', kml.indexOf('<extrude>1</extrude>') > 0);
+  ok('outline is clamped, not extruded', kml.indexOf('clampToGround') > 0);
+
+  /* Rings, in document order: the outline folder is written first, then the
+     obstructions in list order — outline, rect, cylinder. */
+  var all = kml.match(/<coordinates>([^<]+)<\/coordinates>/g).map(function (s) {
+    return s.replace(/<\/?coordinates>/g, '').trim().split(/\s+/);
+  });
+  ok('three rings emitted', all.length === 3, 'got ' + all.length);
+  ok('ring is closed', all[0][0] === all[0][all[0].length - 1]);
+
+  var outlineNW = all[0][0].split(',');
+  ok('coordinate is lon,lat,alt',
+    Math.abs(parseFloat(outlineNW[0]) + 79.5083) < 0.01 && Math.abs(parseFloat(outlineNW[1]) - 43.7615) < 0.01);
+  near('outline corner sits 20 m west of the anchor', parseFloat(outlineNW[0]),
+    -79.5083 + (-20) / EE.metresPerDeg(43.7615).lon, 1e-8);
+
+  var rectSW = all[1][0].split(',');
+  near('rect corner sits 1 m west of centre', parseFloat(rectSW[0]),
+    -79.5083 + (-1) / EE.metresPerDeg(43.7615).lon, 1e-8);
+  near('rect corner carries its 1.2 m height', parseFloat(rectSW[2]), 1.2, 1e-9);
+
+  ok('cylinder ring has 24 segments plus closure', all[2].length === 25, 'got ' + all[2].length);
+
+  ok('kml escapes markup in names', EE.buildKML({
+    name: 'x', anchor: project.anchor,
+    objects: [{ id: 'z', kind: 'rect', name: 'A & <B>', cx: 0, cy: 0, w: 1, l: 1, rot: 0, h: 1 }]
+  }, { unit: 'm', nameTemplate: '{name}' }).indexOf('A &amp; &lt;B&gt;') > 0);
+
+  ok('no anchor -> no kml', EE.buildKML({ name: 'x', objects: [] }, {}) === null);
+
+  var ft = EE.fmtName('{name} h={h}{u}', 'RTU', 1.2192, 'ft');
+  ok('name template converts to feet', ft === 'RTU h=4ft', ft);
+})();
+
+/* ---- unit helpers ---- */
+(function () {
+  near('toM feet', EE.toM(10, 'ft'), 3.048, 1e-12);
+  near('fromM feet', EE.fromM(3.048, 'ft'), 10, 1e-12);
+  ok('fmtLen metric', EE.fmtLen(3.456, 'm') === '3.46 m', EE.fmtLen(3.456, 'm'));
+  ok('fmtLen imperial', EE.fmtLen(3.048, 'ft') === '10.0 ft', EE.fmtLen(3.048, 'ft'));
+})();
+
+document.getElementById('out').innerHTML = lines.join('');
+document.getElementById('sum').innerHTML = fail === 0
+  ? '<span class="ok">ALL ' + pass + ' CHECKS PASSED</span>'
+  : '<span class="bad">' + fail + ' FAILED</span> · ' + pass + ' passed';
+document.title = fail === 0 ? 'PASS ' + pass : 'FAIL ' + fail;
+</script>
+</body>
+</html>

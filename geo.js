@@ -1,0 +1,715 @@
+/* Eagle Eye — geometry core.
+
+   Everything that turns pixels into metres lives here, isolated from the UI so it
+   can be exercised directly by tools/test-geo.html.
+
+   Two independent ways to map a photo onto the roof plane:
+
+     1. HOMOGRAPHY (`homographyFromQuad`) — the user taps four points whose real
+        ground coordinates are known (normally the corners of a rectangle they
+        measured with a tape). This needs no lens data, no device attitude and no
+        camera height: it is a pure 2D image-plane -> 2D ground-plane map. It is
+        the accurate mode and the one to prefer on site.
+
+     2. RAY CAST (`rayForPixel` + `groundPoint`) — build the camera ray for a
+        pixel from the focal length, rotate it into the world with the device
+        attitude captured at the shutter, and intersect it with the roof plane a
+        known height below the camera. Needs a calibrated focal length and a
+        trustworthy tilt, so it is the convenience mode. It is also the only mode
+        that knows where the camera is in 3D, so object HEIGHT measurement and
+        tracing on a raised plane are ray-cast only.
+
+   Units are metres and radians throughout. Degrees only ever appear at the
+   boundaries — device orientation events in, geodesy out. */
+'use strict';
+
+var EE = (function () {
+
+  var M_PER_FT = 0.3048;
+  var DEG = Math.PI / 180;
+
+  /* ================= small linear algebra ================= */
+
+  /* Gauss-Jordan with partial pivoting. A is n arrays of n, b is length n.
+     Returns null on a singular system rather than handing back Infinities —
+     a degenerate tap (three points in a line) has to fail loudly. */
+  function solveLinear(A, b) {
+    var n = b.length, i, j, k;
+    var M = [];
+    for (i = 0; i < n; i++) M.push(A[i].slice().concat([b[i]]));
+
+    for (i = 0; i < n; i++) {
+      var piv = i;
+      for (k = i + 1; k < n; k++) if (Math.abs(M[k][i]) > Math.abs(M[piv][i])) piv = k;
+      if (Math.abs(M[piv][i]) < 1e-12) return null;
+      var tmp = M[i]; M[i] = M[piv]; M[piv] = tmp;
+
+      var d = M[i][i];
+      for (j = i; j <= n; j++) M[i][j] /= d;
+      for (k = 0; k < n; k++) {
+        if (k === i) continue;
+        var f = M[k][i];
+        if (f === 0) continue;
+        for (j = i; j <= n; j++) M[k][j] -= f * M[i][j];
+      }
+    }
+    var x = [];
+    for (i = 0; i < n; i++) x.push(M[i][n]);
+    return x;
+  }
+
+  /* 3x3 matrices are flat row-major 9-arrays throughout. */
+  function mul3(a, b) {
+    var o = new Array(9);
+    for (var r = 0; r < 3; r++) for (var c = 0; c < 3; c++) {
+      o[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+    }
+    return o;
+  }
+  function transpose3(m) {
+    return [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+  }
+  function applyM3(m, v) {
+    return [
+      m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+      m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+      m[6] * v[0] + m[7] * v[1] + m[8] * v[2]
+    ];
+  }
+  function invert3(m) {
+    var a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
+    var A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    var det = a * A + b * B + c * C;
+    if (Math.abs(det) < 1e-14) return null;
+    var id = 1 / det;
+    return [
+      A * id, (c * h - b * i) * id, (b * f - c * e) * id,
+      B * id, (a * i - c * g) * id, (c * d - a * f) * id,
+      C * id, (b * g - a * h) * id, (a * e - b * d) * id
+    ];
+  }
+
+  /* ================= homography ================= */
+
+  /* Hartley normalisation: shift to centroid, scale so mean radius is sqrt(2).
+     Pixel coordinates run into the thousands while ground coordinates are single
+     digit metres, and feeding that spread straight into the 8x8 solve loses most
+     of the available precision. Returns the similarity transform used. */
+  function normalise(pts) {
+    var n = pts.length, i, cx = 0, cy = 0;
+    for (i = 0; i < n; i++) { cx += pts[i].x; cy += pts[i].y; }
+    cx /= n; cy /= n;
+    var d = 0;
+    for (i = 0; i < n; i++) d += Math.hypot(pts[i].x - cx, pts[i].y - cy);
+    d /= n;
+    var s = d > 1e-9 ? Math.SQRT2 / d : 1;
+    var out = [];
+    for (i = 0; i < n; i++) out.push({ x: (pts[i].x - cx) * s, y: (pts[i].y - cy) * s });
+    return { pts: out, T: [s, 0, -s * cx, 0, s, -s * cy, 0, 0, 1] };
+  }
+
+  /* Solves the 3x3 that maps src -> dst for four correspondences.
+     h8 is fixed at 1, leaving the eight unknowns of a plane projectivity. */
+  function homographyFromQuad(src, dst) {
+    if (!src || !dst || src.length < 4 || dst.length < 4) return null;
+    var ns = normalise(src.slice(0, 4)), nd = normalise(dst.slice(0, 4));
+    var A = [], b = [];
+    for (var i = 0; i < 4; i++) {
+      var x = ns.pts[i].x, y = ns.pts[i].y, X = nd.pts[i].x, Y = nd.pts[i].y;
+      A.push([x, y, 1, 0, 0, 0, -x * X, -y * X]); b.push(X);
+      A.push([0, 0, 0, x, y, 1, -x * Y, -y * Y]); b.push(Y);
+    }
+    var h = solveLinear(A, b);
+    if (!h) return null;
+    var Hn = [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+
+    var Td = invert3(nd.T);
+    if (!Td) return null;
+    var H = mul3(Td, mul3(Hn, ns.T));
+    /* Scale so h8 = 1 — keeps stored values readable and comparisons stable. */
+    if (Math.abs(H[8]) > 1e-14) { for (var k = 0; k < 9; k++) H[k] /= H[8]; }
+    for (k = 0; k < 9; k++) if (!isFinite(H[k])) return null;
+    return H;
+  }
+
+  /* Applies a homography to a point. Returns null behind the horizon, where w
+     flips sign — those pixels are sky, not roof, and must not silently produce
+     a mirrored point somewhere behind the camera. */
+  function applyH(H, p) {
+    var w = H[6] * p.x + H[7] * p.y + H[8];
+    if (Math.abs(w) < 1e-12) return null;
+    var out = { x: (H[0] * p.x + H[1] * p.y + H[2]) / w, y: (H[3] * p.x + H[4] * p.y + H[5]) / w };
+    if (!isFinite(out.x) || !isFinite(out.y)) return null;
+    return out;
+  }
+
+  /* Corner list for a W (x) by L (y) rectangle, matching the tap order the
+     capture screen asks for: near-left, near-right, far-right, far-left. */
+  function rectRefCorners(w, l) {
+    return [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: l }, { x: 0, y: l }];
+  }
+
+  /* ================= device attitude ================= */
+
+  /* W3C device orientation is an intrinsic Z-X'-Y'' Tait-Bryan triple. The
+     product below is the standard composition and yields device -> world, with
+     world X east, Y north, Z up (alpha is only true-north referenced if the
+     caller has folded in a compass heading).
+
+     Device frame is the screen frame: X right, Y toward the top of the screen,
+     Z out of the glass toward the user. The rear camera therefore looks down
+     device -Z. */
+  function rotFromOrientation(alphaDeg, betaDeg, gammaDeg) {
+    var a = (alphaDeg || 0) * DEG, b = (betaDeg || 0) * DEG, g = (gammaDeg || 0) * DEG;
+    var cA = Math.cos(a), sA = Math.sin(a);
+    var cB = Math.cos(b), sB = Math.sin(b);
+    var cG = Math.cos(g), sG = Math.sin(g);
+
+    return [
+      cA * cG - sA * sB * sG, -sA * cB, cA * sG + sA * sB * cG,
+      sA * cG + cA * sB * sG, cA * cB, sA * sG - cA * sB * cG,
+      -cB * sG, sB, cB * cG
+    ];
+  }
+
+  /* Focal length in pixels from a horizontal field of view, for an image whose
+     long edge is `longPx`. FOV is quoted across the long edge of the sensor. */
+  function focalFromFov(fovDeg, longPx) {
+    return (longPx / 2) / Math.tan((fovDeg * DEG) / 2);
+  }
+
+  /* Camera ray for an image pixel, in the DEVICE frame.
+
+     `screenAngle` is screen.orientation.angle at the shutter. Safari hands back
+     a frame oriented to the interface, so in landscape the image axes are turned
+     relative to the device axes that alpha/beta/gamma are expressed in. Undoing
+     that rotation here is what keeps a landscape capture from measuring sideways. */
+  function rayForPixel(px, py, imgW, imgH, f, screenAngle) {
+    var cx = imgW / 2, cy = imgH / 2;
+    var x = px - cx, y = py - cy;
+
+    var ang = ((screenAngle || 0) % 360 + 360) % 360;
+    var rx = x, ry = y;
+    if (ang === 90) { rx = -y; ry = x; }
+    else if (ang === 180) { rx = -x; ry = -y; }
+    else if (ang === 270) { rx = y; ry = -x; }
+
+    /* Image y grows downward, device Y grows upward; the camera looks down -Z. */
+    var v = [rx / f, -ry / f, -1];
+    var n = Math.hypot(v[0], v[1], v[2]);
+    return [v[0] / n, v[1] / n, v[2] / n];
+  }
+
+  /* Intersects a device-frame ray with a horizontal plane `planeZ` metres above
+     the roof, given a camera `camHeight` above that same roof. Returns null when
+     the ray is level or rising — i.e. above the horizon. */
+  function groundPoint(rayDev, R, camHeight, planeZ) {
+    var d = applyM3(R, rayDev);
+    var z = planeZ || 0;
+    var drop = camHeight - z;
+    if (drop <= 1e-6) return null;
+    if (d[2] > -1e-6) return null;
+    var t = drop / -d[2];
+    return { x: t * d[0], y: t * d[1], range: t };
+  }
+
+  /* World point -> pixel. The exact inverse of rayForPixel + groundPoint, used to
+     paint the metric grid and the traced shapes back onto the photo. That overlay
+     is the only honest way for someone on a roof to see that a calibration is
+     right before they trust a number from it. */
+  function projectToPixel(pt, R, camHeight, imgW, imgH, f, screenAngle, planeZ) {
+    var v = [pt.x, pt.y, (planeZ || 0) - camHeight];
+    var d = applyM3(transpose3(R), v);
+    if (d[2] > -1e-9) return null;           /* behind the camera */
+    var xn = d[0] / -d[2], yn = -d[1] / -d[2];
+    var rx = xn * f, ry = yn * f;
+
+    var ang = ((screenAngle || 0) % 360 + 360) % 360;
+    var x = rx, y = ry;
+    if (ang === 90) { x = ry; y = -rx; }
+    else if (ang === 180) { x = -rx; y = -ry; }
+    else if (ang === 270) { x = -ry; y = rx; }
+
+    return { x: x + imgW / 2, y: y + imgH / 2 };
+  }
+
+  /* Height of something standing on the roof, from its base and top pixels.
+
+     The base fixes where the object is on the plane. The top must lie on the
+     vertical through that base, so walking out along the top ray until its
+     horizontal travel matches the base's gives the altitude directly. */
+  function heightFromBaseTop(basePt, topRayDev, R, camHeight) {
+    var d = applyM3(R, topRayDev);
+    var hx = d[0], hy = d[1];
+    var den = hx * hx + hy * hy;
+    if (den < 1e-12) return null;             /* looking straight down */
+    var t = (basePt.x * hx + basePt.y * hy) / den;
+    if (t <= 0) return null;                  /* top ray points the other way */
+    var h = camHeight + t * d[2];
+    if (!isFinite(h)) return null;
+    return h;
+  }
+
+  /* Solves camera height from one known distance on the roof plane. Ground
+     coordinates scale linearly with camera height, so measuring the pair at a
+     nominal 1 m and dividing gives the true height in closed form. This is what
+     lets someone skip guessing their eye height. */
+  function camHeightFromKnown(rayA, rayB, R, knownDist) {
+    var a = groundPoint(rayA, R, 1, 0), b = groundPoint(rayB, R, 1, 0);
+    if (!a || !b) return null;
+    var d = Math.hypot(a.x - b.x, a.y - b.y);
+    if (d < 1e-9) return null;
+    return knownDist / d;
+  }
+
+  /* ================= shape fitting ================= */
+
+  function hull(pts) {
+    if (pts.length < 3) return pts.slice();
+    var p = pts.slice().sort(function (a, b) { return a.x - b.x || a.y - b.y; });
+    var cross = function (o, a, b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); };
+    var lo = [], hi = [], i;
+    for (i = 0; i < p.length; i++) {
+      while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p[i]) <= 0) lo.pop();
+      lo.push(p[i]);
+    }
+    for (i = p.length - 1; i >= 0; i--) {
+      while (hi.length >= 2 && cross(hi[hi.length - 2], hi[hi.length - 1], p[i]) <= 0) hi.pop();
+      hi.push(p[i]);
+    }
+    lo.pop(); hi.pop();
+    return lo.concat(hi);
+  }
+
+  /* Minimum-area oriented box by rotating calipers.
+
+     Taking the first tapped edge as the axis was the obvious alternative and it
+     is worse: a short or sloppily placed first edge then rotates the whole unit.
+     The min-area box recovers the true rectangle from any tap order, and copes
+     with four corners or with eight points round a messy kerb.
+
+     Three points are the exception, and the tests caught it. The minimum-area
+     box around a right triangle is degenerate — aligning to the hypotenuse
+     encloses exactly the same area as aligning to the legs, so the caliper
+     search picks between them arbitrarily and a clean 2.0 x 3.5 unit came back
+     as 1.74 x 4.03. With three taps the user has given corner-edge-corner, so
+     the two tapped edges are the only sane candidates. */
+  function fitOrientedRect(pts) {
+    if (!pts || pts.length < 3) return null;
+
+    var h;
+    if (pts.length === 3) {
+      h = pts.slice();                      /* candidate axes are p0->p1 and p1->p2 */
+    } else {
+      h = hull(pts);
+      if (h.length < 3) h = pts.slice();
+    }
+
+    var best = null;
+    for (var i = 0; i < h.length; i++) {
+      if (pts.length === 3 && i === 2) break;   /* p2->p0 closes the hypotenuse */
+      var a = h[i], b = h[(i + 1) % h.length];
+      var ex = b.x - a.x, ey = b.y - a.y;
+      var len = Math.hypot(ex, ey);
+      if (len < 1e-9) continue;
+      ex /= len; ey /= len;
+
+      var minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+      for (var j = 0; j < pts.length; j++) {
+        var u = pts[j].x * ex + pts[j].y * ey;
+        var v = -pts[j].x * ey + pts[j].y * ex;
+        if (u < minU) minU = u; if (u > maxU) maxU = u;
+        if (v < minV) minV = v; if (v > maxV) maxV = v;
+      }
+      var w = maxU - minU, l = maxV - minV, area = w * l;
+      if (!best || area < best.area) {
+        var cu = (minU + maxU) / 2, cv = (minV + maxV) / 2;
+        best = {
+          area: area, w: w, l: l,
+          cx: cu * ex - cv * ey,
+          cy: cu * ey + cv * ex,
+          rot: Math.atan2(ey, ex)
+        };
+      }
+    }
+    if (!best) return null;
+
+    /* Report the longer side as the length, so the rotation always describes the
+       short axis turning — otherwise nominally identical units come back as
+       3x2 @ 0 deg and 2x3 @ 90 deg depending on which way they were walked. */
+    var w = best.w, l = best.l, rot = best.rot;
+    if (w > l) { var t = w; w = l; l = t; rot += Math.PI / 2; }
+    while (rot > Math.PI / 2) rot -= Math.PI;
+    while (rot < -Math.PI / 2) rot += Math.PI;
+    return { cx: best.cx, cy: best.cy, w: w, l: l, rot: rot };
+  }
+
+  /* Corners of a fitted rectangle, counter-clockwise. */
+  function rectCorners(r) {
+    var c = Math.cos(r.rot), s = Math.sin(r.rot);
+    var hw = r.w / 2, hl = r.l / 2;
+    var local = [[-hw, -hl], [hw, -hl], [hw, hl], [-hw, hl]];
+    return local.map(function (p) {
+      return { x: r.cx + p[0] * c - p[1] * s, y: r.cy + p[0] * s + p[1] * c };
+    });
+  }
+
+  /* Kasa algebraic circle fit: minimise the residual of
+     x^2 + y^2 + Dx + Ey + F = 0, which is linear in D, E, F.
+     Exact for three points, least-squares beyond that. Plenty for a roof stack
+     or tank traced by hand — the bias of the algebraic form only bites on short
+     arcs, and a tapped rim is never that. */
+  function fitCircle(pts) {
+    if (!pts || pts.length < 3) return null;
+    var n = pts.length, Sx = 0, Sy = 0, Sxx = 0, Syy = 0, Sxy = 0, Sxz = 0, Syz = 0, Sz = 0;
+    for (var i = 0; i < n; i++) {
+      var x = pts[i].x, y = pts[i].y, z = x * x + y * y;
+      Sx += x; Sy += y; Sxx += x * x; Syy += y * y; Sxy += x * y;
+      Sxz += x * z; Syz += y * z; Sz += z;
+    }
+    var sol = solveLinear([[Sxx, Sxy, Sx], [Sxy, Syy, Sy], [Sx, Sy, n]], [-Sxz, -Syz, -Sz]);
+    if (!sol) return null;
+    var cx = -sol[0] / 2, cy = -sol[1] / 2;
+    var rr = cx * cx + cy * cy - sol[2];
+    if (rr <= 0) return null;
+    return { cx: cx, cy: cy, r: Math.sqrt(rr) };
+  }
+
+  function circlePoly(cx, cy, r, n) {
+    var out = [];
+    n = n || 24;
+    for (var i = 0; i < n; i++) {
+      var a = (i / n) * Math.PI * 2;
+      out.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+    }
+    return out;
+  }
+
+  function polygonArea(pts) {
+    if (!pts || pts.length < 3) return 0;
+    var a = 0;
+    for (var i = 0, n = pts.length; i < n; i++) {
+      var p = pts[i], q = pts[(i + 1) % n];
+      a += p.x * q.y - q.x * p.y;
+    }
+    return Math.abs(a) / 2;
+  }
+
+  /* ================= station registration ================= */
+
+  /* Rigid 2D fit (Kabsch): the rotation and translation carrying src onto dst
+     with scale held at 1 — correct for tying stations together, because both
+     already carry their own metric scale.
+
+     `scale` comes back as a diagnostic only. It is what the fit WOULD have used
+     had scale been free, so a value of 1.08 means the two stations disagree
+     about size by 8% and one of the calibrations is wrong. That number is worth
+     more than the fit itself. */
+  function rigid2D(src, dst) {
+    var n = Math.min(src.length, dst.length), i;
+    if (n < 2) return null;
+
+    var sx = 0, sy = 0, dx = 0, dy = 0;
+    for (i = 0; i < n; i++) { sx += src[i].x; sy += src[i].y; dx += dst[i].x; dy += dst[i].y; }
+    sx /= n; sy /= n; dx /= n; dy /= n;
+
+    var S = 0, C = 0, norm = 0;
+    for (i = 0; i < n; i++) {
+      var ax = src[i].x - sx, ay = src[i].y - sy;
+      var bx = dst[i].x - dx, by = dst[i].y - dy;
+      S += ax * by - ay * bx;
+      C += ax * bx + ay * by;
+      norm += ax * ax + ay * ay;
+    }
+    if (norm < 1e-12) return null;
+    var theta = Math.atan2(S, C);
+    var ct = Math.cos(theta), st = Math.sin(theta);
+    var tx = dx - (ct * sx - st * sy);
+    var ty = dy - (st * sx + ct * sy);
+
+    var rms = 0;
+    for (i = 0; i < n; i++) {
+      var px = ct * src[i].x - st * src[i].y + tx;
+      var py = st * src[i].x + ct * src[i].y + ty;
+      rms += (px - dst[i].x) * (px - dst[i].x) + (py - dst[i].y) * (py - dst[i].y);
+    }
+    rms = Math.sqrt(rms / n);
+
+    return { theta: theta, tx: tx, ty: ty, rms: rms, n: n, scale: Math.hypot(C, S) / norm };
+  }
+
+  function applyRigid(t, p) {
+    var c = Math.cos(t.theta), s = Math.sin(t.theta);
+    return { x: c * p.x - s * p.y + t.tx, y: s * p.x + c * p.y + t.ty };
+  }
+
+  /* Similarity fit: dst ~= scale * R(theta) * src + t, with scale FREE.
+
+     Distinct from rigid2D, and the distinction matters. Tying two stations
+     together is a rigid problem — both frames are already metric, so letting
+     scale float would just absorb a real disagreement. Recovering a camera pose
+     from a reference rectangle is the opposite: the scale IS the camera height,
+     the whole point of the fit. Reusing rigid2D there silently fitted a rotation
+     and translation across a 1.6x scale gap, which threw the height tool out by
+     4% and sent the focal-length search 10 degrees wide. */
+  function similarity2D(src, dst) {
+    var n = Math.min(src.length, dst.length), i;
+    if (n < 2) return null;
+
+    var sx = 0, sy = 0, dx = 0, dy = 0;
+    for (i = 0; i < n; i++) { sx += src[i].x; sy += src[i].y; dx += dst[i].x; dy += dst[i].y; }
+    sx /= n; sy /= n; dx /= n; dy /= n;
+
+    var S = 0, C = 0, norm = 0;
+    for (i = 0; i < n; i++) {
+      var ax = src[i].x - sx, ay = src[i].y - sy;
+      var bx = dst[i].x - dx, by = dst[i].y - dy;
+      S += ax * by - ay * bx;
+      C += ax * bx + ay * by;
+      norm += ax * ax + ay * ay;
+    }
+    if (norm < 1e-12) return null;
+
+    var theta = Math.atan2(S, C);
+    var scale = Math.hypot(C, S) / norm;
+    if (!(scale > 0) || !isFinite(scale)) return null;
+
+    var ct = Math.cos(theta) * scale, st = Math.sin(theta) * scale;
+    var tx = dx - (ct * sx - st * sy);
+    var ty = dy - (st * sx + ct * sy);
+
+    var rms = 0;
+    for (i = 0; i < n; i++) {
+      var qx = ct * src[i].x - st * src[i].y + tx;
+      var qy = st * src[i].x + ct * src[i].y + ty;
+      rms += (qx - dst[i].x) * (qx - dst[i].x) + (qy - dst[i].y) * (qy - dst[i].y);
+    }
+
+    return { scale: scale, theta: theta, tx: tx, ty: ty, rms: Math.sqrt(rms / n), n: n };
+  }
+
+  /* Inverse of a similarity: dst frame back into src frame. */
+  function applySimilarityInverse(t, p) {
+    var c = Math.cos(-t.theta), s = Math.sin(-t.theta);
+    var x = (p.x - t.tx) / t.scale, y = (p.y - t.ty) / t.scale;
+    /* Undo the rotation after removing the translation, then the scale — the
+       divide happens first here only because scale and rotation commute. */
+    return { x: c * x - s * y, y: s * x + c * y };
+  }
+
+  /* ================= geodesy ================= */
+
+  /* WGS84 metres per degree, series form. Good to a few millimetres and far
+     simpler than a full geodesic solution — sites are hundreds of metres across,
+     not hundreds of kilometres. */
+  function metresPerDeg(latDeg) {
+    var p = latDeg * DEG;
+    return {
+      lat: 111132.92 - 559.82 * Math.cos(2 * p) + 1.175 * Math.cos(4 * p) - 0.0023 * Math.cos(6 * p),
+      lon: 111412.84 * Math.cos(p) - 93.5 * Math.cos(3 * p) + 0.118 * Math.cos(5 * p)
+    };
+  }
+
+  /* Local plan (x right, y up) -> lat/lon.
+
+     `bearingDeg` is the compass bearing of the plan's +Y axis. So bearing 0 puts
+     plan-up at true north; bearing 90 puts plan-up due east. */
+  function localToLatLon(p, anchor) {
+    var br = (anchor.bearing || 0) * DEG;
+    var c = Math.cos(br), s = Math.sin(br);
+    /* Rotate plan axes onto east/north. */
+    var east = p.x * c + p.y * s;
+    var north = -p.x * s + p.y * c;
+    var m = metresPerDeg(anchor.lat);
+    return {
+      lat: anchor.lat + north / m.lat,
+      lon: anchor.lon + east / (Math.abs(m.lon) < 1e-6 ? 1e-6 : m.lon)
+    };
+  }
+
+  function latLonToLocal(ll, anchor) {
+    var m = metresPerDeg(anchor.lat);
+    var north = (ll.lat - anchor.lat) * m.lat;
+    var east = (ll.lon - anchor.lon) * m.lon;
+    var br = (anchor.bearing || 0) * DEG;
+    var c = Math.cos(br), s = Math.sin(br);
+    return { x: east * c - north * s, y: east * s + north * c };
+  }
+
+  /* Fits anchor lat/lon/bearing so two plan points land on two known lat/lons.
+
+     This is the accurate way to georeference: read the coordinates of two roof
+     corners off an aerial, and the plan is placed to within how well they were
+     read — no GPS, no compass, neither of which behaves on a steel roof.
+     `scaleError` compares the plan distance to the geodetic one, which is a free
+     end-to-end check on the whole survey. */
+  function anchorFromTwoPoints(planA, llA, planB, llB) {
+    var pX = planB.x - planA.x, pY = planB.y - planA.y;
+    var pLen = Math.hypot(pX, pY);
+    if (pLen < 1e-6) return null;
+    var pAng = Math.atan2(pX, pY);          /* clockwise from plan +Y */
+
+    /* localToLatLon expands degrees using metresPerDeg at the ANCHOR latitude, so
+       the fit has to use that same latitude or the two disagree. Measuring at the
+       midpoint instead left a systematic ~2e-6 bias, which is nothing on the
+       ground but quietly poisons scaleError — the one number here whose whole job
+       is to be a trustworthy check on the survey.
+
+       The anchor latitude is not known until the fit is done, so iterate: the
+       anchor lies within the site of llA, metresPerDeg barely moves over that
+       distance, and three passes converge to machine precision. */
+    var anchor = { lat: llA.lat, lon: llA.lon, bearing: 0 };
+    var gLen = 0;
+    for (var it = 0; it < 3; it++) {
+      var m = metresPerDeg(anchor.lat);
+      if (Math.abs(m.lon) < 1e-6) return null;
+
+      var gE = (llB.lon - llA.lon) * m.lon, gN = (llB.lat - llA.lat) * m.lat;
+      gLen = Math.hypot(gE, gN);
+      if (gLen < 1e-6) return null;
+
+      anchor.bearing = ((Math.atan2(gE, gN) - pAng) / DEG % 360 + 360) % 360;
+
+      /* Back the anchor off so planA lands exactly on llA. */
+      var br = anchor.bearing * DEG, c = Math.cos(br), s = Math.sin(br);
+      var eastA = planA.x * c + planA.y * s;
+      var northA = -planA.x * s + planA.y * c;
+      anchor.lat = llA.lat - northA / m.lat;
+      anchor.lon = llA.lon - eastA / m.lon;
+    }
+
+    return { anchor: anchor, scaleError: pLen / gLen - 1, groundDist: gLen, planDist: pLen };
+  }
+
+  /* ================= KML ================= */
+
+  function xmlEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c];
+    });
+  }
+
+  function fmtName(tpl, name, heightM, unit) {
+    var h = unit === 'ft' ? heightM / M_PER_FT : heightM;
+    var hs = (Math.round(h * 100) / 100).toString();
+    return String(tpl || '{name} h={h}{u}')
+      .replace(/\{name\}/g, name)
+      .replace(/\{h\}/g, hs)
+      .replace(/\{u\}/g, unit === 'ft' ? 'ft' : 'm');
+  }
+
+  /* KML coordinates are lon,lat,alt — the one ordering everybody gets wrong.
+     Rings are closed by repeating the first vertex.
+
+     extrude + relativeToGround means Google Earth draws a real solid at the
+     stated height, so the export doubles as a check on the scene before it goes
+     anywhere near a layout tool. */
+  function ring(coords, anchor, altM) {
+    var out = [];
+    for (var i = 0; i < coords.length; i++) {
+      var ll = localToLatLon(coords[i], anchor);
+      out.push(ll.lon.toFixed(8) + ',' + ll.lat.toFixed(8) + ',' + (altM || 0).toFixed(2));
+    }
+    if (out.length) out.push(out[0]);
+    return out.join(' ');
+  }
+
+  function placemark(o, anchor, opts) {
+    var coords = o.kind === 'cylinder'
+      ? circlePoly(o.cx, o.cy, o.r, opts.circleSegments || 24)
+      : (o.kind === 'rect' ? rectCorners(o) : (o.pts || []));
+    if (coords.length < 3) return '';
+
+    var extrude = o.kind === 'outline' ? 0 : 1;
+    var alt = o.kind === 'outline' ? 0 : (o.h || 0);
+    var label = o.kind === 'outline' ? o.name : fmtName(opts.nameTemplate, o.name, o.h || 0, opts.unit);
+
+    var ext = '<ExtendedData>' +
+      '<Data name="type"><value>' + xmlEsc(o.kind) + '</value></Data>' +
+      '<Data name="height_m"><value>' + (o.h || 0).toFixed(3) + '</value></Data>' +
+      (o.kind === 'rect' ? '<Data name="width_m"><value>' + o.w.toFixed(3) + '</value></Data>' +
+        '<Data name="length_m"><value>' + o.l.toFixed(3) + '</value></Data>' +
+        '<Data name="rotation_deg"><value>' + (o.rot / DEG).toFixed(2) + '</value></Data>' : '') +
+      (o.kind === 'cylinder' ? '<Data name="radius_m"><value>' + o.r.toFixed(3) + '</value></Data>' +
+        '<Data name="diameter_m"><value>' + (o.r * 2).toFixed(3) + '</value></Data>' : '') +
+      (o.note ? '<Data name="note"><value>' + xmlEsc(o.note) + '</value></Data>' : '') +
+      '</ExtendedData>';
+
+    return '<Placemark>' +
+      '<name>' + xmlEsc(label) + '</name>' +
+      (o.note ? '<description>' + xmlEsc(o.note) + '</description>' : '') +
+      '<styleUrl>#' + (o.kind === 'outline' ? 'ee-outline' : 'ee-obst') + '</styleUrl>' +
+      ext +
+      '<Polygon><extrude>' + extrude + '</extrude>' +
+      '<altitudeMode>' + (extrude ? 'relativeToGround' : 'clampToGround') + '</altitudeMode>' +
+      '<outerBoundaryIs><LinearRing><coordinates>' +
+      ring(coords, anchor, alt) +
+      '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>';
+  }
+
+  function buildKML(project, opts) {
+    opts = opts || {};
+    var anchor = project.anchor;
+    if (!anchor || typeof anchor.lat !== 'number') return null;
+
+    var outlines = project.objects.filter(function (o) { return o.kind === 'outline'; });
+    var obst = project.objects.filter(function (o) { return o.kind !== 'outline'; });
+
+    var folder = function (name, list) {
+      if (!list.length) return '';
+      return '<Folder><name>' + xmlEsc(name) + '</name>' +
+        list.map(function (o) { return placemark(o, anchor, opts); }).join('') +
+        '</Folder>';
+    };
+
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' +
+      '<name>' + xmlEsc(project.name || 'Eagle Eye survey') + '</name>' +
+      '<description>' + xmlEsc(
+        (project.address || '') +
+        '\nSurveyed with Eagle Eye. Heights are encoded in each placemark name and in ExtendedData.'
+      ) + '</description>' +
+      '<Style id="ee-obst"><LineStyle><color>ff37afd4</color><width>2</width></LineStyle>' +
+      '<PolyStyle><color>5537afd4</color></PolyStyle></Style>' +
+      '<Style id="ee-outline"><LineStyle><color>ffe8f0f4</color><width>3</width></LineStyle>' +
+      '<PolyStyle><fill>0</fill></PolyStyle></Style>' +
+      folder('Roof outline', outlines) +
+      folder('Obstructions', obst) +
+      '</Document></kml>';
+  }
+
+  /* ================= formatting ================= */
+
+  function fmtLen(m, unit, dp) {
+    if (unit === 'ft') {
+      var ft = m / M_PER_FT;
+      return ft.toFixed(dp == null ? 1 : dp) + ' ft';
+    }
+    return m.toFixed(dp == null ? 2 : dp) + ' m';
+  }
+  function fmtArea(m2, unit) {
+    if (unit === 'ft') return Math.round(m2 / (M_PER_FT * M_PER_FT)).toLocaleString() + ' ft²';
+    return (Math.round(m2 * 10) / 10).toLocaleString() + ' m²';
+  }
+  function toM(v, unit) { return unit === 'ft' ? v * M_PER_FT : v; }
+  function fromM(v, unit) { return unit === 'ft' ? v / M_PER_FT : v; }
+
+  return {
+    M_PER_FT: M_PER_FT, DEG: DEG,
+    solveLinear: solveLinear, mul3: mul3, invert3: invert3, applyM3: applyM3, transpose3: transpose3,
+    homographyFromQuad: homographyFromQuad, applyH: applyH, rectRefCorners: rectRefCorners,
+    rotFromOrientation: rotFromOrientation, focalFromFov: focalFromFov,
+    rayForPixel: rayForPixel, groundPoint: groundPoint, projectToPixel: projectToPixel,
+    heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
+    hull: hull, fitOrientedRect: fitOrientedRect, rectCorners: rectCorners,
+    fitCircle: fitCircle, circlePoly: circlePoly, polygonArea: polygonArea,
+    rigid2D: rigid2D, applyRigid: applyRigid,
+    similarity2D: similarity2D, applySimilarityInverse: applySimilarityInverse,
+    metresPerDeg: metresPerDeg, localToLatLon: localToLatLon, latLonToLocal: latLonToLocal,
+    anchorFromTwoPoints: anchorFromTwoPoints,
+    buildKML: buildKML, fmtName: fmtName, xmlEsc: xmlEsc,
+    fmtLen: fmtLen, fmtArea: fmtArea, toM: toM, fromM: fromM
+  };
+})();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = EE;
