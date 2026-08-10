@@ -1105,6 +1105,33 @@ var EE = (function () {
     };
   }
 
+  /* Lat/lon -> east/north metres about an origin, with no bearing involved.
+
+     This is the frame an aerial gives you: already north-aligned, so a survey
+     calibrated from map points needs no separate georeferencing step — the plan
+     IS in map coordinates from the first tap. */
+  function latLonToEastNorth(ll, origin) {
+    var m = metresPerDeg(origin.lat);
+    return { e: (ll.lon - origin.lon) * m.lon, n: (ll.lat - origin.lat) * m.lat };
+  }
+
+  /* Worst and RMS disagreement between a homography and a set of correspondences.
+     With exactly four points a homography fits perfectly and says nothing about
+     its own quality; a fifth point is the first honest check available. */
+  function homographyResidual(H, src, dst) {
+    var n = Math.min(src.length, dst.length);
+    if (!H || n < 1) return null;
+    var worst = 0, sum = 0, used = 0;
+    for (var i = 0; i < n; i++) {
+      var p = applyH(H, src[i]);
+      if (!p) return null;
+      var d = Math.hypot(p.x - dst[i].x, p.y - dst[i].y);
+      if (d > worst) worst = d;
+      sum += d * d; used++;
+    }
+    return { worst: worst, rms: Math.sqrt(sum / used), n: used };
+  }
+
   function latLonToLocal(ll, anchor) {
     var m = metresPerDeg(anchor.lat);
     var north = (ll.lat - anchor.lat) * m.lat;
@@ -1400,6 +1427,7 @@ var EE = (function () {
     rigid2D: rigid2D, applyRigid: applyRigid,
     similarity2D: similarity2D, applySimilarityInverse: applySimilarityInverse,
     metresPerDeg: metresPerDeg, localToLatLon: localToLatLon, latLonToLocal: latLonToLocal,
+    latLonToEastNorth: latLonToEastNorth, homographyResidual: homographyResidual,
     anchorFromTwoPoints: anchorFromTwoPoints,
     buildKML: buildKML, fmtName: fmtName, xmlEsc: xmlEsc,
     planToEastNorth: planToEastNorth, eastNorthBox: eastNorthBox,

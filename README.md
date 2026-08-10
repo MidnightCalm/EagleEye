@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     239 assertions over geo.js — open it in a browser
+    ├── test-geo.html     252 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -310,6 +310,43 @@ imagery, and a flat roof is wall-to-wall rectilinear clutter — membrane seams,
 that swamps any line-based detector. Refining a corner you already chose adds accuracy with no
 chance of inventing geometry.
 
+## Calibrating from an aerial
+
+The longest reference on any site is the roof itself, and somebody has already measured it.
+
+**Trace → From the map.** Tap four points in the photo you can also identify on an aerial —
+roof corners, a drain, a hatch — and paste each one's coordinates. That solves the same plane
+homography a tape-measured rectangle would, over **tens of metres instead of a couple**. No
+tape, no camera height, no tilt, no lens data.
+
+And because the reference frame is east/north, the survey lands **georeferenced with bearing
+0** — no separate locating step, no compass.
+
+A **fifth point is optional and worth taking**: four correspondences always fit a homography
+exactly, so four tell you nothing about their own quality. The fifth is the first thing that
+can disagree, and its residual is reported.
+
+Two caveats, both real:
+
+- **Read error.** Google's aerial runs about 0.15 m/px in town, so a corner is good to roughly
+  half a metre. Over 40 m that is ~1% — comparable to a well-tapped 2.4 m kerb. The long
+  baseline is doing the work.
+- **Building lean.** An orthophoto is rectified to the *ground*, so a roof `h` above it is
+  thrown outward from the image nadir. Across a roof of extent `L` the differential is about
+  `h·L/H` for flying height `H`: a 10 m building, 40 m across, shot from 600 m distorts about
+  0.7 m end to end. Satellite imagery barely leans (`H` is hundreds of km) but is coarser per
+  pixel.
+
+All four points must be at **roof level**. Mixing a roof corner with a point on the ground
+breaks the plane the whole method rests on.
+
+The lean also shifts the whole roof sideways from its true ground position — which here is a
+*feature*, since the layout tool draws on the same kind of imagery and inherits the same
+shift.
+
+The same idea works retroactively: **Check → Correct the scale → From the map** takes two
+traced landmarks and their coordinates and rescales a finished survey to match.
+
 ## A reference is measured in pixels, not metres
 
 The most consequential number in a calibration, and the least obvious. A reference does not
@@ -405,7 +442,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 239 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 252 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

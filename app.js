@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.6.0';
+var VERSION = '1.7.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -329,6 +329,82 @@ function calibrateQuad(st, quadPix, refW, refL) {
         cal.pose = fit;
         cal.camH = fit.scale;
         cal.poseRms = fit.rms;               /* already metres, dst being metres */
+      }
+    }
+  }
+  return cal;
+}
+
+/* Calibrate a shot straight from an aerial.
+
+   The longest reference on any site is the roof itself, and it is already
+   measured — by whoever flew the imagery. Tapping four points in the photo and
+   pasting their coordinates solves the same plane homography a tape-measured
+   rectangle would, over a baseline of tens of metres instead of a couple. It
+   needs no tape, no camera height, no tilt and no lens data, and because the
+   reference frame IS east/north the survey lands georeferenced with bearing 0.
+
+   The honest caveats, both real:
+
+   - Read error. Google's aerial runs about 0.15 m/px in town, so a corner is
+     good to roughly half a metre. Over 40 m that is ~1%, which is comparable to
+     a well-tapped 2.4 m kerb — the long baseline is doing the work.
+   - Building lean. An orthophoto is rectified to the GROUND, so a roof h above it
+     is thrown outward from the image nadir. Across a roof of extent L the
+     differential is about h.L/H for flying height H: a 10 m building, 40 m
+     across, shot from 600 m, distorts by ~0.7 m end to end. Satellite imagery is
+     nearly immune (H is hundreds of km) but coarser per pixel.
+
+   The lean also shifts the whole roof sideways from its true ground position —
+   which for this purpose is a feature, since the layout tool draws on the same
+   kind of imagery and inherits the same shift. */
+function calibrateFromMap(st, pixPts, lls) {
+  if (!pixPts || pixPts.length < 4 || !lls || lls.length < 4) {
+    return { ok: false, err: 'Four points with coordinates are needed.' };
+  }
+  var origin = lls[0];
+  var ground = lls.map(function (ll) {
+    var en = EE.latLonToEastNorth(ll, origin);
+    return { x: en.e, y: en.n };
+  });
+
+  var spread = 0;
+  for (var i = 0; i < ground.length; i++) {
+    for (var j = i + 1; j < ground.length; j++) {
+      spread = Math.max(spread, Math.hypot(ground[i].x - ground[j].x, ground[i].y - ground[j].y));
+    }
+  }
+  if (spread < 2) return { ok: false, err: 'Those points are within ' + spread.toFixed(1) + ' m of each other — spread them across the roof.' };
+
+  var H = EE.homographyFromQuad(pixPts.slice(0, 4), ground.slice(0, 4));
+  if (!H) return { ok: false, err: 'Those four points do not form a usable quad — avoid a straight line.' };
+
+  var cal = {
+    mode: 'quad', H: H, quadPix: pixPts.slice(0, 4),
+    refW: spread, refL: spread,
+    f: EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH)),
+    ok: true, source: 'map', originLL: origin, spread: spread
+  };
+
+  /* A fifth correspondence is the first thing that can disagree — four always
+     fit exactly, so four tell you nothing about their own quality. */
+  if (pixPts.length > 4 && lls.length > 4) {
+    var res = EE.homographyResidual(H, pixPts.slice(4), ground.slice(4));
+    if (res) cal.mapCheck = res;
+  }
+
+  /* Recover the camera pose the same way the tape route does, so the height tool
+     and the coverage model keep working. */
+  if (st.att) {
+    var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var unit = cal.quadPix.map(function (q) {
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, st.screenAngle),
+        R, 1, 0, deckNormalOf(st));
+    });
+    if (unit.every(Boolean)) {
+      var fit = EE.similarity2D(unit, ground.slice(0, 4));
+      if (fit && fit.scale > 0.2 && fit.scale < 30) {
+        cal.pose = fit; cal.camH = fit.scale; cal.poseRms = fit.rms;
       }
     }
   }
@@ -1486,9 +1562,61 @@ function tplTraceCal(st, t) {
   };
 
   var modeSeg = '<div class="seg tight">' +
-    '<button class="' + (t.calMode === 'quad' ? 'active' : '') + '" data-calmode="quad">Measured rectangle</button>' +
+    '<button class="' + (t.calMode === 'quad' ? 'active' : '') + '" data-calmode="quad">Rectangle</button>' +
+    '<button class="' + (t.calMode === 'map' ? 'active' : '') + '" data-calmode="map">From the map</button>' +
     '<button class="' + (t.calMode === 'ray' ? 'active' : '') + '" data-calmode="ray">Tilt + height</button>' +
     '</div>';
+
+  if (t.calMode === 'map') {
+    var mn = t.taps.length;
+    var lls = t.mapLL || (t.mapLL = ['', '', '', '', '']);
+    var parsed = lls.slice(0, Math.max(4, mn)).map(parseLL);
+    var haveAll = mn >= 4 && parsed.slice(0, 4).every(Boolean);
+
+    var spread = 0;
+    if (haveAll) {
+      var g = parsed.slice(0, mn).filter(Boolean).map(function (ll) {
+        return EE.latLonToEastNorth(ll, parsed[0]);
+      });
+      for (var a = 0; a < g.length; a++) for (var b = a + 1; b < g.length; b++) {
+        spread = Math.max(spread, Math.hypot(g[a].e - g[b].e, g[a].n - g[b].n));
+      }
+    }
+
+    var rows = '';
+    for (var i = 0; i < Math.max(4, Math.min(5, mn)); i++) {
+      var ok = !!parsed[i];
+      rows += '<div class="field"><label>POINT ' + (i + 1) +
+        (i === 4 ? ' — OPTIONAL, CHECKS THE OTHER FOUR' : '') +
+        (i < mn ? '' : ' — NOT TAPPED YET') + '</label>' +
+        '<input class="inp mono" data-mapll="' + i + '" value="' + esc(lls[i] || '') +
+        '" placeholder="43.761500, -79.508300"' + (ok ? ' style="border-color:var(--green)"' : '') +
+        ' autocomplete="off"></div>';
+    }
+
+    return modeSeg +
+      '<div class="panel gold"><span class="p-tag">THE ROOF IS THE RULER</span>' +
+      '<div class="p-body">Tap <b>four points</b> you can also find on an aerial — roof corners, ' +
+      'a drain, a hatch — then paste each one\'s coordinates. That solves the calibration over ' +
+      '<b>tens of metres</b> instead of a couple, needs no tape or tilt, and georeferences the ' +
+      'survey at the same time.<br><br>' +
+      'All four must be at <b>roof level</b>. Mixing a roof corner with a point on the ground ' +
+      'breaks the plane the whole method rests on.</div></div>' +
+      (mn < 4
+        ? '<div class="hint">Tap point <b>' + (mn + 1) + ' of 4</b> in the photo. Spread them out — ' +
+        'the further apart, the less a misread coordinate matters.<br>A fifth is optional and is ' +
+        'the only way to check the other four.</div>'
+        : (spread ? '<div class="kv ' + (spread > 15 ? 'good' : 'warn') + '"><span>Baseline</span>' +
+          '<span>' + EE.fmtLen(spread, U(), 1) + (spread > 15 ? '' : ' — spread them wider') + '</span></div>' +
+          '<div class="kv"><span>Reading error of ±0.5 m costs</span><span>±' +
+          (spread > 0 ? (0.5 / spread * 100).toFixed(2) : '—') + '%</span></div>' : '')) +
+      rows +
+      '<div class="hint">In Google Maps, right-click a spot and the coordinates copy straight out.</div>' +
+      '<div class="btn-row">' +
+      (mn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
+      '<button class="btn primary sm" data-act="apply-map"' + (haveAll ? '' : ' disabled') + '>Calibrate</button>' +
+      '</div>';
+  }
 
   if (t.calMode === 'quad') {
     var n = t.taps.length;
@@ -1939,7 +2067,44 @@ function sheetRescale(s) {
   var seg = '<div class="seg tight">' +
     '<button class="' + (mode === 'object' ? 'active' : '') + '" data-rsmode="object">An object</button>' +
     '<button class="' + (mode === 'pair' ? 'active' : '') + '" data-rsmode="pair">Two landmarks</button>' +
+    '<button class="' + (mode === 'map' ? 'active' : '') + '" data-rsmode="map">From the map</button>' +
     '</div>';
+
+  if (mode === 'map') {
+    var mapBody = pts.length >= 2
+      ? '<div class="row2">' +
+      '<div class="field"><label>FROM</label><select class="inp" id="rs-a">' +
+      pts.map(function (o, i) { return '<option value="' + o.id + '"' + (i === 0 ? ' selected' : '') + '>' + esc(o.name || 'landmark') + '</option>'; }).join('') +
+      '</select></div>' +
+      '<div class="field"><label>TO</label><select class="inp" id="rs-b">' +
+      pts.map(function (o, i) { return '<option value="' + o.id + '"' + (i === 1 ? ' selected' : '') + '>' + esc(o.name || 'landmark') + '</option>'; }).join('') +
+      '</select></div></div>' +
+      '<div class="field"><label>COORDINATES OF THE FIRST</label>' +
+      '<input class="inp mono" id="rs-lla" value="' + esc(s.llA || '') + '" placeholder="43.761500, -79.508300" autocomplete="off"></div>' +
+      '<div class="field"><label>COORDINATES OF THE SECOND</label>' +
+      '<input class="inp mono" id="rs-llb" value="' + esc(s.llB || '') + '" placeholder="43.762100, -79.507400" autocomplete="off"></div>' +
+      '<div class="hint">Right-click each point in Google Maps and paste. The distance between ' +
+      'them becomes the reference, so the further apart the better — over 40 m, half a metre of ' +
+      'reading error is about 1%.</div>'
+      : '<div class="panel warn"><span class="p-tag">NEED TWO LANDMARKS</span>' +
+      '<div class="p-body">Trace two landmark points you can also identify on an aerial.</div></div>';
+
+    return '<div class="sheet-head"><span class="sh-title">Correct the scale</span>' +
+      '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+      '<div class="p-body">The roof itself is the longest reference on site, and an aerial has ' +
+      'already measured it.</div>' +
+      '<div class="panel"><span class="p-tag">TWO CAVEATS, BOTH REAL</span>' +
+      '<div class="p-body"><b>Read error:</b> aerial runs about 0.15 m/px in town, so a corner is ' +
+      'good to roughly half a metre.<br><b>Building lean:</b> an orthophoto is rectified to the ' +
+      'ground, so a roof is thrown outward from the image nadir — a 10 m building 40 m across, ' +
+      'shot from 600 m, distorts about 0.7 m end to end. Satellite imagery barely leans but is ' +
+      'coarser per pixel.</div></div>' +
+      seg + mapBody +
+      (pts.length >= 2
+        ? '<label class="chk-line"><input type="checkbox" id="rs-camh" checked> Also update my default camera height</label>' +
+        '<div class="btn-row"><button class="btn primary" data-act="apply-rescale">Rescale the survey</button></div>'
+        : '');
+  }
 
   var body;
   if (mode === 'object') {
@@ -1995,10 +2160,21 @@ function applyRescale() {
   var p = currentProject();
   var s = ui.sheet;
   var trueV = EE.toM(parseFloat(($('#rs-true') || {}).value), U());
-  if (!(trueV > 0)) return toast('Enter the measured value');
+  if (s.mode !== 'map' && !(trueV > 0)) return toast('Enter the measured value');
 
   var cur = 0, what = '';
-  if ((s.mode || 'object') === 'object') {
+  if (s.mode === 'map') {
+    var am = planPointOf(p, ($('#rs-a') || {}).value);
+    var bm = planPointOf(p, ($('#rs-b') || {}).value);
+    var lla = parseLL(($('#rs-lla') || {}).value), llb = parseLL(($('#rs-llb') || {}).value);
+    if (!am || !bm) return toast('Pick two landmarks');
+    if (!lla || !llb) return toast('Paste both coordinates as "lat, lon"');
+    var en = EE.latLonToEastNorth(llb, lla);
+    trueV = Math.hypot(en.e, en.n);
+    if (!(trueV > 1)) return toast('Those coordinates are less than a metre apart');
+    cur = Math.hypot(am.x - bm.x, am.y - bm.y);
+    what = 'aerial, ' + trueV.toFixed(1) + ' m apart';
+  } else if ((s.mode || 'object') === 'object') {
     var sel = ($('#rs-dim') || {}).value || '';
     var parts = sel.split(':');
     var o = p.objects.find(function (q) { return q.id === parts[0]; });
@@ -2674,6 +2850,14 @@ function bindLive() {
 function bindTrace() {
   var body = $('#trace-body'); if (!body) return;
   var t = ui.trace;
+
+  /* Coordinate fields store on every keystroke but only re-render on blur —
+     re-rendering mid-word would tear the input out from under the keyboard. */
+  $$('[data-mapll]').forEach(function (el) {
+    var i = parseInt(el.dataset.mapll, 10);
+    el.oninput = function () { (t.mapLL || (t.mapLL = []))[i] = el.value; };
+    el.onchange = function () { (t.mapLL || (t.mapLL = []))[i] = el.value; render(); };
+  });
   var p = currentProject();
   var st = findStation(p, t.stationId);
 
@@ -2781,7 +2965,8 @@ function snapTap(st, ip) {
 
 function addTap(ip) {
   var t = ui.trace;
-  var lim = t.step === 'cal' ? (t.calMode === 'quad' ? 4 : 2)
+  var lim = t.step === 'cal'
+    ? (t.calMode === 'quad' ? 4 : t.calMode === 'map' ? 5 : 2)
     : (t.tool === 'point' ? 1 : (t.tool === 'height' ? 2 : 64));
   if (t.taps.length >= lim) t.taps.shift();
   t.taps.push(ip);
@@ -2889,6 +3074,7 @@ function handle(el, e) {
     case 'close-trace': ui.trace = null; view.screen = 'project'; ui.plan.fitted = false; return render();
     case 'undo-tap': ui.trace.taps.pop(); return render();
     case 'apply-quad': return applyQuad();
+    case 'apply-map': return applyMap();
     case 'apply-ray': return applyRay();
     case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; return render();
     case 'commit-shape': return commitShape();
@@ -3152,6 +3338,8 @@ function openTrace(stationId) {
     loupe: null,
     refW: EE.fromM(2.4, U()).toFixed(2),
     refL: EE.fromM(1.2, U()).toFixed(2),
+    mapLL: ['', '', '', '', ''],
+    lastSnap: null,
     knownLen: '',
     camH: EE.fromM(db.settings.camH, U()).toFixed(2)
   };
@@ -3186,6 +3374,41 @@ function applyQuad() {
   if (cal.poseRms != null && cal.poseRms > 0.3) {
     msg += ' · tilt looks off, heights may be unreliable';
   }
+  toast(msg);
+
+  t.step = 'trace'; t.taps = [];
+  render();
+}
+
+function applyMap() {
+  var p = currentProject(), t = ui.trace;
+  var st = findStation(p, t.stationId);
+  var lls = (t.mapLL || []).map(parseLL);
+  if (t.taps.length < 4 || !lls.slice(0, 4).every(Boolean)) {
+    return toast('Four tapped points, each with coordinates');
+  }
+  var n = Math.min(t.taps.length, lls.filter(Boolean).length, 5);
+  var cal = calibrateFromMap(st, t.taps.slice(0, n), lls.slice(0, n));
+  if (!cal.ok) return toast(cal.err);
+
+  st.cal = cal;
+
+  /* The reference frame is already east/north about the first point, so the
+     survey is georeferenced the moment it is calibrated — bearing 0, no separate
+     step, no compass. Only the first station may define it. */
+  if (!p.anchor) {
+    p.anchor = { lat: cal.originLL.lat, lon: cal.originLL.lon, bearing: 0 };
+    p.anchorMeta = { method: 'aerial points', scaleError: null };
+  }
+
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+
+  var msg = 'Calibrated from a ' + EE.fmtLen(cal.spread, U(), 1) + ' baseline';
+  if (cal.mapCheck) {
+    msg += ' · check point off by ' + EE.fmtLen(cal.mapCheck.worst, U(), 2);
+  }
+  if (cal.poseRms != null && cal.poseRms > 0.4) msg += ' · tilt disagrees, heights may be off';
   toast(msg);
 
   t.step = 'trace'; t.taps = [];

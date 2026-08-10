@@ -803,6 +803,52 @@ function near(name, a, b, tol) {
   near('100 m north is ~100 m', (n.lat - 43.7615) * EE.metresPerDeg(43.7615).lat, 100, 1e-6);
 })();
 
+/* ---- lat/lon straight to east/north metres ---- */
+(function () {
+  var o = { lat: 43.7615, lon: -79.5083 };
+  var m = EE.metresPerDeg(o.lat);
+
+  near('the origin maps to zero', Math.hypot(
+    EE.latLonToEastNorth(o, o).e, EE.latLonToEastNorth(o, o).n), 0, 1e-12);
+
+  var n100 = EE.latLonToEastNorth({ lat: o.lat + 100 / m.lat, lon: o.lon }, o);
+  near('100 m north reads as 100 m north', n100.n, 100, 1e-6);
+  near('and no east component', n100.e, 0, 1e-12);
+
+  var e50 = EE.latLonToEastNorth({ lat: o.lat, lon: o.lon + 50 / m.lon }, o);
+  near('50 m east reads as 50 m east', e50.e, 50, 1e-6);
+
+  /* Distances must agree with the geodesy used everywhere else. */
+  var a = { lat: 43.7615, lon: -79.5083 }, b = { lat: 43.7620, lon: -79.5075 };
+  var en = EE.latLonToEastNorth(b, a);
+  var viaAnchor = EE.latLonToLocal(b, { lat: a.lat, lon: a.lon, bearing: 0 });
+  near('agrees with latLonToLocal at bearing 0 (x)', en.e, viaAnchor.x, 1e-9);
+  near('agrees with latLonToLocal at bearing 0 (y)', en.n, viaAnchor.y, 1e-9);
+})();
+
+/* ---- homography residual: four points cannot check themselves ---- */
+(function () {
+  var src = [{x:0,y:0},{x:100,y:0},{x:100,y:80},{x:0,y:80},{x:50,y:40}];
+  var dst = [{x:0,y:0},{x:10,y:0},{x:10,y:8},{x:0,y:8},{x:5,y:4}];
+  var H = EE.homographyFromQuad(src.slice(0,4), dst.slice(0,4));
+
+  var self = EE.homographyResidual(H, src.slice(0,4), dst.slice(0,4));
+  near('the four points it was built from always fit exactly', self.worst, 0, 1e-9);
+
+  var check = EE.homographyResidual(H, src.slice(4), dst.slice(4));
+  near('a consistent fifth point also fits', check.worst, 0, 1e-9);
+  ok('and it is the first thing that could have disagreed', check.n === 1);
+
+  /* Move the fifth point and the residual must report it. */
+  var bad = EE.homographyResidual(H, src.slice(4), [{x:5.4,y:4.3}]);
+  near('a displaced check point is measured', bad.worst, Math.hypot(0.4,0.3), 1e-9);
+
+  var multi = EE.homographyResidual(H, src, dst);
+  near('rms over all five is nil for exact data', multi.rms, 0, 1e-9);
+  ok('null for no points', EE.homographyResidual(H, [], []) === null);
+  ok('null without a homography', EE.homographyResidual(null, src, dst) === null);
+})();
+
 /* ---- two-point georeference ---- */
 (function () {
   var truth = { lat: 43.7615, lon: -79.5083, bearing: 27.5 };
