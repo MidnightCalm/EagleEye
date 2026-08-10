@@ -989,6 +989,52 @@ var EE = (function () {
       '</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>';
   }
 
+  /* Plan frame -> east/north metres about the anchor.
+
+     The plan's +Y sits at the anchor bearing, so a north-up raster has to be
+     built in east/north rather than in plan coordinates. Same rotation that
+     localToLatLon applies, exposed on its own so a renderer can work in metres
+     and convert once at the end. */
+  function planToEastNorth(pt, anchor) {
+    var br = (anchor.bearing || 0) * DEG;
+    var c = Math.cos(br), s = Math.sin(br);
+    return { e: pt.x * c + pt.y * s, n: -pt.x * s + pt.y * c };
+  }
+
+  /* East/north metre bounds -> a geodetic LatLonBox.
+
+     LatLonBox is axis-aligned in lat/lon and its <rotation> is a separate spin of
+     the image about the box centre in an unspecified frame. At 43 N a degree of
+     longitude is ~1.38x shorter than a degree of latitude, so a non-zero rotation
+     is not safely defined — the raster is rendered north-up and rotation stays 0. */
+  function eastNorthBox(bounds, anchor) {
+    var m = metresPerDeg(anchor.lat);
+    return {
+      north: anchor.lat + bounds.maxN / m.lat,
+      south: anchor.lat + bounds.minN / m.lat,
+      east: anchor.lon + bounds.maxE / m.lon,
+      west: anchor.lon + bounds.minE / m.lon
+    };
+  }
+
+  function buildGroundOverlayKML(box, opts) {
+    opts = opts || {};
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' +
+      '<name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
+      '<description>' + xmlEsc(opts.description || '') + '</description>' +
+      '<GroundOverlay><name>' + xmlEsc(opts.name || 'Eagle Eye plan') + '</name>' +
+      '<drawOrder>1</drawOrder>' +
+      '<Icon><href>' + xmlEsc(opts.href || 'files/plan.png') + '</href></Icon>' +
+      '<LatLonBox>' +
+      '<north>' + box.north.toFixed(9) + '</north>' +
+      '<south>' + box.south.toFixed(9) + '</south>' +
+      '<east>' + box.east.toFixed(9) + '</east>' +
+      '<west>' + box.west.toFixed(9) + '</west>' +
+      '<rotation>0</rotation>' +
+      '</LatLonBox></GroundOverlay></Document></kml>';
+  }
+
   function buildKML(project, opts) {
     opts = opts || {};
     var anchor = project.anchor;
@@ -1059,6 +1105,8 @@ var EE = (function () {
     metresPerDeg: metresPerDeg, localToLatLon: localToLatLon, latLonToLocal: latLonToLocal,
     anchorFromTwoPoints: anchorFromTwoPoints,
     buildKML: buildKML, fmtName: fmtName, xmlEsc: xmlEsc,
+    planToEastNorth: planToEastNorth, eastNorthBox: eastNorthBox,
+    buildGroundOverlayKML: buildGroundOverlayKML,
     fmtLen: fmtLen, fmtArea: fmtArea, toM: toM, fromM: fromM
   };
 })();

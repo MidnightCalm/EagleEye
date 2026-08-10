@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.1.0';
+var VERSION = '1.2.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -987,12 +987,16 @@ function tplExport(p) {
     '<div class="kv"><span>Circle segments</span><span>' + s.circleSegments + '</span></div>' +
     '<div class="kv"><span>Photos on device</span><span>' + fmtBytes(ui.storageBytes) + '</span></div></div>' +
 
-    '<div class="btn-row"><button class="btn primary" data-act="export-kml"' + (p.anchor ? '' : ' disabled') + '>Export KML</button></div>' +
+    '<div class="btn-row"><button class="btn primary" data-act="export-kmz"' + (p.anchor ? '' : ' disabled') + '>Export KMZ overlay</button></div>' +
+    '<div class="hint">Confirmed on 2026-08-10: HelioScope takes a <b>KMZ at true scale</b> via ' +
+    'Designer → Advanced → Overlays. A bare PNG carries no coordinates, so it lands unscaled — ' +
+    'use the KMZ.</div>' +
+    '<div class="btn-row"><button class="btn ghost-gold" data-act="export-kml"' + (p.anchor ? '' : ' disabled') + '>Vector KML</button></div>' +
     '<div class="btn-row">' +
     '<button class="btn ghost-gold" data-act="export-csv">Schedule CSV</button>' +
     '<button class="btn ghost" data-act="export-json">Backup JSON</button></div>' +
-    '<div class="hint">KML opens in Google Earth as solid blocks at their real heights — worth a ' +
-    'look before it goes anywhere near a layout.</div>' +
+    '<div class="hint">The vector KML opens in Google Earth as solid blocks at their real heights — ' +
+    'worth a look before anything goes near a layout.</div>' +
     '<div class="foot-spacer"></div></div>';
 }
 
@@ -2389,6 +2393,7 @@ function handle(el, e) {
     case 'confirm-yes': return confirmYes();
 
     case 'export-kml': return exportKml();
+    case 'export-kmz': return exportKmz();
     case 'export-csv': return exportCsv();
     case 'export-json': return exportJson();
   }
@@ -2883,8 +2888,12 @@ function applyGeoManual() {
 /* ================= export ================= */
 
 function deliver(filename, text, mime) {
-  var blob = new Blob([text], { type: mime });
+  deliverBlob(filename, new Blob([text], { type: mime }));
+}
+
+function deliverBlob(filename, blob) {
   var file = null;
+  var mime = blob.type || 'application/octet-stream';
   try { file = new File([blob], filename, { type: mime }); } catch (e) { /* older Safari */ }
 
   /* The iOS share sheet is the only route that reaches Files, Mail and AirDrop;
@@ -2933,6 +2942,228 @@ function exportCsv() {
     return r.map(function (c) { return /[",\n]/.test(c) ? '"' + String(c).replace(/"/g, '""') + '"' : c; }).join(',');
   }).join('\n');
   deliver(slug(p.name) + '-schedule.csv', csv, 'text/csv');
+}
+
+/* ================= KMZ overlay =================
+
+   A KMZ is a plain zip, so writing one needs no library — and STORE (no
+   compression) is the right method here because the payload is a PNG, which is
+   already deflated. Compressing it again would cost CPU on a phone to save
+   nothing. */
+
+var CRC_TABLE = (function () {
+  var t = new Uint32Array(256);
+  for (var n = 0; n < 256; n++) {
+    var c = n;
+    for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  var c = 0xFFFFFFFF;
+  for (var i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function zipStore(entries) {
+  var enc = new TextEncoder();
+  var parts = [], central = [], offset = 0;
+
+  var dosTime = 0, dosDate = 0;
+  (function () {
+    var d = new Date();
+    dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  })();
+
+  entries.forEach(function (e) {
+    var name = enc.encode(e.name);
+    var data = e.data instanceof Uint8Array ? e.data : enc.encode(e.data);
+    var crc = crc32(data);
+
+    var lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);          /* version needed */
+    lh.setUint16(6, 0, true);           /* flags */
+    lh.setUint16(8, 0, true);           /* method 0 = store */
+    lh.setUint16(10, dosTime, true);
+    lh.setUint16(12, dosDate, true);
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, data.length, true);
+    lh.setUint32(22, data.length, true);
+    lh.setUint16(26, name.length, true);
+    lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), name, data);
+
+    var ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true);
+    ch.setUint16(4, 20, true);
+    ch.setUint16(6, 20, true);
+    ch.setUint16(8, 0, true);
+    ch.setUint16(10, 0, true);
+    ch.setUint16(12, dosTime, true);
+    ch.setUint16(14, dosDate, true);
+    ch.setUint32(16, crc, true);
+    ch.setUint32(20, data.length, true);
+    ch.setUint32(24, data.length, true);
+    ch.setUint16(28, name.length, true);
+    ch.setUint32(42, offset, true);
+    central.push(new Uint8Array(ch.buffer), name);
+
+    offset += 30 + name.length + data.length;
+  });
+
+  var cdSize = central.reduce(function (a, b) { return a + b.length; }, 0);
+  var eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, entries.length, true);
+  eocd.setUint16(10, entries.length, true);
+  eocd.setUint32(12, cdSize, true);
+  eocd.setUint32(16, offset, true);
+
+  return new Blob(parts.concat(central, [new Uint8Array(eocd.buffer)]),
+    { type: 'application/vnd.google-earth.kmz' });
+}
+
+/* The traced plan as a north-up transparent raster, in east/north metres.
+
+   Drawn in east/north rather than plan coordinates because a LatLonBox cannot be
+   rotated safely, so the image itself has to carry the rotation. Colours are for
+   an overlay on an AERIAL: magenta and cyan read on both pale concrete and dark
+   membrane, and every mark carries a dark underlay. */
+function renderPlanRaster(p) {
+  var objs = placedObjects(p);
+  if (!objs.length || !p.anchor) return null;
+
+  var pts = [];
+  objs.forEach(function (o) {
+    var poly = o.kind === 'rect' ? EE.rectCorners(o)
+      : o.kind === 'cylinder' ? EE.circlePoly(o.cx, o.cy, o.r, 32)
+        : (o.pts || []);
+    poly.forEach(function (q) { pts.push(EE.planToEastNorth(q, p.anchor)); });
+  });
+  if (!pts.length) return null;
+
+  var pad = 4;
+  var minE = Math.min.apply(null, pts.map(function (q) { return q.e; })) - pad;
+  var maxE = Math.max.apply(null, pts.map(function (q) { return q.e; })) + pad;
+  var minN = Math.min.apply(null, pts.map(function (q) { return q.n; })) - pad - 4;
+  var maxN = Math.max.apply(null, pts.map(function (q) { return q.n; })) + pad;
+
+  /* HelioScope publishes ~3600x2400 and under 10 MB as guidance, so the sampling
+     is chosen to fit rather than fixed. */
+  var wM = maxE - minE, hM = maxN - minN;
+  var gsd = Math.max(0.01, Math.max(wM / 3400, hM / 2300));
+  var W = Math.round(wM / gsd), H = Math.round(hM / gsd);
+
+  var cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  var g = cv.getContext('2d');
+  var X = function (e) { return (e - minE) / gsd; };
+  var Y = function (n) { return (maxN - n) / gsd; };
+  var EN = function (q) { var a = EE.planToEastNorth(q, p.anchor); return { x: X(a.e), y: Y(a.n) }; };
+  var s = Math.max(1, W / 1200);
+
+  var stroked = function (text, x, y, col, px) {
+    g.font = '600 ' + Math.round(px) + 'px -apple-system, system-ui, sans-serif';
+    g.lineWidth = Math.max(3, px * 0.22); g.strokeStyle = 'rgba(0,0,0,0.85)';
+    g.lineJoin = 'round'; g.strokeText(text, x, y);
+    g.fillStyle = col; g.fillText(text, x, y);
+  };
+
+  /* 5 m grid */
+  g.strokeStyle = 'rgba(0,210,255,0.5)'; g.lineWidth = 2 * s;
+  g.beginPath();
+  for (var e0 = Math.ceil(minE / 5) * 5; e0 <= maxE; e0 += 5) { g.moveTo(X(e0), 0); g.lineTo(X(e0), H); }
+  for (var n0 = Math.ceil(minN / 5) * 5; n0 <= maxN; n0 += 5) { g.moveTo(0, Y(n0)); g.lineTo(W, Y(n0)); }
+  g.stroke();
+
+  objs.forEach(function (o) {
+    var poly = o.kind === 'rect' ? EE.rectCorners(o)
+      : o.kind === 'cylinder' ? EE.circlePoly(o.cx, o.cy, o.r, 48)
+        : (o.pts || []);
+    if (poly.length < 2) return;
+    var sc = poly.map(EN);
+
+    g.beginPath();
+    sc.forEach(function (q, i) { i ? g.lineTo(q.x, q.y) : g.moveTo(q.x, q.y); });
+    g.closePath();
+
+    if (o.kind === 'outline') {
+      g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 10 * s; g.stroke();
+      g.strokeStyle = '#FF3DAE'; g.lineWidth = 5 * s; g.stroke();
+      return;
+    }
+    if (o.kind === 'point') {
+      var q0 = sc[0];
+      g.strokeStyle = '#6ED29A'; g.lineWidth = 4 * s;
+      g.beginPath();
+      g.moveTo(q0.x - 12 * s, q0.y); g.lineTo(q0.x + 12 * s, q0.y);
+      g.moveTo(q0.x, q0.y - 12 * s); g.lineTo(q0.x, q0.y + 12 * s); g.stroke();
+      return;
+    }
+    g.fillStyle = 'rgba(212,175,55,0.55)'; g.fill();
+    g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 7 * s; g.stroke();
+    g.strokeStyle = '#E8C96A'; g.lineWidth = 3.5 * s; g.stroke();
+
+    var c = EN({ x: o.cx, y: o.cy });
+    stroked(EE.fmtName(db.settings.nameTemplate, o.name || '', o.h || 0, db.settings.nameUnit),
+      c.x + 8 * s, c.y - 6 * s, '#FFFFFF', 26 * s);
+  });
+
+  /* Scale bar, alternating 5 m blocks — the one mark that has to be unambiguous
+     on any background, and the thing to measure if the import is ever doubted. */
+  var barM = 20, bx = X(minE + 2), by = Y(minN + 2.2), bw = barM / gsd, bh = 0.6 / gsd;
+  for (var i = 0; i < 4; i++) {
+    g.fillStyle = i % 2 === 0 ? '#FFFFFF' : '#000000';
+    g.fillRect(bx + i * bw / 4, by, bw / 4, bh);
+  }
+  g.strokeStyle = '#000000'; g.lineWidth = 3 * s; g.strokeRect(bx, by, bw, bh);
+  stroked(barM + '.000 m', bx, by - 10 * s, '#FFFFFF', 26 * s);
+
+  /* North arrow — up, by construction */
+  var ax = X(maxE - 3), ay = Y(maxN - 3);
+  g.fillStyle = '#FFFFFF'; g.strokeStyle = 'rgba(0,0,0,0.85)'; g.lineWidth = 4 * s;
+  g.beginPath();
+  g.moveTo(ax, ay - 26 * s); g.lineTo(ax - 10 * s, ay + 12 * s); g.lineTo(ax + 10 * s, ay + 12 * s);
+  g.closePath(); g.fill(); g.stroke();
+  stroked('N', ax - 9 * s, ay + 42 * s, '#FFFFFF', 30 * s);
+
+  stroked(p.name + '  —  ' + gsd.toFixed(3) + ' m/px  —  north up',
+    8 * s, 30 * s, '#FFFFFF', 26 * s);
+
+  return { canvas: cv, bounds: { minE: minE, maxE: maxE, minN: minN, maxN: maxN }, gsd: gsd, w: W, h: H };
+}
+
+function exportKmz() {
+  var p = currentProject();
+  if (!p.anchor) return toast('Locate the survey first');
+  var r = renderPlanRaster(p);
+  if (!r) return toast('Nothing placed to export');
+
+  r.canvas.toBlob(function (png) {
+    if (!png) return toast('Could not render the overlay');
+    png.arrayBuffer().then(function (buf) {
+      var box = EE.eastNorthBox(r.bounds, p.anchor);
+      var doc = EE.buildGroundOverlayKML(box, {
+        name: p.name + ' — plan',
+        href: 'files/plan.png',
+        description: (p.address || '') +
+          '\nNorth-up plan overlay at ' + r.gsd.toFixed(3) + ' m/px. ' +
+          'The scale bar is exactly 20.000 m. Traced with Eagle Eye ' + VERSION + '.' +
+          (p.scaleRef ? '\nScale from a ' + p.scaleRef.method + ' baseline of ' +
+            EE.fmtLen(p.scaleRef.lengthM, 'm') + ' (±' + (p.scaleRef.relSigma * 100).toFixed(3) + '%).' : '') +
+          '\nDeck assumed flat to ±' + EE.fmtLen(db.settings.deckUnc, 'm', 2) + '.'
+      });
+      var blob = zipStore([
+        { name: 'doc.kml', data: doc },
+        { name: 'files/plan.png', data: new Uint8Array(buf) }
+      ]);
+      deliverBlob(slug(p.name) + '-plan.kmz', blob);
+      toast('KMZ · ' + r.w + '×' + r.h + ' px at ' + r.gsd.toFixed(3) + ' m/px');
+    });
+  }, 'image/png');
 }
 
 function exportJson() {

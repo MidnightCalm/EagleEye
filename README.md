@@ -142,12 +142,32 @@ disagree, and it is worth knowing before the layout is drawn.
 
 ## Export
 
-> **Verify this before relying on it.** An exhaustive search of HelioScope's documentation
-> turned up *no* evidence that it imports vector KML geometry — no polygon, no keepout, no
-> field segment; CAD and PVsyst are export-only. What *is* documented is Designer → Advanced →
-> Overlays, which accepts jpg/png/kmz/kml as **georeferenced imagery** locked to true scale.
-> Upload one of each and record what actually lands. If vector import does not work, the right
-> answer is a georeferenced raster, not this KML.
+**Tested against HelioScope on 2026-08-10**, via Designer → Advanced → Overlays → Upload
+Overlay:
+
+| file | result |
+|---|---|
+| **KMZ** | lands at **true scale**, correctly placed |
+| **KML** | lands at **true scale**, correctly placed |
+| bare **PNG** | *unscaled* — has to be placed by hand |
+
+The PNG result is not a defect: a PNG contains no coordinates, so there is nothing for
+HelioScope to scale it by. That is the entire reason the KMZ exists — it is the same image
+plus a `LatLonBox` saying where its corners belong. **Use the KMZ.** The bare PNG is only
+worth having as a movable fallback when the georeferencing itself is suspect.
+
+**KMZ overlay** *(Export tab, primary)* — the traced plan rendered north-up as a transparent
+PNG with a 20.000 m scale bar, north arrow, 5 m grid and every object labelled with its
+height, wrapped with a `GroundOverlay` at `rotation=0`. Sampling is chosen to stay inside
+HelioScope's ~3600 × 2400 px guidance; a 40 × 30 m roof comes out around 370 KB.
+
+Rendered in **east/north**, not plan coordinates, because a `LatLonBox` is axis-aligned in
+lat/lon and its `<rotation>` is a separate spin about the box centre in an unspecified frame.
+At 43° N a degree of longitude is ~1.38× shorter than a degree of latitude, so a non-zero
+rotation is not safely defined — the survey's bearing is baked into the raster instead.
+
+The KMZ is written without a zip library: a KMZ is a plain zip, and `STORE` is the right
+method because the payload is a PNG that is already deflated.
 
 **KML** — one folder for the roof outline, one for obstructions. Rectangles export as
 polygons; cylinders as 24-sided polygons (adjustable). Each placemark is extruded to its real
@@ -316,6 +336,13 @@ To run it locally:
 ```bash
 py -m http.server 8795 --directory eagle-eye
 ```
+
+`tools/make-helioscope-test.py` regenerates the matched probe pair used to establish the
+table above — the same geometry as vector KML and as raster KMZ, with a 20.000 m scale bar,
+an L-marker asymmetric in both axes (so a mirror or a quarter-turn is obvious rather than
+plausible), and heights in the placemark names. It self-checks before writing: the scale bar
+is measured back out of its own emitted coordinates, and the KMZ's box is checked for square
+ground. Point it at a real site with `--lat` / `--lon`.
 
 ## What it does not do
 
