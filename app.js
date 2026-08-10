@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.10.0';
+var VERSION = '1.10.1';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -593,8 +593,26 @@ function deckNormalOf(st) {
    for. */
 
 var attSigmaRad = function () { return db.settings.attSigma * Math.PI / 180; };
-function trustedRadius() {
-  return EE.maxTrustedRange(db.settings.camH, attSigmaRad(), db.settings.tolerance, db.settings.deckUnc);
+/* The honest radius of a standpoint, from the height that shot ACTUALLY used.
+
+   This took the global setting for everything, which put the dashed ring on the
+   plan and the colour inside it on two different heights — a shot taken at 3 m on
+   a pole got a ring sized for a 1.55 m default. The setting is only a starting
+   guess for a shot that does not exist yet; a real shot knows its own height. */
+function trustedRadius(camH) {
+  var h = camH > 0 ? camH : db.settings.camH;
+  return EE.maxTrustedRange(h, attSigmaRad(), db.settings.tolerance, db.settings.deckUnc);
+}
+
+/* A representative height for headline figures: what the survey actually used. */
+function typicalCamH(p) {
+  var hs = [];
+  (p ? p.stations : []).forEach(function (st) {
+    if (st.cal && st.cal.ok && st.cal.camH > 0) hs.push(st.cal.camH);
+  });
+  if (!hs.length) return db.settings.camH;
+  hs.sort(function (a, b) { return a - b; });
+  return hs[Math.floor(hs.length / 2)];
 }
 
 /* The ground-plane homography for a station, whichever way it was calibrated. */
@@ -662,7 +680,8 @@ function stationFootprint(p, st) {
   var fp = EE.frameFootprint(H, st.imgW, st.imgH, 0.25);
   if (!fp) return null;
 
-  var poly = clipToCircle(fp.ground, cam.x, cam.y, Math.max(0.5, trustedRadius()), 24);
+  var poly = clipToCircle(fp.ground, cam.x, cam.y,
+    Math.max(0.5, trustedRadius(st.cal && st.cal.camH)), 24);
   if (poly.length < 3) return null;
   return poly.map(function (q) { return EE.applyRigid(t, q); });
 }
@@ -937,17 +956,20 @@ function buildChecklist(p) {
     'HelioScope needs a height for every obstruction. Measure with the height tool or type it.', 'object', noH[0].id);
 
   var far = [];
-  var tr = trustedRadius();
+  var tr = trustedRadius(typicalCamH(p));
   p.objects.forEach(function (o) {
     if (o.kind === 'point') return;
     var d = objectRange(p, o);
-    if (d != null && d > tr) far.push({ o: o, d: d });
+    var st = findStation(p, o.stationId);
+    /* judged against the radius of the shot it came from, not a global one */
+    var lim = trustedRadius(st && st.cal && st.cal.camH);
+    if (d != null && d > lim) far.push({ o: o, d: d, lim: lim });
   });
   if (far.length) {
     far.sort(function (a, b) { return b.d - a.d; });
     add('warn', far.length + (far.length === 1 ? ' object traced beyond the trusted radius' : ' objects traced beyond the trusted radius'),
       'Furthest is ' + esc(far[0].o.name || 'unnamed') + ' at ' + EE.fmtLen(far[0].d, U(), 1) +
-      ', past ' + EE.fmtLen(tr, U(), 1) + '. Re-trace it from closer.', 'object', far[0].o.id);
+      ', past ' + EE.fmtLen(far[0].lim, U(), 1) + '. Re-trace it from closer.', 'object', far[0].o.id);
   }
 
   if (!p.objects.some(function (o) { return o.kind === 'outline'; }))
@@ -1312,7 +1334,7 @@ function tplCheck(p) {
       '</div>';
   }).join('');
 
-  var tr = trustedRadius();
+  var tr = trustedRadius(typicalCamH(p));
   var s = db.settings;
   var corr = totalScaleCorrection(p);
   return '<div class="screen" style="padding-top:14px">' +
@@ -1549,7 +1571,7 @@ function tplLive() {
       '<div class="field"><label>ALIGN — NUDGE UNTIL THE WIREFRAME SITS ON THE REAL UNITS</label>' +
       '<input type="range" class="slider" id="live-yaw" min="-180" max="180" step="0.5" value="' + (l.yaw || 0) + '"></div>' +
       '<div class="hint">' + (noH ? '<b>' + noH + '</b> object' + (noH === 1 ? '' : 's') + ' still need a height — drawn amber. ' : '') +
-      'Trusted to <b>' + EE.fmtLen(trustedRadius(), U(), 1) + '</b> from here.</div>';
+      'Trusted to <b>' + EE.fmtLen(trustedRadius(liveCamH(p, l)), U(), 1) + '</b> from here.</div>';
   }
 
   return '<div class="full">' +
@@ -1559,6 +1581,11 @@ function tplLive() {
     (l.err ? '' : '<video id="live-video" autoplay playsinline muted></video><canvas id="live-canvas"></canvas>') +
     '</div>' +
     '<div class="full-foot">' + foot + '</div></div>';
+}
+
+function liveCamH(p, l) {
+  var st = l && findStation(p, l.stationId);
+  return (st && st.cal && st.cal.camH) || db.settings.camH;
 }
 
 /* project frame -> the alpha-referenced world frame the live attitude lives in */
@@ -1619,7 +1646,7 @@ function paintLive() {
     g.strokeStyle = 'rgba(110,210,154,0.5)'; g.lineWidth = lw;
     g.setLineDash([11 * scale, 9 * scale]);
     g.beginPath();
-    strokeScreenPoly(g, EE.circlePoly(cam.x, cam.y, trustedRadius(), 72).map(toPix), true);
+    strokeScreenPoly(g, EE.circlePoly(cam.x, cam.y, trustedRadius(camH), 72).map(toPix), true);
     g.stroke(); g.setLineDash([]);
   }
 
@@ -1632,7 +1659,7 @@ function paintLive() {
           var e = cov.data[r * cov.cols + c];
           if (isFinite(e) && e <= db.settings.tolerance) continue;
           var wx = cov.minX + (c + 0.5) * cov.cell, wy = cov.minY + (r + 0.5) * cov.cell;
-          if (cam && Math.hypot(wx - cam.x, wy - cam.y) > trustedRadius() * 1.7) continue;
+          if (cam && Math.hypot(wx - cam.x, wy - cam.y) > trustedRadius(camH) * 1.7) continue;
           var q = toPix({ x: wx, y: wy });
           if (!q) continue;
           var sz = Math.max(3, 30 * scale);
@@ -2103,7 +2130,7 @@ function sheetError() {
     'the point by <b>(h² + d²)/h</b> per radian. It grows with the <b>square</b> of range and shrinks ' +
     'with camera height — which is why standing closer beats every other improvement.</div>' +
     rows +
-    '<div class="kv"><span>Trusted radius</span><span>' + EE.fmtLen(trustedRadius(), U(), 1) + '</span></div>' +
+    '<div class="kv"><span>Trusted radius</span><span>' + EE.fmtLen(trustedRadius(typicalCamH(currentProject())), U(), 1) + '</span></div>' +
     '<div class="row3">' +
     '<div class="field"><label>TOLERANCE</label><input class="inp mono" id="err-tol" inputmode="decimal" value="' + EE.fromM(s.tolerance, U()).toFixed(2) + '"></div>' +
     '<div class="field"><label>TILT σ (°)</label><input class="inp mono" id="err-att" inputmode="decimal" value="' + s.attSigma + '"></div>' +
@@ -2279,7 +2306,7 @@ function sheetHowTo() {
 
     '<div class="chk-list">' +
     step(1, 'Stand close', 'Position error grows with the <b>square</b> of distance. Inside ' +
-      EE.fmtLen(trustedRadius(), U(), 1) + ' it meets your tolerance; at twice that it is four times worse. ' +
+      EE.fmtLen(trustedRadius(typicalCamH(currentProject())), U(), 1) + ' it meets your tolerance; at twice that it is four times worse. ' +
       'Walk to the far units rather than shooting across the roof.') +
     step(2, 'Tilt 25°–65° down', 'The capture screen colours the readout. Too flat and distance ' +
       'error runs away; too steep and you cover almost nothing.') +
@@ -2467,12 +2494,28 @@ function sheetSettings() {
     '<div class="field"><label>UNITS</label><div class="seg tight">' +
     '<button class="' + (s.unit === 'm' ? 'active' : '') + '" data-unit="m">metres</button>' +
     '<button class="' + (s.unit === 'ft' ? 'active' : '') + '" data-unit="ft">feet</button></div></div>' +
-    '<div class="field"><label>CAMERA FIELD OF VIEW (° ACROSS THE LONG EDGE)</label>' +
-    '<input class="inp mono" id="set-fov" inputmode="decimal" value="' + s.fov + '"></div>' +
-    '<div class="hint">Only the tilt-and-height route uses this. Calibrate from a measured ' +
-    'rectangle once and Eagle Eye solves it for you.</div>' +
-    '<div class="field"><label>DEFAULT CAMERA HEIGHT</label><div class="unit-suffix">' +
+    /* Measured beats typed, so once the lens has been measured the input is not
+       offered — it exists as a fallback for a camera that has never calibrated,
+       and leaving it editable invites overwriting a real measurement with a
+       guess. Forgetting it is explicit and reversible. */
+    (s.fovAt
+      ? '<div class="panel good"><span class="p-tag">LENS — MEASURED</span>' +
+      '<div class="kv"><span>Field of view</span><span>' + s.fov.toFixed(2) + '°</span></div>' +
+      '<div class="kv"><span>From</span><span>' + esc(s.fovFrom || 'camera') + '</span></div>' +
+      '<div class="p-body">Read off the four corners of a calibration rectangle, so it is the ' +
+      'real figure for whichever lens Safari selected. Nothing here needs adjusting.</div>' +
+      '<button class="btn ghost sm" data-act="forget-fov">Forget it and go back to assuming</button></div>'
+      : '<div class="panel warn"><span class="p-tag">LENS — ASSUMED</span>' +
+      '<div class="field"><label>FIELD OF VIEW (° ACROSS THE LONG EDGE)</label>' +
+      '<input class="inp mono" id="set-fov" inputmode="decimal" value="' + s.fov + '"></div>' +
+      '<div class="p-body">A guess until something measures it. Calibrate once from a large ' +
+      'rectangle and Eagle Eye reads the real value off the same four corners — that is far ' +
+      'better than any number typed here.</div></div>') +
+
+    '<div class="field"><label>STARTING CAMERA HEIGHT FOR A NEW SHOT</label><div class="unit-suffix">' +
     '<input class="inp mono" id="set-camh" inputmode="decimal" value="' + EE.fromM(s.camH, s.unit).toFixed(2) + '"><span>' + s.unit + '</span></div></div>' +
+    '<div class="hint">Only a starting value, to save retyping. <b>Every shot stores its own ' +
+    'height</b> once calibrated, and that is what its measurements and its trusted radius use.</div>' +
     '<div class="field"><label>YOUR PHONE, MEASURED (W × L)</label><div class="row2">' +
     '<div class="unit-suffix"><input class="inp mono" id="set-phw" inputmode="decimal" value="' +
     EE.fromM(s.phoneW, s.unit).toFixed(4) + '"><span>' + s.unit + '</span></div>' +
@@ -2594,7 +2637,7 @@ function paintPlan() {
       if (!cam) return;
       var sx = X(cam.x), sy = Y(cam.y);
       g.strokeStyle = 'rgba(244,240,232,0.35)'; g.lineWidth = 1; g.setLineDash([3, 4]);
-      g.beginPath(); g.arc(sx, sy, trustedRadius() * S, 0, Math.PI * 2); g.stroke();
+      g.beginPath(); g.arc(sx, sy, trustedRadius(st.cal && st.cal.camH) * S, 0, Math.PI * 2); g.stroke();
       g.setLineDash([]);
       g.fillStyle = 'rgba(244,240,232,0.85)';
       g.beginPath(); g.arc(sx, sy, 4, 0, Math.PI * 2); g.fill();
@@ -3518,7 +3561,12 @@ function handle(el, e) {
       if (a2 > 0 && a2 < 30) db.settings.attSigma = a2;
       if (d2 >= 0) db.settings.deckUnc = d2;
       save(); ui.sheet = null;
-      toast('Trusted radius now ' + EE.fmtLen(trustedRadius(), U(), 1));
+      toast('Trusted radius now ' + EE.fmtLen(trustedRadius(typicalCamH(p)), U(), 1));
+      return render();
+    }
+    case 'forget-fov': {
+      db.settings.fovAt = null; db.settings.fovFrom = null; save();
+      toast('Lens is an assumption again — ' + db.settings.fov.toFixed(1) + '°');
       return render();
     }
     case 'check-update': return checkForUpdate(true);
@@ -3616,8 +3664,16 @@ function saveProjectSheet() {
 
 function saveSettings() {
   var s = db.settings;
-  var fov = parseFloat($('#set-fov').value);
-  if (fov > 20 && fov < 140) s.fov = fov;
+  var fovEl = $('#set-fov');
+  if (fovEl) {
+    var fov = parseFloat(fovEl.value);
+    /* A hand-typed field of view is an assumption, whatever was there before.
+       Leaving fovAt set made the app report a typed number as "measured", which
+       is worse than having no measurement at all. */
+    if (fov > 20 && fov < 140 && Math.abs(fov - s.fov) > 1e-9) {
+      s.fov = fov; s.fovAt = null; s.fovFrom = null;
+    }
+  }
   var ch = parseFloat($('#set-camh').value);
   if (ch > 0) s.camH = EE.toM(ch, s.unit);
   var seg = parseInt($('#set-seg').value, 10);
