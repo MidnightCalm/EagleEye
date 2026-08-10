@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.12.0';
+var VERSION = '1.13.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1777,9 +1777,62 @@ function tplTraceCal(st, t) {
 
   var modeSeg = '<div class="seg tight">' +
     '<button class="' + (t.calMode === 'quad' ? 'active' : '') + '" data-calmode="quad">Rectangle</button>' +
-    '<button class="' + (t.calMode === 'map' ? 'active' : '') + '" data-calmode="map">From the map</button>' +
+    '<button class="' + (t.calMode === 'ball' ? 'active' : '') + '" data-calmode="ball">Golf ball</button>' +
+    '<button class="' + (t.calMode === 'map' ? 'active' : '') + '" data-calmode="map">Map</button>' +
     '<button class="' + (t.calMode === 'ray' ? 'active' : '') + '" data-calmode="ray">Tilt + height</button>' +
     '</div>';
+
+  if (t.calMode === 'ball') {
+    if (!st.att) {
+      return modeSeg +
+        '<div class="panel warn"><span class="p-tag">NEEDS THE TILT SENSOR</span>' +
+        '<div class="p-body">The ball supplies a length; the plane comes from gravity, which ' +
+        'means the tilt recorded with this shot. This one has none — use the Rectangle route.</div></div>';
+    }
+    var bn = t.taps.length;
+    var fitb = t.ballFit;
+    var seedR = bn >= 2 ? Math.hypot(t.taps[1].x - t.taps[0].x, t.taps[1].y - t.taps[0].y) : 0;
+    var dh = fitb ? fitb.dh : seedR * 2;
+    var errPx = fitb ? 0.6 : 3;
+    var body;
+
+    if (bn === 0) {
+      body = '<div class="hint">Put a golf ball <b>on the deck</b>, in frame. Press on its ' +
+        '<b>centre</b> — the loupe helps.</div>';
+    } else if (bn === 1) {
+      body = '<div class="hint">Now press on the centre again and <b>drag out to its edge</b> — ' +
+        'a circle follows your finger. Let go on the rim.</div>';
+    } else {
+      body = '<div class="panel ' + (fitb ? 'good' : 'warn') + '">' +
+        '<span class="p-tag">' + (fitb ? 'RIM LOCKED' : 'USING YOUR CIRCLE') + '</span>' +
+        (fitb
+          ? '<div class="kv"><span>Rim found on</span><span>' + fitb.n + ' of 48 spokes, ±' +
+          fitb.rms.toFixed(1) + ' px</span></div>' +
+          '<div class="kv"><span>Width across</span><span>' + fitb.dh.toFixed(1) + ' px</span></div>'
+          : '<div class="p-body">Could not lock onto the rim — low contrast or glare. Your circle ' +
+          'is used as drawn, so place it carefully, or move closer.</div>' +
+          '<div class="kv"><span>Width across</span><span>' + (seedR * 2).toFixed(0) + ' px</span></div>') +
+        (dh > 0 ? '<div class="kv ' + (errPx / dh < 0.02 ? 'good' : '') + '"><span>Scale error this implies</span>' +
+          '<span>±' + (errPx / dh * 100).toFixed(1) + '%</span></div>' +
+          '<div class="kv"><span>Closer is better</span><span>' + Math.round(dh) + ' px now</span></div>' : '') +
+        '</div>';
+    }
+
+    return modeSeg +
+      '<div class="hint">Every ball is the same ball — <b>42.67 mm</b> is written into the rules — ' +
+      'and a sphere reads identically from any angle. The plane comes from gravity; the ball only ' +
+      'supplies the length.</div>' +
+      body +
+      (bn >= 2 ? '<div class="field"><label>BALL DIAMETER</label><div class="unit-suffix">' +
+        '<input class="inp mono" id="ball-dia" inputmode="decimal" value="' +
+        esc(t.ballDia || EE.fromM(0.04267, U()).toFixed(5)) + '"><span>' + U() + '</span></div></div>' : '') +
+      (db.settings.fovAt ? '' : '<div class="hint">Lens not measured yet, so the scale will be ' +
+        '<b>provisional</b> — one tape check afterwards trues every shot.</div>') +
+      '<div class="btn-row">' +
+      (bn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
+      '<button class="btn primary sm" data-act="apply-ball"' + (bn >= 2 ? '' : ' disabled') + '>Calibrate</button>' +
+      '</div>';
+  }
 
   if (t.calMode === 'map') {
     var mn = t.taps.length;
@@ -3054,6 +3107,38 @@ function paintTrace() {
     g.fillText(String(i + 1), q.x, q.y + 3.5); g.textAlign = 'left';
   });
 
+  /* ball mode: the circle IS the interface. Live while dragging the radius out,
+     gold for the circle as placed, green once the refiner has locked the rim. */
+  if (t.step === 'cal' && t.calMode === 'ball' && t.taps.length >= 1) {
+    var bc = img2cv(v, t.taps[0]);
+    var rimSrc = t.taps.length >= 2 ? t.taps[1] : (t.loupe ? t.loupe.img : null);
+    if (rimSrc) {
+      var rc2 = img2cv(v, rimSrc);
+      var rad2 = Math.hypot(rc2.x - bc.x, rc2.y - bc.y);
+      if (rad2 > 3) {
+        g.strokeStyle = '#D4AF37'; g.lineWidth = 2; g.setLineDash([6, 5]);
+        g.beginPath(); g.arc(bc.x, bc.y, rad2, 0, Math.PI * 2); g.stroke();
+        g.setLineDash([]);
+      }
+    }
+    if (t.ballFit) {
+      var fc = img2cv(v, { x: t.ballFit.cx, y: t.ballFit.cy });
+      var fr = t.ballFit.r * v.s;
+      g.strokeStyle = '#6ED29A'; g.lineWidth = 2.5;
+      g.beginPath(); g.arc(fc.x, fc.y, fr, 0, Math.PI * 2); g.stroke();
+      var pl = img2cv(v, { x: t.ballFit.xL, y: t.ballFit.cy });
+      var pr = img2cv(v, { x: t.ballFit.xR, y: t.ballFit.cy });
+      g.beginPath(); g.moveTo(pl.x, pl.y); g.lineTo(pr.x, pr.y); g.stroke();
+      var bl = 'Ø ' + t.ballFit.dh.toFixed(1) + ' px';
+      g.font = '600 13px ui-monospace, monospace';
+      var bw2 = g.measureText(bl).width;
+      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillRect(fc.x - bw2 / 2 - 7, fc.y - fr - 30, bw2 + 14, 22);
+      g.fillStyle = '#6ED29A'; g.textAlign = 'center';
+      g.fillText(bl, fc.x, fc.y - fr - 14); g.textAlign = 'left';
+    }
+  }
+
   /* preview of the shape the current taps would produce */
   if (t.step === 'trace' && map && t.taps.length >= 3 && (t.tool === 'rect' || t.tool === 'cylinder')) {
     var gpts = t.taps.map(function (q) { return map.toGround(q.x, q.y); }).filter(Boolean);
@@ -3418,10 +3503,18 @@ function bindTrace() {
       if (t.loupe) {
         var ip = t.loupe.img;
         if (ip.x >= 0 && ip.y >= 0 && ip.x <= st.imgW && ip.y <= st.imgH) {
-          var s = snapTap(st, ip);
+          /* The ball selector wants the raw finger: a corner snap would drag the
+             centre onto a dimple or a logo, and the rim refiner does the real
+             locking anyway. */
+          var ballMode = t.step === 'cal' && t.calMode === 'ball';
+          var s = ballMode ? ip : snapTap(st, ip);
           if (s.snapped) buzz(15);
           t.lastSnap = s.snapped ? s.moved : null;
           addTap({ x: s.x, y: s.y });
+          if (ballMode && t.taps.length >= 2) {
+            t.ballFit = refineBall(st);
+            if (t.ballFit) buzz([25, 40, 25]);
+          }
         }
       }
       t.loupe = null; hideLoupe();
@@ -3512,7 +3605,7 @@ function handle(el, e) {
   if (el.dataset.open) { view.projectId = el.dataset.open; view.screen = 'project'; view.tab = 'plan'; ui.plan.fitted = false; ui.sel = null; return render(); }
   if (el.dataset.tab) { view.tab = el.dataset.tab; return render(); }
   if (el.dataset.tool) { ui.trace.tool = el.dataset.tool; ui.trace.taps = []; return render(); }
-  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; return render(); }
+  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; ui.trace.ballFit = null; return render(); }
   if (el.dataset.unit) { db.settings.unit = el.dataset.unit; save(); return render(); }
   if (el.dataset.nameunit) { db.settings.nameUnit = el.dataset.nameunit; save(); return render(); }
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
@@ -3661,9 +3754,10 @@ function handle(el, e) {
     case 'shoot': return shoot();
 
     case 'close-trace': ui.trace = null; view.screen = 'project'; ui.plan.fitted = false; return render();
-    case 'undo-tap': ui.trace.taps.pop(); return render();
+    case 'undo-tap': ui.trace.taps.pop(); ui.trace.ballFit = null; return render();
     case 'apply-quad': return applyQuad();
     case 'apply-map': return applyMap();
+    case 'apply-ball': return applyBall();
     case 'apply-ray': return applyRay();
     case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; ui.trace.view = null; return render();
     case 'commit-shape': return commitShape();
@@ -3978,6 +4072,8 @@ function openTrace(stationId) {
     mapLL: ['', '', '', '', ''],
     lastSnap: null,
     knownLen: '',
+    ballFit: null,
+    ballDia: '',
     camH: EE.fromM(db.settings.camH, U()).toFixed(2)
   };
   view.screen = 'trace';
@@ -4079,6 +4175,92 @@ function applyQuad() {
   toast(msg);
 
   t.step = 'trace'; t.taps = []; t.view = null;
+  render();
+}
+
+/* Pull pixels around the seeded circle and hand them to the rim refiner. */
+function refineBall(st) {
+  var t = ui.trace;
+  if (!t || t.taps.length < 2) return null;
+  var im = ui.imgCache[st.id];
+  if (!im) return null;
+  var c = t.taps[0];
+  var r0 = Math.hypot(t.taps[1].x - c.x, t.taps[1].y - c.y);
+  if (!(r0 > 4)) return null;
+
+  var pad = Math.ceil(r0 * 1.7) + 8;
+  var S = pad * 2;
+  if (S > 640 || S > st.imgW || S > st.imgH) return null;
+  var sx = Math.round(Math.max(0, Math.min(st.imgW - S, c.x - pad)));
+  var sy = Math.round(Math.max(0, Math.min(st.imgH - S, c.y - pad)));
+
+  if (!snapCv) snapCv = document.createElement('canvas');
+  snapCv.width = S; snapCv.height = S;
+  var g = snapCv.getContext('2d', { willReadFrequently: true });
+  g.drawImage(im, sx, sy, S, S, 0, 0, S, S);
+  var d;
+  try { d = g.getImageData(0, 0, S, S).data; } catch (e) { return null; }
+  var gray = new Float32Array(S * S);
+  for (var i = 0; i < S * S; i++) {
+    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  }
+
+  var f = EE.refineCircleEdge(gray, S, S, c.x - sx, c.y - sy, r0);
+  if (!f) return null;
+  return {
+    cx: sx + f.cx, cy: sy + f.cy, r: f.r,
+    xL: sx + f.xL, xR: sx + f.xR, dh: f.dh,
+    rms: f.rms, n: f.n, horizRefined: f.horizRefined
+  };
+}
+
+/* The solve: rays through the left and right rim, tangent to the sphere, are the
+   two-points-a-known-distance-apart problem the app already knows how to do —
+   the tangent points sit one radius above the deck, 42.67 mm apart. The +r at
+   the end is exact, not a fudge: layover makes the solve return h − r. */
+function applyBall() {
+  var p = currentProject(), t = ui.trace;
+  var st = findStation(p, t.stationId);
+  if (!st.att) return toast('The ball route needs the tilt sensor');
+  if (t.taps.length < 2) return toast('Mark the centre, then drag to the rim');
+
+  var diaEl = $('#ball-dia');
+  if (diaEl) t.ballDia = diaEl.value;
+  var D = EE.toM(parseFloat(t.ballDia || EE.fromM(0.04267, U()).toFixed(5)), U());
+  if (!(D > 0.02 && D < 0.31)) return toast('Enter the ball diameter');
+
+  var fitb = t.ballFit;
+  var cyRow, xL, xR;
+  if (fitb) { cyRow = fitb.cy; xL = fitb.xL; xR = fitb.xR; }
+  else {
+    var r0 = Math.hypot(t.taps[1].x - t.taps[0].x, t.taps[1].y - t.taps[0].y);
+    cyRow = t.taps[0].y; xL = t.taps[0].x - r0; xR = t.taps[0].x + r0;
+  }
+  if (!(xR - xL > 6)) return toast('That circle is too small to measure — get closer');
+
+  var f = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+  var a = EE.rayForPixel(xL, cyRow, st.imgW, st.imgH, f, effAngle(st));
+  var b = EE.rayForPixel(xR, cyRow, st.imgW, st.imgH, f, effAngle(st));
+  var solved = EE.camHeightFromKnown(a, b, R, D, deckNormalOf(st));
+  if (!(solved > 0.2 && solved < 30)) {
+    return toast('Could not solve from that circle — is the whole ball visible, on the deck?');
+  }
+  solved += D / 2;
+
+  st.cal = {
+    mode: 'ray', camH: solved, f: f, ok: true, source: 'ball',
+    provisionalScale: !db.settings.fovAt
+  };
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+
+  var msg = 'Ball read at ' + (xR - xL).toFixed(0) + ' px — camera height ' + EE.fmtLen(solved, U(), 2);
+  if (solved < 0.7 || solved > 2.6) msg += ' — not a handheld height; was the ball on the deck?';
+  if (st.cal.provisionalScale) msg += '. Scale provisional until one tape check (Check → Correct the scale).';
+  toast(msg);
+
+  t.step = 'trace'; t.taps = []; t.view = null; t.ballFit = null;
   render();
 }
 

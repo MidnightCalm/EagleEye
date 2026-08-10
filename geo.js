@@ -989,6 +989,114 @@ var EE = (function () {
     return { x: px, y: py, moved: Math.hypot(px - x0, py - y0) };
   }
 
+  /* Lock a user-seeded circle onto a ball's rim.
+
+     This is deliberately refinement, not detection: the user says WHERE the ball
+     is and roughly how big, and the pixels say exactly. Auto-detecting circles on
+     a roof invites every drain, bolt head and membrane blister to volunteer;
+     refining a circle someone placed cannot invent geometry, only sharpen it —
+     the same argument that put corner snapping in and kept rectangle detection
+     out.
+
+     Method: walk outward along N spokes from the seeded centre, take the
+     strongest radial gradient on each (sub-stepped by a parabola), fit a circle
+     to the hits, reject outliers once, refit. The HORIZONTAL extremes are then
+     re-probed from the refined centre and reported separately, because they are
+     the two points the distance solve should use: a sphere's silhouette is
+     radially elongated off-axis and its bottom edge is where the contact shadow
+     lives, so the left-right chord is both the geometrically right measure and
+     the cleanest one. */
+  function refineCircleEdge(gray, w, h, cx0, cy0, r0) {
+    if (!gray || !(r0 > 4) || w < 16 || h < 16) return null;
+
+    var bil = function (x, y) {
+      if (x < 0) x = 0; if (y < 0) y = 0;
+      if (x > w - 1.001) x = w - 1.001;
+      if (y > h - 1.001) y = h - 1.001;
+      var xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+      var i = yi * w + xi;
+      return gray[i] * (1 - fx) * (1 - fy) + gray[i + 1] * fx * (1 - fy) +
+        gray[i + w] * (1 - fx) * fy + gray[i + w + 1] * fx * fy;
+    };
+
+    /* Strongest edge crossing along one spoke, searched around radius rc. */
+    var edgeAlong = function (cx, cy, ang, rc) {
+      var ca = Math.cos(ang), sa = Math.sin(ang);
+      var lo = 0.55 * rc, hi = 1.55 * rc, step = 0.5;
+      var vals = [];
+      for (var r = lo; r <= hi; r += step) vals.push(bil(cx + ca * r, cy + sa * r));
+      if (vals.length < 5) return null;
+      var bi = -1, bg = 0;
+      for (var k = 1; k < vals.length - 1; k++) {
+        var g = Math.abs(vals[k + 1] - vals[k - 1]);
+        if (g > bg) { bg = g; bi = k; }
+      }
+      /* Below this the "edge" is sensor noise, and refusing beats guessing. */
+      if (bi < 1 || bg < 18) return null;
+      var g0 = Math.abs(vals[bi] - vals[bi - 2 >= 0 ? bi - 2 : 0]);
+      var g1 = bg;
+      var g2 = Math.abs(vals[bi + 2 <= vals.length - 1 ? bi + 2 : vals.length - 1] - vals[bi]);
+      var den = g0 - 2 * g1 + g2;
+      var d = Math.abs(den) > 1e-9 ? 0.5 * (g0 - g2) / den : 0;
+      if (d > 1) d = 1; if (d < -1) d = -1;
+      return { r: lo + (bi + d) * step, g: bg };
+    };
+
+    var N = 48;
+
+    /* Probe all spokes from a given centre, robust-fit the hits. A corrupted arc
+       — the contact shadow — is rejected as outliers, but a fit seeded from an
+       off-centre guess still inherits a small bias from asymmetric sampling, so
+       the whole pass is run again from the refined centre, where the spokes are
+       symmetric. Two passes settle it. */
+    var collectAndFit = function (cx, cy, rc) {
+      var pts = [];
+      for (var i2 = 0; i2 < N; i2++) {
+        var ang = i2 / N * 2 * Math.PI;
+        var e = edgeAlong(cx, cy, ang, rc);
+        if (e) pts.push({ x: cx + Math.cos(ang) * e.r, y: cy + Math.sin(ang) * e.r });
+      }
+      if (pts.length < N * 0.5) return null;
+      var fit0 = fitCircle(pts);
+      if (!fit0 || !(fit0.r > 3)) return null;
+      var tol = Math.max(1.5, 0.06 * fit0.r);
+      var keep = [];
+      for (var j = 0; j < pts.length; j++) {
+        if (Math.abs(Math.hypot(pts[j].x - fit0.cx, pts[j].y - fit0.cy) - fit0.r) < tol) keep.push(pts[j]);
+      }
+      if (keep.length >= 8) {
+        var f2 = fitCircle(keep);
+        if (f2 && f2.r > 3) fit0 = f2;
+      }
+      var rms0 = 0;
+      for (j = 0; j < keep.length; j++) {
+        var dr = Math.hypot(keep[j].x - fit0.cx, keep[j].y - fit0.cy) - fit0.r;
+        rms0 += dr * dr;
+      }
+      return { cx: fit0.cx, cy: fit0.cy, r: fit0.r, n: keep.length,
+        rms: keep.length ? Math.sqrt(rms0 / keep.length) : Infinity };
+    };
+
+    var fit = collectAndFit(cx0, cy0, r0);
+    if (!fit) return null;
+    var fitB = collectAndFit(fit.cx, fit.cy, fit.r);
+    if (fitB) fit = fitB;
+    var rms = fit.rms;
+
+    /* The measurement itself: left and right rim, probed from the refined centre. */
+    var eL = edgeAlong(fit.cx, fit.cy, Math.PI, fit.r);
+    var eR = edgeAlong(fit.cx, fit.cy, 0, fit.r);
+    var xL = eL ? fit.cx - eL.r : fit.cx - fit.r;
+    var xR = eR ? fit.cx + eR.r : fit.cx + fit.r;
+
+    return {
+      cx: fit.cx, cy: fit.cy, r: fit.r,
+      rms: rms, n: fit.n,
+      xL: xL, xR: xR, dh: xR - xL,
+      horizRefined: !!(eL && eR)
+    };
+  }
+
   /* ================= shape fitting ================= */
 
   function hull(pts) {
@@ -1560,6 +1668,7 @@ var EE = (function () {
     focalFromHomography: focalFromHomography, horizonLine: horizonLine,
     referenceQuality: referenceQuality, steppedReferenceError: steppedReferenceError,
     meanAngleMod90: meanAngleMod90, bestCorner: bestCorner, refineCorner: refineCorner,
+    refineCircleEdge: refineCircleEdge,
     normalFromAttitude: normalFromAttitude, deckTiltDeg: deckTiltDeg, deckBasis: deckBasis,
     jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
     clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,

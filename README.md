@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     289 assertions over geo.js — open it in a browser
+    ├── test-geo.html     302 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -373,14 +373,27 @@ They are a rescue, not a plan.
 Stepping a short reference end to end helps, but slowly: length grows as *n* while placement
 error grows as √*n*, so relative error improves only as 1/√*n*.
 
-**A golf ball works too**, through the tilt-and-height two-tap flow: the R&A/USGA rules fix
-its diameter at 42.67 mm, so every ball is the same ball, and its silhouette reads identically
-from every direction — no foreshortening, no which-side-is-which, no need to lie flat. Tap its
-two side edges and pick the **Golf ball** preset. The one systematic is exactly correctable:
-the visible rim sits one radius above the deck, and layover makes the solve return precisely
-*h − r*, so the preset hands the 21.3 mm back. The limit is pixels — ~26 px across at 1.5 m,
-so expect a few percent; the card's long side is twice the ball, and a paver beats both. White
-balls also make excellent landmarks for tying shots together.
+**A golf ball has its own calibration mode** — *Trace → Calibrate → Golf ball*, top level,
+next to Rectangle. The R&A/USGA rules fix the diameter at 42.67 mm, so every ball is the same
+ball, and a sphere's silhouette reads identically from every direction — no foreshortening,
+no which-side-is-which, no need to lie flat.
+
+The interface is a **circular selector**: press on the ball's centre, then drag out to its
+edge — a circle follows your finger. On release the rim is locked automatically: 48 spokes
+search for the strongest edge, a robust circle fit rejects the contact shadow, a second pass
+re-probes from the refined centre, and the result draws in green with its pixel width. If the
+lock fails (glare, low contrast) it says so and uses your circle as drawn.
+
+The solve uses the **horizontal** rim extremes deliberately: a sphere's silhouette is radially
+elongated off-axis and its bottom edge is where the contact shadow lives, so the left–right
+chord is both the geometrically correct measure and the cleanest one. The one systematic is
+exact: the rim sits one radius above the deck and layover makes the solve return precisely
+*h − r*, so 21.3 mm is handed back. Verified end to end: a 28 px ball with a painted contact
+shadow recovers the camera height to 0.8%, and a 0.5 m square then traces 0.500 × 0.500.
+
+The honest limit is pixels — ~26 px across at 1.5 m — so get close; the readout shows the
+implied scale error live. The card's long side is twice the ball, and a paver beats both.
+White balls also make excellent landmarks for tying shots together.
 
 **With a small reference, the plane always comes from gravity** (when the tilt sensor is on) —
 even before the lens has been measured. In that case the scale is marked **provisional**
@@ -459,7 +472,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 289 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 302 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.
