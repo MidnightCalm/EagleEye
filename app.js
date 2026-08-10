@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.9.2';
+var VERSION = '1.10.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -828,6 +828,69 @@ function applyScaleCorrection(p, k, note) {
   return true;
 }
 
+/* Do the shots agree about size?
+
+   Each shot carries its own camera height, and camera height IS scale. Calibrate
+   three shots from three different references and you can get three different
+   scales in one survey — the plan looks fine, the shapes look fine, and the
+   dimensions are quietly wrong by however much they disagree.
+
+   Registration catches it, but only between shots that share two named landmarks.
+   This checks every shot against every other, whether they are tied or not. */
+function scaleSpread(p) {
+  var hs = [];
+  p.stations.forEach(function (st) {
+    if (st.cal && st.cal.ok && st.cal.camH > 0) hs.push({ id: st.id, h: st.cal.camH });
+  });
+  if (hs.length < 2) return null;
+  var lo = hs[0].h, hi = hs[0].h;
+  hs.forEach(function (x) { if (x.h < lo) lo = x.h; if (x.h > hi) hi = x.h; });
+  var med = hs.map(function (x) { return x.h; }).sort(function (a, b) { return a - b; })[Math.floor(hs.length / 2)];
+  return { lo: lo, hi: hi, median: med, spread: hi / lo - 1, n: hs.length, heights: hs };
+}
+
+/* Force one camera height on a shot, rescaling everything traced from it.
+
+   Scale is a similarity on that shot's own frame, so its geometry, its pose and
+   its homography all take the same factor. Its registration does not: that was
+   fitted against the old size, so it is dropped and re-solved from the landmarks. */
+function rescaleStation(p, st, k) {
+  if (!(k > 0) || !isFinite(k) || Math.abs(k - 1) < 1e-12) return false;
+  var c = st.cal;
+  if (c) {
+    if (c.camH) c.camH *= k;
+    if (c.pose) { c.pose.scale *= k; c.pose.tx *= k; c.pose.ty *= k; }
+    if (c.mode === 'quad' && c.H) {
+      for (var i = 0; i < 6; i++) c.H[i] *= k;
+      if (c.refW) c.refW *= k;
+      if (c.refL) c.refL *= k;
+    }
+  }
+  p.objects.forEach(function (o) {
+    if (o.stationId !== st.id) return;
+    if (o.kind === 'rect') { o.cx *= k; o.cy *= k; o.w *= k; o.l *= k; }
+    else if (o.kind === 'cylinder') { o.cx *= k; o.cy *= k; o.r *= k; }
+    else if (o.pts) o.pts = o.pts.map(function (q) { return { x: q.x * k, y: q.y * k }; });
+    if (o.hSrc !== 'typed' && o.h) o.h *= k;
+  });
+  if (st.reg && st.reg.method === 'tie') st.reg = null;
+  return true;
+}
+
+function unifyScale(p, targetH) {
+  var n = 0;
+  p.stations.forEach(function (st) {
+    if (!st.cal || !st.cal.ok || !(st.cal.camH > 0)) return;
+    if (rescaleStation(p, st, targetH / st.cal.camH)) n++;
+  });
+  ensureOrigin(p);
+  p.stations.forEach(function (st) { if (!st.reg) tryRegister(p, st); });
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+  ui.plan.fitted = false;
+  return n;
+}
+
 function totalScaleCorrection(p) {
   return (p.scaleLog || []).reduce(function (a, s) { return a * s.k; }, 1);
 }
@@ -897,6 +960,15 @@ function buildChecklist(p) {
   else if (p.anchorMeta && p.anchorMeta.scaleError != null && Math.abs(p.anchorMeta.scaleError) > 0.02)
     add('warn', 'Scale disagrees with the map by ' + fmtSigned(p.anchorMeta.scaleError * 100) + '%',
       'The survey and the aerial do not agree on distance. One of them is wrong.', 'geo');
+
+  var sp = scaleSpread(p);
+  if (sp && sp.spread > 0.03) {
+    add(sp.spread > 0.10 ? 'block' : 'warn',
+      'Shots disagree about size by ' + (sp.spread * 100).toFixed(0) + '%',
+      'Camera height is scale, and these ' + sp.n + ' shots were calibrated to heights from ' +
+      EE.fmtLen(sp.lo, U(), 2) + ' to ' + EE.fmtLen(sp.hi, U(), 2) + '. The plan will look right ' +
+      'and the dimensions will not.', 'scaleagree');
+  }
 
   if (!p.scaleRef) add('warn', 'No scale reference recorded',
     'Every length in the survey rides on one measured distance. Record which one, and how it was measured.', 'scale');
@@ -1253,6 +1325,7 @@ function tplCheck(p) {
     '</div>' +
     '<button class="btn primary sm" data-act="rescale">Correct the scale</button>' +
     '<button class="btn ghost-gold sm" data-act="align">Align to the building</button>' +
+    (scaleSpread(p) ? '<button class="btn ghost-gold sm" data-act="scaleagree">Scale across shots</button>' : '') +
     '<button class="btn ghost-gold sm" data-act="howto">How to measure well</button></div>' +
     '<div class="panel"><span class="p-tag">TRUSTED RADIUS</span>' +
     '<div class="kv"><span>From where you stand</span><span>' + EE.fmtLen(tr, U(), 1) + '</span></div>' +
@@ -1896,6 +1969,7 @@ function tplSheet() {
   else if (s.kind === 'scale') inner = sheetScale(s);
   else if (s.kind === 'rescale') inner = sheetRescale(s);
   else if (s.kind === 'howto') inner = sheetHowTo(s);
+  else if (s.kind === 'scaleagree') inner = sheetScaleAgree(s);
   else if (s.kind === 'align') inner = sheetAlign(s);
   else if (s.kind === 'confirm') inner = sheetConfirm(s);
   return '<div class="scrim" data-act="close-sheet"></div><div class="sheet">' + inner + '</div>';
@@ -2150,6 +2224,41 @@ function applyAlign() {
   ui.sheet = null; ui.plan.fitted = false; coverageCache = { key: null, val: null };
   toast('Snapped ' + n + ' boxes to ' + (ax.angle * 180 / Math.PI).toFixed(1) + '°');
   render();
+}
+
+function sheetScaleAgree(s) {
+  var p = currentProject();
+  var sp = scaleSpread(p);
+  if (!sp) {
+    return '<div class="sheet-head"><span class="sh-title">Scale across shots</span>' +
+      '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+      '<div class="p-body">Fewer than two calibrated shots — nothing to compare yet.</div>';
+  }
+  var pick = s.target != null ? s.target : sp.median;
+  var rows = sp.heights.map(function (x, i) {
+    var d = x.h / pick - 1;
+    return '<div class="kv ' + (Math.abs(d) < 0.01 ? 'good' : Math.abs(d) > 0.05 ? 'warn' : '') + '">' +
+      '<span>Shot ' + (p.stations.findIndex(function (q) { return q.id === x.id; }) + 1) + '</span>' +
+      '<span>' + EE.fmtLen(x.h, U(), 2) + '  ' + fmtSigned(d * 100) + '%</span></div>';
+  }).join('');
+
+  return '<div class="sheet-head"><span class="sh-title">Scale across shots</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+    '<div class="p-body">Camera height <b>is</b> scale. Every shot carries its own, so shots ' +
+    'calibrated from different references can disagree about size — and a plan built from them ' +
+    'looks perfectly sensible while every dimension is wrong.</div>' +
+    '<div class="panel ' + (sp.spread > 0.03 ? 'warn' : 'good') + '">' +
+    '<span class="p-tag">' + (sp.spread > 0.03 ? 'THEY DISAGREE' : 'THEY AGREE') + '</span>' +
+    '<div class="kv"><span>Spread</span><span>' + (sp.spread * 100).toFixed(1) + '%</span></div>' +
+    rows + '</div>' +
+    '<div class="field"><label>USE ONE HEIGHT FOR EVERY SHOT</label><div class="unit-suffix">' +
+    '<input class="inp mono" id="sa-h" inputmode="decimal" value="' + EE.fromM(pick, U()).toFixed(3) +
+    '"><span>' + U() + '</span></div></div>' +
+    '<div class="hint">Everything traced from a shot is rescaled with it, and any landmark tie is ' +
+    're-solved afterwards. If you know your real height, type it — otherwise the median is a ' +
+    'reasonable guess, and <b>Correct the scale</b> can fix all of them together later.</div>' +
+    '<div class="btn-row"><button class="btn primary" data-act="apply-unify">Apply to all ' +
+    sp.n + ' shots</button></div>';
 }
 
 function sheetHowTo() {
@@ -3265,6 +3374,7 @@ function handle(el, e) {
     if (a === 'capture') return openCapture();
     if (a === 'geo') { ui.sheet = { kind: 'geo', method: 'two' }; startGps(); return render(); }
     if (a === 'scale') { ui.sheet = { kind: 'scale' }; return render(); }
+    if (a === 'scaleagree') { ui.sheet = { kind: 'scaleagree' }; return render(); }
     if (a === 'place') { ui.sheet = { kind: 'place', id: id }; return render(); }
     if (a === 'object') { ui.sel = id; ui.sheet = { kind: 'object', id: id }; return render(); }
     if (a === 'station') return openStation(id);
@@ -3302,6 +3412,15 @@ function handle(el, e) {
     case 'save-scale': return saveScaleRef();
     case 'rescale': ui.sheet = { kind: 'rescale', mode: 'object' }; return render();
     case 'howto': ui.sheet = { kind: 'howto' }; return render();
+    case 'scaleagree': ui.sheet = { kind: 'scaleagree' }; return render();
+    case 'apply-unify': {
+      var th = EE.toM(parseFloat(($('#sa-h') || {}).value), U());
+      if (!(th > 0.2 && th < 30)) return toast('Enter a plausible camera height');
+      var n = unifyScale(p, th);
+      ui.sheet = null;
+      toast('All ' + n + ' shots now at ' + EE.fmtLen(th, U(), 2));
+      return render();
+    }
     case 'toggle-diag': ui.trace.showDiag = !ui.trace.showDiag; return render();
     case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
     case 'level-up': return startLevel(false);
