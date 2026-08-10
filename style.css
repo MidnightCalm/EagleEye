@@ -251,6 +251,12 @@ textarea.inp { min-height: 72px; resize: vertical; }
 .chk.ok { border-color: rgba(110,210,154,0.35); background: rgba(110,210,154,0.06); }
 .chk.ok .cg { color: var(--green); }
 
+.chk-line {
+  display: flex; align-items: center; gap: 10px; cursor: pointer;
+  font-size: 13.5px; color: rgba(244,240,232,0.75); padding: 2px 0;
+}
+.chk-line input { width: 20px; height: 20px; accent-color: var(--gold); flex-shrink: 0; }
+
 /* ============ tab badge ============ */
 .tabbar { overflow-x: auto; scrollbar-width: none; }
 .tabbar::-webkit-scrollbar { display: none; }

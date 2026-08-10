@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.3.0';
+var VERSION = '1.4.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -544,6 +544,55 @@ function coverageCanvas(p) {
   return cv;
 }
 
+/* ================= scale, corrected afterwards =================
+
+   Camera height enters the ray model as a pure similarity: the homography is
+   D.R.A.T with D = diag(h, h, -1), so doubling h doubles every length and nothing
+   else. Get it wrong and the whole survey is the right SHAPE at the wrong SIZE.
+
+   That is the good news, because a uniform scale error can be undone at any time
+   from a single known dimension — long after the roof visit, from one tape
+   measurement, across every shot at once. Nothing has to be re-traced.
+
+   The correction is applied destructively so the rest of the app keeps working in
+   true metres with no scale-aware read path. Factors compose, so it can be
+   applied again as better references turn up. */
+function applyScaleCorrection(p, k, note) {
+  if (!(k > 0) || !isFinite(k)) return false;
+
+  p.stations.forEach(function (st) {
+    if (st.reg) { st.reg.tx *= k; st.reg.ty *= k; }
+    var c = st.cal;
+    if (!c) return;
+    if (c.camH) c.camH *= k;
+    if (c.pose) { c.pose.scale *= k; c.pose.tx *= k; c.pose.ty *= k; }
+    if (c.mode === 'quad' && c.H) {
+      /* H maps image -> ground; its first two rows ARE the output coordinates,
+         so scaling them scales the ground plane. The third row is the
+         perspective denominator and must not be touched. */
+      for (var i = 0; i < 6; i++) c.H[i] *= k;
+      c.refW *= k; c.refL *= k;
+    }
+  });
+
+  p.objects.forEach(function (o) {
+    if (o.kind === 'rect') { o.cx *= k; o.cy *= k; o.w *= k; o.l *= k; }
+    else if (o.kind === 'cylinder') { o.cx *= k; o.cy *= k; o.r *= k; }
+    else if (o.pts) o.pts = o.pts.map(function (q) { return { x: q.x * k, y: q.y * k }; });
+    /* A typed height came off a tape and is already true; only an optically
+       measured one rides on the camera height. */
+    if (o.hSrc !== 'typed' && o.h) o.h *= k;
+  });
+
+  p.scaleLog = (p.scaleLog || []).concat([{ k: k, at: Date.now(), note: note || '' }]);
+  touchProject(p);
+  return true;
+}
+
+function totalScaleCorrection(p) {
+  return (p.scaleLog || []).reduce(function (a, s) { return a * s.k; }, 1);
+}
+
 /* ================= completeness =================
 
    Coverage answers "did I look at it". This answers "can I leave the roof",
@@ -891,7 +940,16 @@ function tplCheck(p) {
 
   var tr = trustedRadius();
   var s = db.settings;
+  var corr = totalScaleCorrection(p);
   return '<div class="screen" style="padding-top:14px">' +
+    '<div class="panel gold"><span class="p-tag">SIZE LOOKS WRONG?</span>' +
+    '<div class="p-body">Camera height is a <b>pure scale</b>, so a survey can be the right ' +
+    'shape at the wrong size. One tape measurement fixes every dimension in every shot — ' +
+    'afterwards, with nothing re-traced.' +
+    (Math.abs(corr - 1) > 1e-9 ? '<br>Already corrected by <b>' + fmtSigned((corr - 1) * 100) + '%</b>.' : '') +
+    '</div>' +
+    '<button class="btn primary sm" data-act="rescale">Correct the scale</button>' +
+    '<button class="btn ghost-gold sm" data-act="howto">How to measure well</button></div>' +
     '<div class="panel"><span class="p-tag">TRUSTED RADIUS</span>' +
     '<div class="kv"><span>From where you stand</span><span>' + EE.fmtLen(tr, U(), 1) + '</span></div>' +
     '<div class="kv"><span>At tolerance</span><span>±' + EE.fmtLen(s.tolerance, U(), 2) + '</span></div>' +
@@ -1305,9 +1363,12 @@ function tplTraceCal(st, t) {
     var n = t.taps.length;
     var body;
     if (n < 4) {
-      body = '<div class="hint">Tap the <b>four corners</b> of something rectangular you have ' +
-        'measured — a curb, a paver, two tapes in an L. Go round in order.<br>' +
-        'Corner <b>' + (n + 1) + ' of 4</b>. Hold and drag for the loupe.</div>' + dots(n, 4);
+      body = '<div class="panel warn"><span class="p-tag">IT MUST LIE FLAT ON THE ROOF</span>' +
+        '<div class="p-body">A curb top, a paver, a hatch lid, two tapes in an L. <b>Not</b> a wall, ' +
+        'a parapet face or the side of a unit — everything here is projected onto the deck, so a ' +
+        'vertical reference gives a badly wrong size.</div></div>' +
+        '<div class="hint">Tap the <b>four corners</b> in order, going round.<br>' +
+        'Corner <b>' + (n + 1) + ' of 4</b>. Press and drag for the loupe.</div>' + dots(n, 4);
     } else {
       body = '<div class="row2">' +
         '<div class="field"><label>WIDTH (first edge)</label><div class="unit-suffix">' +
@@ -1330,8 +1391,8 @@ function tplTraceCal(st, t) {
   var scaleRow = t.taps.length >= 2
     ? '<div class="field"><label>DISTANCE BETWEEN THE TWO TAPS</label><div class="unit-suffix">' +
     '<input class="inp mono" id="known-len" inputmode="decimal" value="' + esc(t.knownLen) + '"><span>' + U() + '</span></div></div>'
-    : '<div class="hint">Optional but far better: tap <b>two points</b> a known distance apart and ' +
-    'let the app solve your camera height instead of trusting the number above.</div>';
+    : '<div class="hint">Better than trusting the number above: tap <b>two points on the deck</b> a ' +
+    'known distance apart and let the app solve your camera height.</div>';
 
   return modeSeg +
     (haveAtt ? '' : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
@@ -1401,6 +1462,8 @@ function tplSheet() {
   else if (s.kind === 'place') inner = sheetPlace(s);
   else if (s.kind === 'error') inner = sheetError(s);
   else if (s.kind === 'scale') inner = sheetScale(s);
+  else if (s.kind === 'rescale') inner = sheetRescale(s);
+  else if (s.kind === 'howto') inner = sheetHowTo(s);
   else if (s.kind === 'confirm') inner = sheetConfirm(s);
   return '<div class="scrim" data-act="close-sheet"></div><div class="sheet">' + inner + '</div>';
 }
@@ -1576,6 +1639,157 @@ function sheetScale(s) {
         '<span>±' + (sigma / v * 100).toFixed(3) + '%</span></div>';
     })() +
     '<div class="btn-row"><button class="btn primary" data-act="save-scale">Save</button></div>';
+}
+
+function sheetHowTo() {
+  var step = function (n, title, body) {
+    return '<div class="chk info"><span class="cg">' + n + '</span>' +
+      '<div class="cmain"><span class="ct">' + title + '</span>' +
+      '<span class="cd">' + body + '</span></div></div>';
+  };
+  return '<div class="sheet-head"><span class="sh-title">How to measure well</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+
+    '<div class="panel warn"><span class="p-tag">THE ONE RULE</span>' +
+    '<div class="p-body">Everything you tap is projected onto the <b>roof deck</b>. So every ' +
+    'reference and every traced corner must be something <b>lying flat on the roof</b>.<br><br>' +
+    'Tap the side of a unit, a parapet face or a wall and the maths puts it out on the deck ' +
+    'where its sight-line lands — metres away. That single mistake is the usual reason a ' +
+    'survey measures wrong.</div></div>' +
+
+    '<div class="chk-list">' +
+    step(1, 'Stand close', 'Position error grows with the <b>square</b> of distance. Inside ' +
+      EE.fmtLen(trustedRadius(), U(), 1) + ' it meets your tolerance; at twice that it is four times worse. ' +
+      'Walk to the far units rather than shooting across the roof.') +
+    step(2, 'Tilt 25°–65° down', 'The capture screen colours the readout. Too flat and distance ' +
+      'error runs away; too steep and you cover almost nothing.') +
+    step(3, 'Calibrate on something flat and measured', 'A curb top, a paver, a hatch lid, or two ' +
+      'tape measures in an L. Four corners of a rectangle is the accurate route — it needs no lens ' +
+      'data, no tilt and no eye-height guess.') +
+    step(4, 'Check the green grid', 'After calibrating, a metric grid is painted onto the photo. ' +
+      'If those squares do not sit flat and square on the roof, <b>nothing from that shot is worth ' +
+      'keeping</b>. Recalibrate.') +
+    step(5, 'Trace bases, never tops', 'Tap where an object <b>meets the roof</b>. The top of a ' +
+      '1 m unit sits 2.4× further out than it really is, because the deck is where the sight-line lands.') +
+    step(6, 'Fix the size afterwards', 'Camera height is a pure scale. If it turns out wrong, one ' +
+      'tape measurement rescales the whole survey — every shot, every object — without re-tracing. ' +
+      'Check → <b>Correct the scale</b>.') +
+    '</div>' +
+
+    '<div class="panel"><span class="p-tag">WHAT IT CANNOT DO</span>' +
+    '<div class="p-body">It cannot invent a length. Scale has to come from a tape or a laser once ' +
+    'per survey — no amount of photography recovers it. And it is a field aid, not a survey: the ' +
+    'stated tolerance is ±' + EE.fmtLen(db.settings.tolerance, U(), 2) + ' inside the trusted radius.</div></div>' +
+    '<div class="btn-row"><button class="btn primary" data-act="close-sheet">Got it</button></div>';
+}
+
+/* Fix the size of a finished survey from one known dimension. */
+function sheetRescale(s) {
+  var p = currentProject();
+  var mode = s.mode || 'object';
+  var dims = [];
+  p.objects.forEach(function (o) {
+    var po = projObj(p, o);
+    if (!po) return;
+    if (o.kind === 'rect') {
+      dims.push({ id: o.id, k: 'w', label: esc(o.name || 'box') + ' — width', cur: po.w });
+      dims.push({ id: o.id, k: 'l', label: esc(o.name || 'box') + ' — length', cur: po.l });
+    } else if (o.kind === 'cylinder') {
+      dims.push({ id: o.id, k: 'd', label: esc(o.name || 'cylinder') + ' — diameter', cur: po.r * 2 });
+    }
+  });
+  var pts = p.objects.filter(function (o) { return o.kind === 'point' && projObj(p, o); });
+
+  var seg = '<div class="seg tight">' +
+    '<button class="' + (mode === 'object' ? 'active' : '') + '" data-rsmode="object">An object</button>' +
+    '<button class="' + (mode === 'pair' ? 'active' : '') + '" data-rsmode="pair">Two landmarks</button>' +
+    '</div>';
+
+  var body;
+  if (mode === 'object') {
+    body = dims.length
+      ? '<div class="field"><label>PICK A DIMENSION YOU HAVE MEASURED</label>' +
+      '<select class="inp" id="rs-dim">' + dims.map(function (d, i) {
+        return '<option value="' + d.id + ':' + d.k + '"' + (i === 0 ? ' selected' : '') + '>' +
+          d.label + ' — now ' + EE.fmtLen(d.cur, U()) + '</option>';
+      }).join('') + '</select></div>' +
+      '<div class="field"><label>WHAT IT ACTUALLY MEASURES</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="rs-true" inputmode="decimal" placeholder="tape or laser"><span>' + U() + '</span></div></div>'
+      : '<div class="panel warn"><span class="p-tag">NOTHING TO SCALE FROM</span>' +
+      '<div class="p-body">Trace a box or a cylinder first, then come back and tell Eagle Eye what one of its sides really measures.</div></div>';
+  } else {
+    body = pts.length >= 2
+      ? '<div class="row2">' +
+      '<div class="field"><label>FROM</label><select class="inp" id="rs-a">' +
+      pts.map(function (o, i) { return '<option value="' + o.id + '"' + (i === 0 ? ' selected' : '') + '>' + esc(o.name || 'landmark') + '</option>'; }).join('') +
+      '</select></div>' +
+      '<div class="field"><label>TO</label><select class="inp" id="rs-b">' +
+      pts.map(function (o, i) { return '<option value="' + o.id + '"' + (i === 1 ? ' selected' : '') + '>' + esc(o.name || 'landmark') + '</option>'; }).join('') +
+      '</select></div></div>' +
+      '<div class="field"><label>TRUE DISTANCE BETWEEN THEM</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="rs-true" inputmode="decimal" placeholder="laser is best"><span>' + U() + '</span></div></div>'
+      : '<div class="panel warn"><span class="p-tag">NEED TWO LANDMARKS</span>' +
+      '<div class="p-body">Trace two landmark points first — the further apart the better.</div></div>';
+  }
+
+  var applied = totalScaleCorrection(p);
+
+  return '<div class="sheet-head"><span class="sh-title">Correct the scale</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+    '<div class="p-body">Camera height enters as a <b>pure scale</b>: get it wrong and the survey ' +
+    'is the right shape at the wrong size. So one known dimension fixes <b>every</b> measurement ' +
+    'in <b>every</b> shot at once — nothing has to be re-traced.</div>' +
+    '<div class="panel warn"><span class="p-tag">MEASURE FLAT ON THE ROOF</span>' +
+    '<div class="p-body">Use something lying <b>on the deck</b> — a curb, a paver, a kerb run. ' +
+    'A wall, a parapet face or the side of a unit is <b>vertical</b>, and every calculation here ' +
+    'projects onto the deck, so a vertical reference comes out badly wrong. That is the most ' +
+    'likely cause of a survey that measures short or long.</div></div>' +
+    seg + body +
+    (Math.abs(applied - 1) > 1e-9
+      ? '<div class="kv"><span>Already corrected by</span><span>' + fmtSigned((applied - 1) * 100) + '%</span></div>'
+      : '') +
+    (dims.length || pts.length >= 2
+      ? '<label class="chk-line"><input type="checkbox" id="rs-camh" checked> Also update my default camera height</label>' +
+      '<div class="btn-row"><button class="btn primary" data-act="apply-rescale">Rescale the survey</button></div>'
+      : '') +
+    ((p.scaleLog || []).length ? '<button class="btn ghost sm" data-act="undo-rescale">Undo the last correction</button>' : '');
+}
+
+function applyRescale() {
+  var p = currentProject();
+  var s = ui.sheet;
+  var trueV = EE.toM(parseFloat(($('#rs-true') || {}).value), U());
+  if (!(trueV > 0)) return toast('Enter the measured value');
+
+  var cur = 0, what = '';
+  if ((s.mode || 'object') === 'object') {
+    var sel = ($('#rs-dim') || {}).value || '';
+    var parts = sel.split(':');
+    var o = p.objects.find(function (q) { return q.id === parts[0]; });
+    var po = o && projObj(p, o);
+    if (!po) return toast('Pick a dimension');
+    cur = parts[1] === 'w' ? po.w : parts[1] === 'l' ? po.l : po.r * 2;
+    what = (o.name || 'object') + ' ' + parts[1];
+  } else {
+    var a = planPointOf(p, ($('#rs-a') || {}).value);
+    var b = planPointOf(p, ($('#rs-b') || {}).value);
+    if (!a || !b) return toast('Pick two landmarks');
+    cur = Math.hypot(a.x - b.x, a.y - b.y);
+    what = 'landmark pair';
+  }
+  if (!(cur > 1e-6)) return toast('That dimension is zero');
+
+  var k = trueV / cur;
+  if (k < 0.2 || k > 5) {
+    return toast('That would rescale by ' + ((k - 1) * 100).toFixed(0) + '% — check you measured the same thing');
+  }
+
+  applyScaleCorrection(p, k, what);
+  if (($('#rs-camh') || {}).checked) db.settings.camH *= k;
+  save();
+  ui.sheet = null; ui.plan.fitted = false; coverageCache = { key: null, val: null };
+  toast('Rescaled ' + fmtSigned((k - 1) * 100) + '% from ' + what);
+  render();
 }
 
 function sheetSettings() {
@@ -2104,7 +2318,7 @@ function bind() {
        silently inert — the delegated listener never sees it. */
     var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
       '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
-      '[data-station],[data-setheight],[data-chk]');
+      '[data-station],[data-setheight],[data-chk],[data-rsmode]');
     if (!el) return;
     handle(el, e);
   };
@@ -2304,6 +2518,7 @@ function handle(el, e) {
   if (el.dataset.nameunit) { db.settings.nameUnit = el.dataset.nameunit; save(); return render(); }
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
   if (el.dataset.srmethod) { ui.sheet.method = el.dataset.srmethod; return render(); }
+  if (el.dataset.rsmode) { ui.sheet.mode = el.dataset.rsmode; return render(); }
   if (el.dataset.station) return openStation(el.dataset.station);
   if (el.dataset.object) { ui.sel = el.dataset.object; ui.sheet = { kind: 'object', id: el.dataset.object }; return render(); }
   if (el.dataset.setheight) {
@@ -2352,6 +2567,20 @@ function handle(el, e) {
     case 'error-sheet': ui.sheet = { kind: 'error' }; return render();
     case 'scale': ui.sheet = { kind: 'scale' }; return render();
     case 'save-scale': return saveScaleRef();
+    case 'rescale': ui.sheet = { kind: 'rescale', mode: 'object' }; return render();
+    case 'howto': ui.sheet = { kind: 'howto' }; return render();
+    case 'apply-rescale': return applyRescale();
+    case 'undo-rescale': {
+      var log = p.scaleLog || [];
+      if (!log.length) return;
+      var last = log.pop();
+      applyScaleCorrection(p, 1 / last.k, 'undo');
+      (p.scaleLog || []).pop();          /* drop the undo entry too */
+      p.scaleLog = log;
+      save(); ui.plan.fitted = false; coverageCache = { key: null, val: null };
+      toast('Reverted ' + fmtSigned((last.k - 1) * 100) + '%');
+      return render();
+    }
     case 'ask-motion': return startSensors().then(function (okd) {
       if (!okd) toast('Tilt sensor refused — use the rectangle route');
       render();
@@ -2673,9 +2902,19 @@ function applyRay() {
       var a = EE.rayForPixel(t.taps[0].x, t.taps[0].y, st.imgW, st.imgH, f, st.screenAngle);
       var b = EE.rayForPixel(t.taps[1].x, t.taps[1].y, st.imgW, st.imgH, f, st.screenAngle);
       var solved = EE.camHeightFromKnown(a, b, R, known);
+      /* A plausible handheld camera height is roughly 1.2-1.8 m. Anything far
+         outside that almost always means the two taps were NOT on the deck —
+         a wall or the side of a unit gets projected onto the roof plane, which
+         stretches the apparent distance and drags the solved height with it.
+         Saying so is worth more than silently accepting the number. */
       if (solved && solved > 0.2 && solved < 60) {
+        if (solved < 0.7 || solved > 2.6) {
+          toast('Solved ' + EE.fmtLen(solved, U()) + ' — that is not a handheld height. ' +
+            'Were both taps flat on the deck?');
+        } else {
+          toast('Camera height solved: ' + EE.fmtLen(solved, U()));
+        }
         camH = solved;
-        toast('Camera height solved: ' + EE.fmtLen(camH, U()));
       } else {
         toast('Could not solve from those two taps — using the height you typed');
       }
@@ -2750,7 +2989,16 @@ function saveObjectSheet() {
   var nameEl = $('#so-name');
   if (nameEl) o.name = nameEl.value.trim();
   var hEl = $('#so-h');
-  if (hEl) { var hv = parseFloat(hEl.value); if (hv >= 0) o.h = EE.toM(hv, U()); }
+  if (hEl) {
+    var hv = parseFloat(hEl.value);
+    if (hv >= 0) {
+      var wasM = o.hSrc === 'measured' && Math.abs(EE.toM(hv, U()) - o.h) < 1e-9;
+      o.h = EE.toM(hv, U());
+      /* A typed height came off a tape and must not move when the survey is
+         rescaled; an optically measured one rides on the camera height and must. */
+      if (!wasM) o.hSrc = 'typed';
+    }
+  }
   var nEl = $('#so-note'); if (nEl) o.note = nEl.value.trim();
 
   if (o.kind === 'rect') {
@@ -3168,24 +3416,21 @@ function exportKmz() {
     png.arrayBuffer().then(function (buf) {
       var box = EE.eastNorthBox(r.bounds, p.anchor);
 
-      /* One archive, three layers, drawn in the order they are wanted:
-         the flat tracing base, the 3D volumes standing on it, and the names
-         floating clear of both. */
-      var doc = EE.buildKML(
-        {
-          name: p.name, address: p.address, anchor: p.anchor,
-          objects: placedObjects(p).filter(function (o) { return o.kind !== 'point'; })
-        },
-        {
-          unit: db.settings.nameUnit,
-          nameTemplate: db.settings.nameTemplate,
-          circleSegments: db.settings.circleSegments,
-          labels: true,
-          labelLift: db.settings.labelLift,
-          groundOverlay: EE.groundOverlayFragment(box, {
-            name: p.name + ' — deck', href: 'files/plan.png'
-          })
-        });
+      /* Raster ONLY. Putting the vectors in here as well was the obvious move and
+         it loses the thing that makes them worth having: HelioScope flattens
+         vector geometry inside a KMZ to the deck, while the very same geometry in
+         a bare .kml extrudes to its real height. So the deck ships as a KMZ and
+         the volumes ship as a KML, and they are imported as two overlays. */
+      var doc = EE.buildGroundOverlayKML(box, {
+        name: p.name + ' — deck',
+        href: 'files/plan.png',
+        description: (p.address || '') +
+          '\nNorth-up deck raster at ' + r.gsd.toFixed(3) + ' m/px; the scale bar is exactly ' +
+          '20.000 m. Import the matching .kml alongside this for 3D volumes and heights.' +
+          (p.scaleRef ? '\nScale from a ' + p.scaleRef.method + ' baseline of ' +
+            EE.fmtLen(p.scaleRef.lengthM, 'm') + '.' : '') +
+          '\nDeck assumed flat to ±' + EE.fmtLen(db.settings.deckUnc, 'm', 2) + '.'
+      });
       if (!doc) return toast('Could not build the KMZ');
 
       var blob = zipStore([

@@ -1106,8 +1106,11 @@ var EE = (function () {
         (project.address || '') +
         '\nSurveyed with Eagle Eye. Heights are encoded in each placemark name and in ExtendedData.'
       ) + '</description>' +
-      '<Style id="ee-obst"><LineStyle><color>ff37afd4</color><width>2</width></LineStyle>' +
-      '<PolyStyle><color>5537afd4</color></PolyStyle></Style>' +
+      /* fill 0, not a translucent fill. HelioScope ignores PolyStyle alpha, so a
+         55% gold turns solid and hides the roof underneath — which is the one
+         thing this layer must not do, since it exists to be traced over. */
+      '<Style id="ee-obst"><LineStyle><color>ff37afd4</color><width>3</width></LineStyle>' +
+      '<PolyStyle><fill>0</fill><outline>1</outline></PolyStyle></Style>' +
       '<Style id="ee-outline"><LineStyle><color>ffe8f0f4</color><width>3</width></LineStyle>' +
       '<PolyStyle><fill>0</fill></PolyStyle></Style>' +
       /* scale 0 hides the pin: the text and its tether are the whole point */
