@@ -17,8 +17,9 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     90 assertions over geo.js — open it in a browser
-    └── make-icons.py     regenerates the icons
+    ├── test-geo.html     213 assertions over geo.js — open it in a browser
+    ├── make-icons.py     regenerates the icons
+    └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
 
 ## Why not LiDAR
