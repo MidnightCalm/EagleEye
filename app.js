@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.7.0';
+var VERSION = '1.9.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -114,6 +114,7 @@ var ui = {
   sheet: null,          /* modal sheet descriptor */
   toastTimer: null,
   sel: null,            /* selected object id, plan tab */
+  swipe: null,          /* survey card whose delete tray is open */
   plan: { s: 12, ox: 0, oy: 0, fitted: false },
   scene: { yaw: 0.6, elev: 0.62 },
   imgCache: {},         /* stationId -> HTMLImageElement */
@@ -143,6 +144,12 @@ function fmtSigned(v) {
   var s = v.toFixed(1);
   if (s === '-0.0' || s === '0.0') return '0.0';
   return (v > 0 ? '+' : '') + s;
+}
+
+/* Haptics are a nicety and a policy minefield — blocked without a prior tap, and
+   absent entirely on iOS Safari. Never let one abort the thing it was confirming. */
+function buzz(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) { /* not important */ }
 }
 
 function toast(msg) {
@@ -272,7 +279,7 @@ function calMap(st) {
          camH was solved against the same reference quad at calibration time. */
       heightAt: function (basePt, topPx, topPy) {
         if (!R || !c.pose) return null;
-        var ray = EE.rayForPixel(topPx, topPy, st.imgW, st.imgH, c.f, st.screenAngle);
+        var ray = EE.rayForPixel(topPx, topPy, st.imgW, st.imgH, c.f, effAngle(st));
         /* heightFromBaseTop works in the ray frame, whose origin sits under the
            camera; basePt arrives in the reference-rectangle frame.
 
@@ -292,13 +299,13 @@ function calMap(st) {
     mode: 'ray',
     has3D: true,
     toGround: function (px, py, planeZ) {
-      return EE.groundPoint(EE.rayForPixel(px, py, st.imgW, st.imgH, c.f, st.screenAngle), R, c.camH, planeZ || 0, deckNormalOf(st));
+      return EE.groundPoint(EE.rayForPixel(px, py, st.imgW, st.imgH, c.f, effAngle(st)), R, c.camH, planeZ || 0, deckNormalOf(st));
     },
     toImg: function (g, planeZ) {
-      return EE.projectToPixel(g, R, c.camH, st.imgW, st.imgH, c.f, st.screenAngle, planeZ || 0, deckNormalOf(st));
+      return EE.projectToPixel(g, R, c.camH, st.imgW, st.imgH, c.f, effAngle(st), planeZ || 0, deckNormalOf(st));
     },
     heightAt: function (basePt, topPx, topPy) {
-      var ray = EE.rayForPixel(topPx, topPy, st.imgW, st.imgH, c.f, st.screenAngle);
+      var ray = EE.rayForPixel(topPx, topPy, st.imgW, st.imgH, c.f, effAngle(st));
       return EE.heightFromBaseTop(basePt, ray, R, c.camH, deckNormalOf(st));
     }
   };
@@ -317,10 +324,20 @@ function calibrateQuad(st, quadPix, refW, refL) {
 
   var cal = { mode: 'quad', H: H, quadPix: quadPix, refW: refW, refL: refL, f: EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH)), ok: true };
 
+  /* The lens, straight out of the same four corners. No attitude, no search.
+     Whatever Safari actually handed us — main, ultra-wide, cropped — this is its
+     real focal length, and it replaces the assumed field of view that governs
+     every tilt-and-height measurement. */
+  cal.focal = EE.focalFromHomography(H, st.imgW, st.imgH);
+  if (cal.focal) {
+    cal.fovMeasured = EE.fovFromFocalLong(cal.focal.f, Math.max(st.imgW, st.imgH));
+    cal.f = cal.focal.f;
+  }
+
   if (st.att) {
     var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
     var unit = quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, st.screenAngle), R, 1, 0, deckNormalOf(st));
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, effAngle(st)), R, 1, 0, deckNormalOf(st));
     });
     if (unit.every(Boolean)) {
       /* Scale must be free here: it IS the camera height. */
@@ -398,7 +415,7 @@ function calibrateFromMap(st, pixPts, lls) {
   if (st.att) {
     var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
     var unit = cal.quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, st.screenAngle),
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, effAngle(st)),
         R, 1, 0, deckNormalOf(st));
     });
     if (unit.every(Boolean)) {
@@ -424,7 +441,7 @@ function solveFocal(st, quadPix, refW, refL) {
   var cost = function (fovDeg) {
     var f = EE.focalFromFov(fovDeg, longPx);
     var g = quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, f, st.screenAngle), R, 1, 0, deckNormalOf(st));
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, f, effAngle(st)), R, 1, 0, deckNormalOf(st));
     });
     if (!g.every(Boolean)) return Infinity;
     /* The unit-height ray points differ from the reference by exactly the camera
@@ -467,45 +484,93 @@ function levelSamples() {
   return { att: mid, spreadDeg: spread, n: qs.length };
 }
 
+/* Waits for the phone to be still, rather than counting down at it.
+
+   A countdown is a guess about how long it takes to put a phone down, and it is
+   wrong in both directions — it fires while you are still moving, or it makes you
+   wait after you have finished. Stillness is the thing that actually matters, so
+   watch for it: once the attitude has held within a fraction of a degree for a
+   second and a half, take the reading. */
 function startLevel(faceDown) {
-  if (!ui.sensors.live) return toast('Enable the tilt sensor first');
-  ui.level = { faceDown: !!faceDown, count: 6, samples: [], done: null };
-  clearInterval(ui.levelTimer);
-  ui.levelTimer = setInterval(function () {
-    var l = ui.level;
-    if (!l) { clearInterval(ui.levelTimer); return; }
-    l.count--;
-    /* Only the last second is kept, by which time the phone is down and still. */
-    if (l.count <= 1) {
-      l.samples.push({ a: ui.sensors.alpha, b: ui.sensors.beta, g: ui.sensors.gamma });
-    }
-    if (l.count <= 0) {
-      clearInterval(ui.levelTimer);
-      var s = levelSamples();
-      if (!s || s.spreadDeg > 2.5) {
-        toast('It moved while reading — try again, and let it settle');
-        ui.level = null;
-      } else {
-        var p = currentProject();
-        p.deck = {
-          n: EE.normalFromAttitude(s.att.a, s.att.b, s.att.g, l.faceDown),
-          faceDown: l.faceDown,
-          spreadDeg: s.spreadDeg,
-          at: Date.now()
-        };
-        p.deck.tiltDeg = EE.deckTiltDeg(p.deck.n);
-        touchProject(p); save();
-        ui.level = null;
-        if (navigator.vibrate) navigator.vibrate(60);
-        toast('Deck read: ' + p.deck.tiltDeg.toFixed(1) + '° off level');
+  var go = function () {
+    clearInterval(ui.levelTimer);
+    ui.level = { faceDown: !!faceDown, samples: [], started: Date.now(), spread: null, held: 0 };
+    ui.levelTimer = setInterval(tickLevel, 100);
+    render();
+  };
+  /* The button press IS the user gesture iOS requires, so ask here rather than
+     making someone open the camera just to get the prompt. */
+  if (!ui.sensors.live) {
+    startSensors().then(function (granted) {
+      if (!granted || !ui.sensors.live) {
+        return toast('Motion access is needed to read the deck — allow it and tap again');
       }
-      render();
-      return;
-    }
-    var el = $('#level-count');
-    if (el) el.textContent = l.count;
-  }, 1000);
-  render();
+      go();
+    });
+    return;
+  }
+  go();
+}
+
+var LEVEL_WINDOW = 1500;   /* ms of stillness required */
+var LEVEL_SPREAD = 0.8;    /* degrees of wobble tolerated within it */
+
+function tickLevel() {
+  var l = ui.level;
+  if (!l) { clearInterval(ui.levelTimer); return; }
+
+  var now = Date.now();
+  l.samples.push({
+    q: EE.quatFromOrientation(ui.sensors.alpha, ui.sensors.beta, ui.sensors.gamma),
+    a: ui.sensors.alpha, b: ui.sensors.beta, g: ui.sensors.gamma, t: now
+  });
+  while (l.samples.length && l.samples[0].t < now - LEVEL_WINDOW) l.samples.shift();
+
+  var spread = 0;
+  for (var i = 1; i < l.samples.length; i++) {
+    spread = Math.max(spread, EE.quatAngleDeg(l.samples[0].q, l.samples[i].q));
+  }
+  l.spread = spread;
+  var span = l.samples.length > 1 ? l.samples[l.samples.length - 1].t - l.samples[0].t : 0;
+  l.held = (spread < LEVEL_SPREAD) ? span : 0;
+
+  if (l.samples.length >= 8 && span >= LEVEL_WINDOW - 150 && spread < LEVEL_SPREAD) {
+    clearInterval(ui.levelTimer);
+    var mid = l.samples[Math.floor(l.samples.length / 2)];
+    var p = currentProject();
+    p.deck = {
+      n: EE.normalFromAttitude(mid.a, mid.b, mid.g, l.faceDown),
+      faceDown: l.faceDown, spreadDeg: spread, at: now
+    };
+    p.deck.tiltDeg = EE.deckTiltDeg(p.deck.n);
+    touchProject(p); save();
+    ui.level = null;
+    buzz([40, 60, 40]);
+    toast('Deck read: ' + p.deck.tiltDeg.toFixed(2) + '° off level');
+    render();
+    return;
+  }
+
+  if (now - l.started > 45000) {
+    clearInterval(ui.levelTimer);
+    ui.level = null;
+    toast('Gave up waiting for it to settle — try resting it on something flat');
+    render();
+    return;
+  }
+  paintLevelHud();
+}
+
+/* Patched in place rather than re-rendered: this runs ten times a second. */
+function paintLevelHud() {
+  var l = ui.level; if (!l) return;
+  var bar = $('#level-bar'), txt = $('#level-txt');
+  if (bar) bar.style.width = Math.min(100, l.held / LEVEL_WINDOW * 100) + '%';
+  if (txt) {
+    txt.textContent = l.spread == null ? 'waiting for the sensor…'
+      : l.spread < LEVEL_SPREAD ? 'holding still — ' + (l.held / 1000).toFixed(1) + ' s'
+        : 'still moving — ' + l.spread.toFixed(1) + '°';
+  }
 }
 
 /* The normal a shot should be measured against. */
@@ -539,7 +604,19 @@ function stationH(st) {
   if (c.mode === 'quad') return c.H;
   if (!st.att) return null;
   var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
-  return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, st.screenAngle, deckNormalOf(st));
+  return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
+}
+
+/* The screen angle a shot should actually be read with.
+
+   Safari hands back a frame oriented to the interface, and whether that matches
+   the device frame the tilt is expressed in is not something this app can know
+   without testing on the handset. Getting it wrong rotates the tilt about the
+   wrong axis and throws the horizon completely — which looks exactly like a
+   broken calibration. So it is correctable per shot, empirically, by watching
+   the drawn horizon. */
+function effAngle(st) {
+  return (((st && st.screenAngle) || 0) + ((st && st.angleFix) || 0) + 360) % 360;
 }
 
 /* Where the camera stood, in that station's own frame.
@@ -890,11 +967,21 @@ function loadImage(st) {
 
 function thumbUrl(st) {
   if (ui.urlCache[st.id]) return ui.urlCache[st.id];
+  if (st.photoGone) return '';
   IDB.get(photoKey(st.id)).then(function (b) {
-    if (!b) return;
+    if (!b) {
+      /* Remembered, so a dropped photo reads as "dropped" rather than as a
+         broken image that looks like a bug. */
+      st.photoGone = true;
+      var slot = document.querySelector('[data-thumb="' + st.id + '"]');
+      if (slot && slot.tagName !== 'IMG') slot.innerHTML = 'photo<br>dropped';
+      return;
+    }
+    st.photoGone = false;
     ui.urlCache[st.id] = URL.createObjectURL(b);
     var el = document.querySelector('[data-thumb="' + st.id + '"]');
-    if (el) el.src = ui.urlCache[st.id];
+    if (el && el.tagName === 'IMG') el.src = ui.urlCache[st.id];
+    else if (el) render();
   });
   return '';
 }
@@ -993,7 +1080,12 @@ function tplHome() {
       var objs = p.objects.filter(function (o) { return o.kind !== 'point'; }).length;
       var outline = p.objects.find(function (o) { return o.kind === 'outline'; });
       var area = outline ? EE.polygonArea(outline.pts || []) : 0;
-      return '<div class="proj-card" data-open="' + p.id + '">' +
+      var open = ui.swipe === p.id;
+      return '<div class="card-wrap' + (open ? ' open' : '') + '" data-swipe="' + p.id + '">' +
+        '<div class="card-actions">' +
+        '<button class="swipe-btn del" data-act="del-survey" data-id="' + p.id + '">Delete</button>' +
+        '</div>' +
+        '<div class="proj-card" data-open="' + p.id + '">' +
         '<span class="watermark">' + esc((p.name || '?').charAt(0)) + '</span>' +
         '<span class="pc-name">' + esc(p.name) + '</span>' +
         (p.address ? '<span class="pc-addr">' + esc(p.address) + '</span>' : '') +
@@ -1001,7 +1093,7 @@ function tplHome() {
         objs + (objs === 1 ? ' OBJECT' : ' OBJECTS') +
         (area ? ' · ' + EE.fmtArea(area, U()) : '') +
         (p.anchor ? ' · LOCATED' : '') + '</span>' +
-        '</div>';
+        '</div></div>';
     }).join('');
 
   return '<div class="screen home">' +
@@ -1080,9 +1172,14 @@ function tplPlan(p) {
     '</div>' +
     '<div style="flex:0 0 auto;padding:10px 20px calc(var(--safe-bottom) + 86px)">' +
     '<div class="stn-list">' + p.stations.map(function (s, i) {
+      var url = thumbUrl(s);
       return '<div class="stn-chip' + (s.reg ? '' : ' unreg') + '" data-station="' + s.id + '">' +
-        '<img class="thumb" data-thumb="' + s.id + '" src="' + esc(thumbUrl(s)) + '" alt="">' +
-        '<div class="sl">' + (s.reg ? '' : '⚠ ') + 'SHOT ' + (i + 1) + '</div></div>';
+        (url
+          ? '<img class="thumb" data-thumb="' + s.id + '" src="' + esc(url) + '" alt="">'
+          : '<div class="thumb gone" data-thumb="' + s.id + '">' +
+          (s.photoGone ? 'photo<br>dropped' : '…') + '</div>') +
+        '<div class="sl">' + (s.reg ? '' : '⚠ ') + 'SHOT ' + (i + 1) + '</div>' +
+        '<button class="stn-del" data-act="del-station" data-id="' + s.id + '">×</button></div>';
     }).join('') +
     (p.stations.length ? '' : '<div class="hint" style="padding:14px 4px">No shots yet — tap <b>Capture</b>.</div>') +
     '</div></div>';
@@ -1094,9 +1191,12 @@ function tplDeckPanel(p) {
   var l = ui.level;
   if (l) {
     return '<div class="panel gold"><span class="p-tag">READING THE DECK</span>' +
-      '<div class="level-count" id="level-count">' + l.count + '</div>' +
-      '<div class="p-body">Lay the phone ' + (l.faceDown ? '<b>screen down</b>' : '<b>screen up</b>') +
-      ' on the roof and let it settle. It reads when the count hits zero.</div>' +
+      '<div class="p-body">Lay the phone <b>' + (l.faceDown ? 'screen down' : 'screen up') +
+      '</b> on the roof. It reads itself as soon as it has been still for a moment — ' +
+      'no need to watch it.</div>' +
+      '<div class="hold-bar"><div id="level-bar"></div></div>' +
+      '<div class="kv"><span id="level-txt">waiting for the sensor…</span><span>' +
+      LEVEL_SPREAD.toFixed(1) + '° for ' + (LEVEL_WINDOW / 1000).toFixed(1) + ' s</span></div>' +
       '<button class="btn ghost sm" data-act="level-cancel">Cancel</button></div>';
   }
 
@@ -1105,11 +1205,13 @@ function tplDeckPanel(p) {
     return '<div class="panel good"><span class="p-tag">DECK LEVELLED</span>' +
       '<div class="kv"><span>Off level</span><span>' + p.deck.tiltDeg.toFixed(2) + '° (' + pct.toFixed(1) + '% fall)</span></div>' +
       '<div class="kv"><span>Read</span><span>' + (p.deck.faceDown ? 'screen down' : 'screen up') +
-      ', ±' + p.deck.spreadDeg.toFixed(1) + '°</span></div>' +
-      '<div class="p-body">New shots will be measured against this plane instead of assuming ' +
-      'level. Re-read it if you move to a roof section that falls a different way.</div>' +
-      '<div class="btn-row"><button class="btn ghost-gold sm" data-act="level-down">Re-read</button>' +
-      '<button class="btn ghost sm" data-act="clear-deck">Clear</button></div></div>';
+      ', ±' + p.deck.spreadDeg.toFixed(2) + '°</span></div>' +
+      '<div class="p-body">New shots are measured against this plane instead of assuming level. ' +
+      'Re-read it if you move to a section that falls a different way.</div>' +
+      '<div class="btn-row">' +
+      '<button class="btn ghost-gold sm" data-act="level-down">Re-read, screen down</button>' +
+      '<button class="btn ghost-gold sm" data-act="level-up">Screen up</button></div>' +
+      '<button class="btn ghost sm" data-act="clear-deck">Clear the reading</button></div>';
   }
 
   return '<div class="panel warn"><span class="p-tag">DECK NOT LEVELLED</span>' +
@@ -1667,6 +1769,34 @@ function tplTraceCal(st, t) {
 
   /* ray mode */
   var haveAtt = !!st.att;
+  var fovNow = db.settings.fov;
+  var Hray = haveAtt ? stationH(Object.assign({}, st, {
+    cal: { mode: 'ray', camH: EE.toM(parseFloat(t.camH) || 1.55, U()), f: EE.focalFromFov(fovNow, Math.max(st.imgW, st.imgH)), ok: true }
+  })) : null;
+  var hzNow = Hray && EE.horizonLine(Hray, st.imgW, st.imgH);
+
+  var diag = '<div class="panel ' + (db.settings.fovAt ? 'good' : 'warn') + '">' +
+    '<span class="p-tag">LENS</span>' +
+    '<div class="kv"><span>Field of view in use</span><span>' + fovNow.toFixed(1) + '°</span></div>' +
+    '<div class="kv ' + (db.settings.fovAt ? 'good' : 'warn') + '"><span>Source</span><span>' +
+    (db.settings.fovAt ? 'measured, ' + esc(db.settings.fovFrom || 'camera') : 'ASSUMED — not measured') + '</span></div>' +
+    (st.cam ? '<div class="kv"><span>Camera</span><span>' + esc((st.cam.label || '?').slice(0, 22)) + '</span></div>' +
+      '<div class="kv"><span>Frame</span><span>' + st.imgW + '×' + st.imgH + '</span></div>' : '') +
+    (db.settings.fovAt ? '' :
+      '<div class="p-body">This route <b>depends</b> on the field of view, and nothing has measured ' +
+      'it yet. Calibrate once from a large rectangle — the app reads your real lens off the same ' +
+      'four corners — then come back. Until then the perspective here is a guess.</div>') +
+    '</div>' +
+    '<div class="panel"><span class="p-tag">ORIENTATION</span>' +
+    '<div class="kv"><span>Horizon sits at</span><span>' +
+    (hzNow ? (hzNow.steep ? 'a VERTICAL line — the frame is rotated' : Math.round(hzNow.y0) + ' px of ' + st.imgH) : '—') + '</span></div>' +
+    '<div class="p-body">The red line on the photo is where this shot thinks the horizon is. If it ' +
+    'is not on the real one, the frame and the tilt disagree about which way is up — step the ' +
+    'correction until it lands.</div>' +
+    '<div class="seg tight">' + [0, 90, 180, 270].map(function (a) {
+      return '<button class="' + ((st.angleFix || 0) === a ? 'active' : '') + '" data-anglefix="' + a + '">' +
+        (a === 0 ? 'none' : a + '°') + '</button>';
+    }).join('') + '</div></div>';
   var scaleRow = t.taps.length >= 2
     ? '<div class="field"><label>DISTANCE BETWEEN THE TWO TAPS</label><div class="unit-suffix">' +
     '<input class="inp mono" id="known-len" inputmode="decimal" value="' + esc(t.knownLen) + '"><span>' + U() + '</span></div></div>'
@@ -1674,8 +1804,17 @@ function tplTraceCal(st, t) {
     'known distance apart and let the app solve your camera height.</div>';
 
   return modeSeg +
-    (haveAtt ? '' : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
+    (haveAtt ? diag : '<div class="panel warn"><span class="p-tag">NO TILT RECORDED</span>' +
       '<div class="p-body">This shot has no attitude, so it can only be calibrated from a measured rectangle.</div></div>') +
+    (haveAtt ? (st.deckN
+      ? '<div class="kv good"><span>Deck plane</span><span>from gravity</span></div>'
+      : '<div class="panel warn"><span class="p-tag">SHOT PREDATES THE LEVELLING</span>' +
+      '<div class="p-body">The deck reading is stamped onto a shot when it is taken, so levelling ' +
+      'afterwards does not reach it.' + (currentProject().deck ? '' : ' No reading exists yet either.') +
+      '</div>' + (currentProject().deck
+        ? '<button class="btn primary sm" data-act="relevel">Apply the current reading to this shot</button>'
+        : '<button class="btn primary sm" data-act="level-down">Read the deck now</button>') +
+      '</div>') : '') +
     '<div class="field"><label>CAMERA HEIGHT ABOVE THE ROOF</label><div class="unit-suffix">' +
     '<input class="inp mono" id="cam-h" inputmode="decimal" value="' + esc(t.camH) + '"><span>' + U() + '</span></div></div>' +
     scaleRow +
@@ -2540,6 +2679,35 @@ function paintTrace() {
 
   var map = calMap(st);
 
+  /* The horizon, drawn wherever the calibration thinks it is.
+
+     This is the single most diagnostic thing on the screen. The vanishing line is
+     two of the eight numbers in the homography, and when a calibration goes wrong
+     it is almost always these two. If the red line does not sit on the real
+     horizon — or the real roof edge, when the horizon is out of frame — nothing
+     from this shot is worth keeping, and no amount of scale correction will fix
+     it. Drawn in both steps, because it is most useful while calibrating. */
+  var calH = map ? (st.cal.mode === 'quad' ? st.cal.H : stationH(st)) : null;
+  if (calH) {
+    var hz = EE.horizonLine(calH, st.imgW, st.imgH);
+    if (hz) {
+      var a = img2cv(v, { x: hz.x0, y: hz.y0 }), b = img2cv(v, { x: hz.x1, y: hz.y1 });
+      g.save();
+      g.strokeStyle = 'rgba(201,106,94,0.9)'; g.lineWidth = 2.5; g.setLineDash([12, 7]);
+      g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = 'rgba(12,10,16,0.8)';
+      var lab = 'horizon';
+      g.font = '600 12px ui-monospace, monospace';
+      var lw2 = g.measureText(lab).width;
+      var ly = Math.max(14, Math.min(h - 6, a.y - 8));
+      g.fillRect(6, ly - 12, lw2 + 12, 17);
+      g.fillStyle = 'rgba(224,137,125,0.95)';
+      g.fillText(lab, 12, ly);
+      g.restore();
+    }
+  }
+
   /* Metric grid warped back onto the photo. Nothing else tells you at a glance
      that a calibration is sound — if these squares do not sit flat and square on
      the roof, no number taken from this shot is worth having. */
@@ -2738,11 +2906,12 @@ function bind() {
        silently inert — the delegated listener never sees it. */
     var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
       '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
-      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset]');
+      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset],[data-anglefix],[data-swipe]');
     if (!el) return;
     handle(el, e);
   };
 
+  if (view.screen === 'home') bindSwipe();
   if (view.screen === 'capture') bindCapture();
   if (view.screen === 'live') bindLive();
   if (view.screen === 'trace') bindTrace();
@@ -2809,6 +2978,55 @@ function bindCapture() {
   if (!v || !ui.cap) return;
   if (ui.cap.stream) { v.srcObject = ui.cap.stream; return; }
   startCamera();
+}
+
+/* Swipe a survey card left to uncover Delete.
+
+   The card slides; the action sits underneath. Horizontal intent is required
+   before anything moves, so a vertical flick still scrolls the list, and the
+   card's own tap is suppressed for the swipe that opened it. */
+function bindSwipe() {
+  $$('[data-swipe]').forEach(function (wrap) {
+    var card = wrap.querySelector('.proj-card');
+    var id = wrap.dataset.swipe;
+    var x0 = 0, y0 = 0, dx = 0, active = false, decided = false;
+    var W = 96;
+
+    wrap.addEventListener('pointerdown', function (e) {
+      x0 = e.clientX; y0 = e.clientY; dx = 0; active = true; decided = false;
+      card.style.transition = 'none';
+    });
+    wrap.addEventListener('pointermove', function (e) {
+      if (!active) return;
+      var mx = e.clientX - x0, my = e.clientY - y0;
+      if (!decided) {
+        if (Math.abs(mx) < 8 && Math.abs(my) < 8) return;
+        decided = true;
+        if (Math.abs(my) > Math.abs(mx)) { active = false; return; }  /* let it scroll */
+        wrap.setPointerCapture(e.pointerId);
+      }
+      dx = Math.max(-W, Math.min(0, mx + (ui.swipe === id ? -W : 0)));
+      card.style.transform = 'translateX(' + dx + 'px)';
+    });
+    var settle = function () {
+      if (!active) return;
+      active = false;
+      card.style.transition = 'transform 0.16s ease';
+      var open = dx < -W / 2;
+      card.style.transform = 'translateX(' + (open ? -W : 0) + 'px)';
+      ui.swipe = open ? id : null;
+      if (decided) wrap.dataset.suppress = '1';
+    };
+    wrap.addEventListener('pointerup', settle);
+    wrap.addEventListener('pointercancel', settle);
+    /* Swallow the click that ends a swipe, so opening the tray never opens the survey. */
+    card.addEventListener('click', function (e) {
+      if (wrap.dataset.suppress) {
+        delete wrap.dataset.suppress;
+        e.stopPropagation(); e.preventDefault();
+      }
+    }, true);
+  });
 }
 
 function bindLive() {
@@ -2900,7 +3118,7 @@ function bindTrace() {
         var ip = t.loupe.img;
         if (ip.x >= 0 && ip.y >= 0 && ip.x <= st.imgW && ip.y <= st.imgH) {
           var s = snapTap(st, ip);
-          if (s.snapped && navigator.vibrate) navigator.vibrate(15);
+          if (s.snapped) buzz(15);
           t.lastSnap = s.snapped ? s.moved : null;
           addTap({ x: s.x, y: s.y });
         }
@@ -2987,6 +3205,12 @@ function handle(el, e) {
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
   if (el.dataset.srmethod) { ui.sheet.method = el.dataset.srmethod; return render(); }
   if (el.dataset.rsmode) { ui.sheet.mode = el.dataset.rsmode; return render(); }
+  if (el.dataset.anglefix) {
+    var stn = findStation(p, ui.trace.stationId);
+    stn.angleFix = parseInt(el.dataset.anglefix, 10);
+    touchProject(p); save();
+    return render();
+  }
   if (el.dataset.refpreset) {
     var r = REF_PRESETS[parseInt(el.dataset.refpreset, 10)];
     var w = r.w == null ? db.settings.phoneW : r.w;
@@ -3051,6 +3275,39 @@ function handle(el, e) {
     case 'level-down': return startLevel(true);
     case 'level-cancel': clearInterval(ui.levelTimer); ui.level = null; return render();
     case 'clear-deck': { p.deck = null; touchProject(p); save(); toast('Deck reading cleared'); return render(); }
+    case 'del-survey': {
+      var tgt = db.projects.find(function (q) { return q.id === el.dataset.id; });
+      if (!tgt) return;
+      ui.sheet = {
+        kind: 'confirm', title: 'Delete ' + tgt.name + '?',
+        body: tgt.stations.length + ' shot' + (tgt.stations.length === 1 ? '' : 's') + ' and ' +
+          tgt.objects.length + ' object' + (tgt.objects.length === 1 ? '' : 's') + ' go with it. This cannot be undone.',
+        yes: 'Delete survey', on: 'del-survey', id: tgt.id
+      };
+      return render();
+    }
+    case 'del-station': {
+      var sid = el.dataset.id;
+      var stn = findStation(p, sid);
+      if (!stn) return;
+      var owned = objectsOf(p, sid).length;
+      ui.sheet = {
+        kind: 'confirm', title: 'Delete this shot?',
+        body: owned
+          ? owned + (owned === 1 ? ' object was' : ' objects were') + ' traced from it, and will go too.'
+          : 'Nothing has been traced from it.',
+        yes: 'Delete shot', on: 'del-station', id: sid
+      };
+      return render();
+    }
+    case 'relevel': {
+      var rst = findStation(p, ui.trace.stationId);
+      if (!p.deck) return toast('Read the deck first');
+      rst.deckN = p.deck.n.slice();
+      touchProject(p); save();
+      toast('Applied the ' + p.deck.tiltDeg.toFixed(1) + '° reading to this shot');
+      return render();
+    }
     case 'align': ui.sheet = { kind: 'align' }; return render();
     case 'apply-align': return applyAlign();
     case 'apply-rescale': return applyRescale();
@@ -3148,11 +3405,38 @@ function confirmYes() {
     });
     ui.sheet = null; return render();
   }
-  if (s.on === 'del-project') {
-    p.stations.forEach(function (st) { IDB.del(photoKey(st.id)); });
-    db.projects = db.projects.filter(function (q) { return q.id !== p.id; });
-    save();
-    ui.sheet = null; view.screen = 'home'; return render();
+  if (s.on === 'del-project' || s.on === 'del-survey') {
+    var tgt = s.id ? db.projects.find(function (q) { return q.id === s.id; }) : p;
+    if (tgt) {
+      tgt.stations.forEach(function (st) {
+        IDB.del(photoKey(st.id));
+        delete ui.imgCache[st.id];
+        if (ui.urlCache[st.id]) { URL.revokeObjectURL(ui.urlCache[st.id]); delete ui.urlCache[st.id]; }
+      });
+      db.projects = db.projects.filter(function (q) { return q.id !== tgt.id; });
+      if (view.projectId === tgt.id) { view.projectId = null; view.screen = 'home'; }
+      save(); refreshStorage();
+      toast('Deleted ' + tgt.name);
+    }
+    ui.sheet = null; ui.swipe = null; return render();
+  }
+  if (s.on === 'del-station') {
+    var st = findStation(p, s.id);
+    if (st) {
+      IDB.del(photoKey(st.id));
+      delete ui.imgCache[st.id];
+      if (ui.urlCache[st.id]) { URL.revokeObjectURL(ui.urlCache[st.id]); delete ui.urlCache[st.id]; }
+      /* Objects traced from a deleted shot have no frame to live in, so they go
+         with it rather than becoming unplaceable orphans. */
+      p.objects = p.objects.filter(function (o) { return o.stationId !== st.id; });
+      p.stations = p.stations.filter(function (q) { return q.id !== st.id; });
+      ensureOrigin(p);
+      touchProject(p); save(); refreshStorage();
+      coverageCache = { key: null, val: null };
+      ui.plan.fitted = false;
+      toast('Shot deleted');
+    }
+    ui.sheet = null; return render();
   }
   ui.sheet = null; return render();
 }
@@ -3214,6 +3498,11 @@ function startCamera() {
   }).then(function (stream) {
     if (!ui.cap) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
     ui.cap.stream = stream;
+    var tr = stream.getVideoTracks()[0];
+    var se = tr && tr.getSettings ? tr.getSettings() : {};
+    /* Which lens Safari picked is not something we get to choose, and a measured
+       field of view only means anything attached to the camera it came from. */
+    ui.cap.cam = { label: (tr && tr.label) || '', w: se.width || 0, h: se.height || 0, id: se.deviceId || '' };
     var v = $('#cam-video');
     if (v) {
       v.srcObject = stream;
@@ -3295,6 +3584,8 @@ function shoot() {
       heading: ui.sensors.heading, headingAcc: ui.sensors.headingAcc
     } : null,
     gps: ui.gps ? Object.assign({}, ui.gps) : null,
+    cam: (ui.cap && ui.cap.cam) ? Object.assign({}, ui.cap.cam) : null,
+    angleFix: 0,
     /* Copied onto the shot, not read from the project later: the deck reading is
        only valid against the gyro's yaw reference as it stood at capture time. */
     deckN: (p.deck && p.deck.n) ? p.deck.n.slice() : null,
@@ -3361,15 +3652,22 @@ function applyQuad() {
   st.cal = cal;
   touchProject(p); save();
 
-  /* A measured rectangle plus a recorded tilt is exactly what the lens needs, so
-     take the free calibration while it is on offer. */
   var msg = 'Calibrated from ' + EE.fmtLen(w, U()) + ' × ' + EE.fmtLen(l, U());
-  var f = solveFocal(st, t.taps.slice(0, 4), w, l);
-  if (f && f.rms < 0.25) {
-    db.settings.fov = f.fov;
-    st.cal.f = EE.focalFromFov(f.fov, Math.max(st.imgW, st.imgH));
+
+  /* Adopt the measured lens, but only from a quad big enough to mean it. A card
+     spanning a dozen pixels produces a focal length as unreliable as its own
+     vanishing line, and writing that into settings would poison every later
+     tilt-and-height shot. */
+  var q = EE.referenceQuality(t.taps.slice(0, 4), 3);
+  if (cal.fovMeasured && q && q.minSpanPx >= 150 &&
+    (cal.focal.disagree == null || cal.focal.disagree < 0.06)) {
+    db.settings.fov = cal.fovMeasured;
+    db.settings.fovFrom = (st.cam && st.cam.label) || 'this camera';
+    db.settings.fovAt = Date.now();
     save();
-    msg += ' · lens solved at ' + f.fov.toFixed(1) + '°';
+    msg += ' · lens measured at ' + cal.fovMeasured.toFixed(1) + '°';
+  } else if (cal.fovMeasured) {
+    msg += ' · lens reads ' + cal.fovMeasured.toFixed(1) + '°, quad too small to trust it';
   }
   if (cal.poseRms != null && cal.poseRms > 0.3) {
     msg += ' · tilt looks off, heights may be unreliable';
@@ -3428,8 +3726,8 @@ function applyRay() {
   if (t.taps.length >= 2 && knownEl) {
     var known = EE.toM(parseFloat(knownEl.value), U());
     if (known > 0) {
-      var a = EE.rayForPixel(t.taps[0].x, t.taps[0].y, st.imgW, st.imgH, f, st.screenAngle);
-      var b = EE.rayForPixel(t.taps[1].x, t.taps[1].y, st.imgW, st.imgH, f, st.screenAngle);
+      var a = EE.rayForPixel(t.taps[0].x, t.taps[0].y, st.imgW, st.imgH, f, effAngle(st));
+      var b = EE.rayForPixel(t.taps[1].x, t.taps[1].y, st.imgW, st.imgH, f, effAngle(st));
       var solved = EE.camHeightFromKnown(a, b, R, known, deckNormalOf(st));
       /* A plausible handheld camera height is roughly 1.2-1.8 m. Anything far
          outside that almost always means the two taps were NOT on the deck —

@@ -251,11 +251,41 @@ textarea.inp { min-height: 72px; resize: vertical; }
 .chk.ok { border-color: rgba(110,210,154,0.35); background: rgba(110,210,154,0.06); }
 .chk.ok .cg { color: var(--green); }
 
-.level-count {
-  font-family: ui-monospace, monospace; font-size: 52px; line-height: 1;
-  color: var(--gold); text-align: center; padding: 6px 0;
-  animation: eeBlink 1s infinite;
+/* stillness meter for the deck reading */
+.hold-bar { height: 6px; border-radius: 3px; background: rgba(244,240,232,0.12); overflow: hidden; }
+.hold-bar > div { height: 100%; width: 0; background: var(--gold); border-radius: 3px; transition: width 0.1s linear; }
+
+/* ============ swipe to delete ============ */
+/* The border lives on the wrapper, not the card: a clipped child's 1px border
+   gets shaved along rounded corners at fractional device-pixel ratios. */
+.card-wrap {
+  position: relative; overflow: hidden; border-radius: 20px;
+  box-shadow: 0 0 0 1.5px rgba(244,240,232,0.13);
+  touch-action: pan-y;
 }
+.card-wrap .proj-card { position: relative; z-index: 1; box-shadow: none; border-radius: 20px; }
+.card-actions { position: absolute; inset: 0 0 0 auto; width: 96px; display: flex; }
+.swipe-btn {
+  flex: 1; border: none; cursor: pointer; font-family: inherit;
+  font-size: 13px; font-weight: 700; letter-spacing: 0.02em;
+}
+.swipe-btn.del { background: var(--red); color: #2A0F0B; }
+.swipe-btn.del:active { filter: brightness(1.15); }
+
+/* ============ shot chips ============ */
+.stn-chip { position: relative; }
+.stn-chip > .thumb.gone {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  font-family: ui-monospace, monospace; font-size: 9px; line-height: 1.25;
+  color: rgba(244,240,232,0.4); background: #14101C;
+}
+.stn-del {
+  position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border-radius: 999px;
+  background: rgba(12,10,16,0.82); border: 1px solid rgba(244,240,232,0.25);
+  color: var(--red-light); font-size: 13px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; padding: 0; font-family: inherit;
+}
+.stn-del:active { background: var(--red); color: var(--ink); }
 .chk-line {
   display: flex; align-items: center; gap: 10px; cursor: pointer;
   font-size: 13.5px; color: rgba(244,240,232,0.75); padding: 2px 0;

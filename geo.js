@@ -350,6 +350,12 @@ var EE = (function () {
   function focalFromFov(fovDeg, longPx) {
     return (longPx / 2) / Math.tan((fovDeg * DEG) / 2);
   }
+  /* The inverse, so a focal length recovered from a homography can be shown as
+     the field of view a human recognises. */
+  function fovFromFocalLong(f, longPx) {
+    if (!(f > 0)) return 0;
+    return 2 * Math.atan((longPx / 2) / f) / DEG;
+  }
 
   /* Camera ray for an image pixel, in the DEVICE frame.
 
@@ -421,6 +427,97 @@ var EE = (function () {
     else if (ang === 270) { x = -ry; y = rx; }
 
     return { x: x + imgW / 2, y: y + imgH / 2 };
+  }
+
+  /* Focal length recovered from a plane homography alone — Zhang's constraint.
+
+     This removes the worst guess in the app. A 68 deg field of view was assumed
+     for every phone; an iPhone 16 Pro Max main camera is a 24 mm equivalent at
+     roughly 73-77 deg, and Safari may hand back a cropped stream at a different
+     figure again. In the ray model f sets the perspective outright, so a 10%
+     error there puts the vanishing line badly wrong — exactly the failure of a
+     calibration that measures fine along one direction and nowhere else.
+
+     If G = H^-1 maps the plane to the image then G = lambda.K.[r1 r2 t], and r1,
+     r2 being orthonormal gives two equations. Recentring on the principal point
+     leaves K = diag(f, f, 1), so each equation solves for f in closed form — no
+     search, no attitude, nothing but the four corners already tapped.
+
+     The two estimates are independent, which is the useful part: when they agree
+     the quad is sound, and when they do not it is telling you the corners are
+     wrong or the reference is too small to determine perspective at all. */
+  function focalFromHomography(H, imgW, imgH) {
+    var G = invert3(H);
+    if (!G) return null;
+    var cx = imgW / 2, cy = imgH / 2;
+
+    /* Columns of G, shifted so the principal point is the origin, then scaled by
+       a COMMON factor — the two share one projective scale, so normalising them
+       separately would break the equal-length constraint. */
+    var g1 = [G[0] - cx * G[6], G[3] - cy * G[6], G[6]];
+    var g2 = [G[1] - cx * G[7], G[4] - cy * G[7], G[7]];
+    var s = Math.max(Math.hypot(g1[0], g1[1], g1[2]), Math.hypot(g2[0], g2[1], g2[2]));
+    if (!(s > 0)) return null;
+    for (var i = 0; i < 3; i++) { g1[i] /= s; g2[i] /= s; }
+
+    /* Both denominators vanish in ordinary situations, and an absolute epsilon
+       is not enough to notice. Hold the phone without roll and align the
+       reference to the frame — the everyday case — and g1z goes to zero, taking
+       the first constraint with it; floating-point noise then sails through a
+       1e-18 guard and the division returns confident nonsense. With the columns
+       normalised, a relative threshold catches it. */
+    var EPS = 1e-9;
+    var f2a = null, f2b = null;
+    var denA = g1[2] * g2[2];
+    if (Math.abs(denA) > EPS) {
+      var va = -(g1[0] * g2[0] + g1[1] * g2[1]) / denA;
+      if (va > 0) f2a = va;
+    }
+    var denB = g1[2] * g1[2] - g2[2] * g2[2];
+    if (Math.abs(denB) > EPS) {
+      var vb = ((g2[0] * g2[0] + g2[1] * g2[1]) - (g1[0] * g1[0] + g1[1] * g1[1])) / denB;
+      if (vb > 0) f2b = vb;
+    }
+
+    /* A focal length outside roughly 10-150 degrees across the frame is not a
+       lens; it is a degenerate solve that slipped the guard. */
+    var plausible = function (f2) {
+      if (f2 == null) return null;
+      var f = Math.sqrt(f2);
+      var fov = fovFromFocalLong(f, Math.max(imgW, imgH));
+      return (fov > 10 && fov < 150) ? f : null;
+    };
+    var fa = plausible(f2a), fb = plausible(f2b);
+    if (fa == null && fb == null) return null;
+
+    var f = (fa != null && fb != null) ? Math.sqrt(fa * fb) : (fa != null ? fa : fb);
+
+    /* How far apart the two independent answers are, as a fraction. */
+    var disagree = (fa != null && fb != null)
+      ? Math.abs(fa - fb) / Math.max(fa, fb)
+      : null;
+
+    return { f: f, fOrtho: fa, fEqual: fb, disagree: disagree };
+  }
+
+  /* Where the deck's horizon falls in the image, for a plane homography.
+     w = 0 is the vanishing line by construction, so this is exact — and drawing
+     it is the fastest way to see that a calibration has gone wrong. */
+  function horizonLine(H, imgW, imgH) {
+    if (!H) return null;
+    var a = H[6], b = H[7], c = H[8];
+    if (Math.abs(a) < 1e-18 && Math.abs(b) < 1e-18) return null;
+
+    /* Solved along whichever axis is better conditioned. A y = f(x) form alone
+       returns nothing when the horizon is vertical — which is precisely the shape
+       a wrongly-rotated frame produces, and the one case the diagnostic most
+       needs to draw. */
+    var steep = Math.abs(b) < Math.abs(a);
+    var h = imgH || imgW;
+    if (!steep) {
+      return { x0: 0, y0: -c / b, x1: imgW, y1: -(c + a * imgW) / b, steep: false };
+    }
+    return { x0: -c / a, y0: 0, x1: -(c + b * h) / a, y1: h, steep: true };
   }
 
   /* ================= the deck plane =================
@@ -1408,12 +1505,14 @@ var EE = (function () {
     solveLinear: solveLinear, mul3: mul3, invert3: invert3, applyM3: applyM3, transpose3: transpose3,
     homographyFromQuad: homographyFromQuad, applyH: applyH, rectRefCorners: rectRefCorners,
     det3: det3, orientH: orientH, homographyFromPose: homographyFromPose,
+    focalFromHomography: focalFromHomography, horizonLine: horizonLine,
     referenceQuality: referenceQuality, steppedReferenceError: steppedReferenceError,
     meanAngleMod90: meanAngleMod90, bestCorner: bestCorner,
     normalFromAttitude: normalFromAttitude, deckTiltDeg: deckTiltDeg, deckBasis: deckBasis,
     jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
     clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,
     rotFromOrientation: rotFromOrientation, focalFromFov: focalFromFov,
+    fovFromFocalLong: fovFromFocalLong,
     quatMul: quatMul, quatFromOrientation: quatFromOrientation, quatToMatrix: quatToMatrix,
     quatSlerp: quatSlerp, quatAngleDeg: quatAngleDeg,
     rayForPixel: rayForPixel, groundPoint: groundPoint, projectToPixel: projectToPixel,

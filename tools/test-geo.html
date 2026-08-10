@@ -161,6 +161,122 @@ function near(name, a, b, tol) {
   })());
 })();
 
+/* ---- focal length recovered from a homography ---- */
+(function () {
+  var W = 1080, H = 1440;
+
+  /* Synthesise a camera at a KNOWN focal length, project a rectangle, solve the
+     homography from those four corners alone, and see if f comes back. */
+  [58, 68, 77, 90].forEach(function (fovDeg) {
+    var f = EE.focalFromFov(fovDeg, Math.max(W, H));
+    var R = EE.rotFromOrientation(11, 57, -5), camH = 1.55;
+    var ref = EE.rectRefCorners(2.4, 1.2);
+    var pix = ref.map(function (p) {
+      return EE.projectToPixel({ x: p.x + 1, y: p.y + 4 }, R, camH, W, H, f, 0, 0);
+    });
+    var Hm = EE.homographyFromQuad(pix, ref);
+    var got = EE.focalFromHomography(Hm, W, H);
+    ok('focal recovered at ' + fovDeg + ' deg fov', got && Math.abs(got.f - f) / f < 1e-6,
+       got && (got.f.toFixed(1) + ' vs ' + f.toFixed(1)));
+    ok('  and both estimates agree at ' + fovDeg, got.disagree < 1e-6, got && got.disagree);
+    near('  round trips back to the fov', EE.fovFromFocalLong(got.f, Math.max(W, H)), fovDeg, 1e-6);
+  });
+
+  /* The regression this exists for: assuming 68 deg when the lens is 77 deg puts
+     the horizon badly wrong, and the recovered value says so. */
+  var fTrue = EE.focalFromFov(77, Math.max(W, H));
+  var fAssumed = EE.focalFromFov(68, Math.max(W, H));
+  var R2 = EE.rotFromOrientation(0, 58, 0);
+  var hTrue = EE.homographyFromPose(R2, 1.55, fTrue, W, H, 0);
+  var hAssumed = EE.homographyFromPose(R2, 1.55, fAssumed, W, H, 0);
+  var horA = EE.horizonLine(hTrue, W, H), horB = EE.horizonLine(hAssumed, W, H);
+  ok('a 9 deg fov error moves the horizon by many pixels',
+     Math.abs(horA.y0 - horB.y0) > 25, Math.abs(horA.y0 - horB.y0).toFixed(0) + ' px');
+
+  /* The everyday degeneracy, and the one that produced a confident wrong answer:
+     no roll and no yaw relative to the reference, so one constraint's denominator
+     collapses to floating-point noise. It must fall back to the constraint that
+     still works rather than average in garbage. */
+  (function () {
+    var fx = EE.focalFromFov(77, Math.max(W, H));
+    var Rlevel = EE.rotFromOrientation(0, 58, 0);       /* alpha 0, gamma 0 */
+    var ref = EE.rectRefCorners(2.4, 1.2);
+    var pix = ref.map(function (p) {
+      return EE.projectToPixel({ x: p.x - 1.2, y: p.y + 2.0 }, Rlevel, 1.55, W, H, fx, 0, 0);
+    });
+    var got = EE.focalFromHomography(EE.homographyFromQuad(pix, ref), W, H);
+    ok('an unrolled, unyawed shot still recovers the lens',
+       got && Math.abs(got.f - fx) / fx < 1e-6, got && (got.f.toFixed(1) + ' vs ' + fx.toFixed(1)));
+    ok('and it does so from one constraint, not a bogus average',
+       got && got.fOrtho === null && got.fEqual != null,
+       got && ('ortho=' + got.fOrtho + ' equal=' + (got.fEqual && got.fEqual.toFixed(1))));
+    ok('so it reports no self-check rather than a false one', got && got.disagree === null);
+  })();
+
+  /* Straight down is the genuinely degenerate case: a fronto-parallel plane makes
+     the homography a similarity, both perspective terms vanish, and there is no
+     focal length to be had. It must return nothing rather than a confident guess. */
+  var fx = EE.focalFromFov(68, Math.max(W, H));
+  var refF = EE.rectRefCorners(2.4, 1.2);
+  var nadir = refF.map(function (p) {
+    return EE.projectToPixel({ x: p.x - 1.2, y: p.y - 0.6 },
+      EE.rotFromOrientation(0, 0, 0), 3.0, W, H, fx, 0, 0);
+  });
+  var hNadir = EE.homographyFromQuad(nadir, refF);
+  ok('a nadir view yields no focal length', EE.focalFromHomography(hNadir, W, H) === null,
+     JSON.stringify(EE.focalFromHomography(hNadir, W, H)));
+
+  /* But it needs very little tilt to work — 2 degrees is already enough, which
+     matters because it means almost any real shot can calibrate its own lens. */
+  var tilted = refF.map(function (p) {
+    return EE.projectToPixel({ x: p.x - 1.2, y: p.y - 0.6 },
+      EE.rotFromOrientation(0, 2, 0), 3.0, W, H, fx, 0, 0);
+  });
+  var got2 = EE.focalFromHomography(EE.homographyFromQuad(tilted, refF), W, H);
+  ok('two degrees of tilt already recovers it', got2 && Math.abs(got2.f - fx) / fx < 1e-6,
+     got2 && got2.f.toFixed(1) + ' vs ' + fx.toFixed(1));
+  ok('though with only one usable constraint, so it cannot self-check',
+     got2.disagree === null, got2.disagree);
+
+  ok('a singular matrix yields nothing', EE.focalFromHomography([1,0,0, 2,0,0, 3,0,0], W, H) === null);
+})();
+
+/* ---- horizon line ---- */
+(function () {
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0);
+  var Hm = EE.homographyFromPose(R, 1.55, f, W, H, 0);
+  var hor = EE.horizonLine(Hm, W, H);
+  ok('horizon reported', !!hor);
+  near('level camera: horizon is flat across the frame', hor.y0, hor.y1, 1e-9);
+
+  /* w must be exactly zero on the reported line, and positive below it. */
+  var wAt = function (x, y) { return Hm[6]*x + Hm[7]*y + Hm[8]; };
+  near('w is zero on the horizon', wAt(0, hor.y0), 0, 1e-12);
+  ok('w is positive below it', wAt(W/2, hor.y0 + 50) > 0);
+  ok('w is negative above it', wAt(W/2, hor.y0 - 50) < 0);
+
+  /* Rolling the phone must tilt the horizon in the image. */
+  var rolled = EE.homographyFromPose(EE.rotFromOrientation(0, 58, 20), 1.55, f, W, H, 0);
+  var hr = EE.horizonLine(rolled, W, H);
+  ok('a rolled phone tilts the horizon', Math.abs(hr.y0 - hr.y1) > 100,
+     Math.abs(hr.y0 - hr.y1).toFixed(0) + ' px across the frame');
+
+  /* A wrongly-rotated frame turns the horizon vertical. The y = f(x) form alone
+     returned nothing here, which hid the very failure this is meant to expose. */
+  var sideways = EE.homographyFromPose(R, 1.55, f, W, H, 90);
+  var hs = EE.horizonLine(sideways, W, H);
+  ok('a 90 deg frame rotation gives a vertical horizon', hs && hs.steep, JSON.stringify(hs));
+  ok('and it is still a drawable segment',
+     hs && isFinite(hs.x0) && isFinite(hs.x1) && isFinite(hs.y0) && isFinite(hs.y1));
+  near('running the full height of the frame', Math.abs(hs.y1 - hs.y0), H, 1e-9);
+
+  /* w must still flip sign across it, whichever way it runs. */
+  var wS = function (x, y) { return sideways[6]*x + sideways[7]*y + sideways[8]; };
+  var mx = (hs.x0 + hs.x1) / 2, my = (hs.y0 + hs.y1) / 2;
+  ok('sign flips across a vertical horizon too', wS(mx - 60, my) * wS(mx + 60, my) < 0);
+})();
+
 /* ---- the deck plane from gravity ---- */
 (function () {
   var D = Math.PI / 180;
