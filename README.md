@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     213 assertions over geo.js — open it in a browser
+    ├── test-geo.html     239 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -263,6 +263,53 @@ gaps are shaded on the deck where they actually are, so you can walk to them.
 
 The yaw slider exists because iOS `alpha` drifts; nudge until the wireframe lines up.
 
+## Level the deck first
+
+**Check → Set the flat plane.** Lay the phone on the roof, screen down, and Eagle Eye reads
+where flat actually is from gravity. It counts down, so you never need to see the screen, and
+it refuses the reading if the phone moved while it was taken.
+
+This is what makes a *small* reference usable, and it is worth understanding why. A homography
+has eight degrees of freedom and two of them **are** the vanishing line. A bank card spanning
+a dozen pixels carries almost no perspective information, so those two terms end up decided by
+a pixel of noise: the scale along the card comes out right and the horizon comes out wrong —
+so anything away from the card is wrong with it.
+
+Gravity has exactly the opposite problem. It fixes the plane perfectly and carries no length
+at all. So the two are complementary: **plane from gravity, length from the card.**
+
+Screen down is truer than screen up — the camera bump tilts a face-up phone about a degree.
+Rest it on a wallet if the bump is the only thing touching.
+
+A commercial roof drains at 1–2%, which is 0.6–1.1°. Small, but it is a *bias*, not noise, so
+it does not average away across a survey. Re-read it if you move to a section that falls a
+different way.
+
+Every measurement path uses the reading once it exists — ray casting, the pose homography,
+reprojection, and the height tool. With no reading, the deck is assumed level exactly as
+before.
+
+## Corner snapping
+
+**On by default**, toggled in the trace toolbar. A finger is about 3 px honest even with the
+loupe, and inside the trusted radius that is the dominant error. But a corner is exactly
+locatable from the image itself — so your tap only has to say *which* corner, and the pixels
+say where it is. It reports how far it moved, and buzzes when it catches.
+
+Shi-Tomasi rather than Harris: the smaller eigenvalue of the structure tensor is the response
+directly, with no empirical constant to tune, and it does not reward a strong edge the way
+Harris can. A Gaussian prior about the tap stops it wandering to a better corner half a unit
+away.
+
+It refuses to snap when the patch is featureless, which matters as much as snapping when it is
+not — blank membrane must not produce a confident answer out of sensor noise.
+
+This is deliberately **not** shape detection. Proposing whole rectangles on a roof produces
+confident nonsense: the best published attempt at that task gets 58% precision on easier
+imagery, and a flat roof is wall-to-wall rectilinear clutter — membrane seams, board joints —
+that swamps any line-based detector. Refining a corner you already chose adds accuracy with no
+chance of inventing geometry.
+
 ## A reference is measured in pixels, not metres
 
 The most consequential number in a calibration, and the least obvious. A reference does not
@@ -358,7 +405,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 213 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 239 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

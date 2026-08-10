@@ -376,22 +376,39 @@ var EE = (function () {
   /* Intersects a device-frame ray with a horizontal plane `planeZ` metres above
      the roof, given a camera `camHeight` above that same roof. Returns null when
      the ray is level or rising — i.e. above the horizon. */
-  function groundPoint(rayDev, R, camHeight, planeZ) {
+  function groundPoint(rayDev, R, camHeight, planeZ, deckNormal) {
     var d = applyM3(R, rayDev);
+    var n = deckNormal || [0, 0, 1];
     var z = planeZ || 0;
-    var drop = camHeight - z;
-    if (drop <= 1e-6) return null;
-    if (d[2] > -1e-6) return null;
-    var t = drop / -d[2];
-    return { x: t * d[0], y: t * d[1], range: t };
+    if (camHeight - z <= 1e-6) return null;
+
+    var nd = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+    if (nd > -1e-6) return null;                 /* level with or above the deck */
+    var t = (z - camHeight) / nd;
+
+    var b = deckBasis(n);
+    var X = [t * d[0], t * d[1], t * d[2]];
+    return {
+      x: X[0] * b.e1[0] + X[1] * b.e1[1] + X[2] * b.e1[2],
+      y: X[0] * b.e2[0] + X[1] * b.e2[1] + X[2] * b.e2[2],
+      range: t
+    };
   }
 
   /* World point -> pixel. The exact inverse of rayForPixel + groundPoint, used to
      paint the metric grid and the traced shapes back onto the photo. That overlay
      is the only honest way for someone on a roof to see that a calibration is
      right before they trust a number from it. */
-  function projectToPixel(pt, R, camHeight, imgW, imgH, f, screenAngle, planeZ) {
-    var v = [pt.x, pt.y, (planeZ || 0) - camHeight];
+  function projectToPixel(pt, R, camHeight, imgW, imgH, f, screenAngle, planeZ, deckNormal) {
+    var n = deckNormal || [0, 0, 1];
+    var b = deckBasis(n);
+    var k = (planeZ || 0) - camHeight;
+    /* A deck point lifted along the deck normal, not along world up. */
+    var v = [
+      pt.x * b.e1[0] + pt.y * b.e2[0] + k * n[0],
+      pt.x * b.e1[1] + pt.y * b.e2[1] + k * n[1],
+      pt.x * b.e1[2] + pt.y * b.e2[2] + k * n[2]
+    ];
     var d = applyM3(transpose3(R), v);
     if (d[2] > -1e-9) return null;           /* behind the camera */
     var xn = d[0] / -d[2], yn = -d[1] / -d[2];
@@ -406,6 +423,54 @@ var EE = (function () {
     return { x: x + imgW / 2, y: y + imgH / 2 };
   }
 
+  /* ================= the deck plane =================
+
+     Where "flat" actually is, taken from gravity rather than assumed.
+
+     This is what rescues a small reference. A homography has 8 degrees of freedom
+     and two of them ARE the vanishing line. A bank card spanning a dozen pixels
+     carries almost no perspective information, so those two terms end up decided
+     by a pixel of noise: the scale along the card comes out fine while the
+     horizon is nonsense, and everything away from the card goes with it.
+
+     Gravity has the opposite problem — it fixes the plane exactly and carries no
+     length at all. Lay the phone on the deck and the two are complementary: the
+     plane comes from gravity, the length from the card. */
+
+  /* Deck normal, in the world frame, from the attitude of a phone lying on it.
+     Face-up the device +Z points out of the screen along the normal; face-down it
+     points into the deck, so the sign flips. */
+  function normalFromAttitude(alphaDeg, betaDeg, gammaDeg, faceDown) {
+    var R = rotFromOrientation(alphaDeg, betaDeg, gammaDeg);
+    var n = applyM3(R, [0, 0, faceDown ? -1 : 1]);
+    var m = Math.hypot(n[0], n[1], n[2]);
+    if (m < 1e-9) return [0, 0, 1];
+    return [n[0] / m, n[1] / m, n[2] / m];
+  }
+
+  /* How far off level the deck is, in degrees. A commercial roof drains at 1-2%,
+     which is 0.6-1.1 deg — small, but it is a bias rather than noise, so it does
+     not average away over a survey. */
+  function deckTiltDeg(n) {
+    if (!n) return 0;
+    return Math.acos(Math.min(1, Math.abs(n[2]))) / DEG;
+  }
+
+  /* An orthonormal pair spanning the deck, for expressing points on it in 2D.
+     e1 is world east projected onto the deck, so a level deck reduces to plain
+     x/y and every existing measurement is unchanged. */
+  function deckBasis(n) {
+    if (!n || Math.abs(n[2] - 1) < 1e-12) return { e1: [1, 0, 0], e2: [0, 1, 0] };
+    var ref = Math.abs(n[0]) > 0.9 ? [0, 1, 0] : [1, 0, 0];
+    var d = ref[0] * n[0] + ref[1] * n[1] + ref[2] * n[2];
+    var e1 = [ref[0] - d * n[0], ref[1] - d * n[1], ref[2] - d * n[2]];
+    var m = Math.hypot(e1[0], e1[1], e1[2]);
+    if (m < 1e-9) return { e1: [1, 0, 0], e2: [0, 1, 0] };
+    e1 = [e1[0] / m, e1[1] / m, e1[2] / m];
+    var e2 = [n[1] * e1[2] - n[2] * e1[1], n[2] * e1[0] - n[0] * e1[2], n[0] * e1[1] - n[1] * e1[0]];
+    return { e1: e1, e2: e2 };
+  }
+
   /* The ray cast expressed as a single 3x3 image -> ground homography.
 
      The two calibration modes look unrelated in code but describe the same kind
@@ -418,7 +483,7 @@ var EE = (function () {
      directions. Intersecting z = 0 from height h gives x = h.d0/(-d2) and
      y = h.d1/(-d2), which is exactly the matrix below. Because the third row is
      -d2, w > 0 lands in front of the camera for free. */
-  function homographyFromPose(R, camHeight, f, imgW, imgH, screenAngle) {
+  function homographyFromPose(R, camHeight, f, imgW, imgH, screenAngle, deckNormal) {
     if (!R || !(camHeight > 0) || !(f > 0)) return null;
     var cx = imgW / 2, cy = imgH / 2;
     var ang = ((screenAngle || 0) % 360 + 360) % 360;
@@ -432,10 +497,23 @@ var EE = (function () {
     var M = [1 / f, 0, 0, 0, -1 / f, 0, 0, 0, -1];
     var A = mul3(R, mul3(M, S));
 
+    var n = deckNormal || [0, 0, 1];
+    var b = deckBasis(n);
+    /* (v^T A)[j] — the row of A seen along direction v. */
+    var row = function (v) {
+      return [v[0] * A[0] + v[1] * A[3] + v[2] * A[6],
+      v[0] * A[1] + v[1] * A[4] + v[2] * A[7],
+      v[0] * A[2] + v[1] * A[5] + v[2] * A[8]];
+    };
+    var r1 = row(b.e1), r2 = row(b.e2), r3 = row(n);
+
+    /* Negating the third row keeps w > 0 in front of the camera, which is what
+       every horizon test in the codebase relies on. A level deck reduces this to
+       [h.A0 ; h.A1 ; -A2], exactly as before. */
     return [
-      camHeight * A[0], camHeight * A[1], camHeight * A[2],
-      camHeight * A[3], camHeight * A[4], camHeight * A[5],
-      -A[6], -A[7], -A[8]
+      camHeight * r1[0], camHeight * r1[1], camHeight * r1[2],
+      camHeight * r2[0], camHeight * r2[1], camHeight * r2[2],
+      -r3[0], -r3[1], -r3[2]
     ];
   }
 
@@ -657,14 +735,19 @@ var EE = (function () {
      The base fixes where the object is on the plane. The top must lie on the
      vertical through that base, so walking out along the top ray until its
      horizontal travel matches the base's gives the altitude directly. */
-  function heightFromBaseTop(basePt, topRayDev, R, camHeight) {
+  function heightFromBaseTop(basePt, topRayDev, R, camHeight, deckNormal) {
     var d = applyM3(R, topRayDev);
-    var hx = d[0], hy = d[1];
+    var n = deckNormal || [0, 0, 1];
+    var b = deckBasis(n);
+    /* Components of the top ray within the deck, and along its normal. */
+    var hx = d[0] * b.e1[0] + d[1] * b.e1[1] + d[2] * b.e1[2];
+    var hy = d[0] * b.e2[0] + d[1] * b.e2[1] + d[2] * b.e2[2];
+    var hn = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
     var den = hx * hx + hy * hy;
     if (den < 1e-12) return null;             /* looking straight down */
     var t = (basePt.x * hx + basePt.y * hy) / den;
     if (t <= 0) return null;                  /* top ray points the other way */
-    var h = camHeight + t * d[2];
+    var h = camHeight + t * hn;
     if (!isFinite(h)) return null;
     return h;
   }
@@ -673,12 +756,88 @@ var EE = (function () {
      coordinates scale linearly with camera height, so measuring the pair at a
      nominal 1 m and dividing gives the true height in closed form. This is what
      lets someone skip guessing their eye height. */
-  function camHeightFromKnown(rayA, rayB, R, knownDist) {
-    var a = groundPoint(rayA, R, 1, 0), b = groundPoint(rayB, R, 1, 0);
+  function camHeightFromKnown(rayA, rayB, R, knownDist, deckNormal) {
+    var a = groundPoint(rayA, R, 1, 0, deckNormal), b = groundPoint(rayB, R, 1, 0, deckNormal);
     if (!a || !b) return null;
     var d = Math.hypot(a.x - b.x, a.y - b.y);
     if (d < 1e-9) return null;
     return knownDist / d;
+  }
+
+  /* ================= corner snapping =================
+
+     Tap error is the dominant error inside the trusted radius, and a finger is
+     about 3 px honest even with the loupe. A corner, though, is exactly locatable
+     from the image itself — so the tap only has to say WHICH corner, and the
+     pixels say where it is.
+
+     Shi-Tomasi rather than Harris: the smaller eigenvalue of the structure tensor
+     is the response directly, with no empirical k to tune, and it does not reward
+     a strong edge the way Harris can. A Gaussian prior about the tap keeps it
+     honest — without one it happily snaps to a better corner half a unit away.
+
+     Deliberately NOT a shape detector. Rooftops are wall-to-wall rectilinear
+     clutter — membrane seams, board joints — so proposing whole rectangles
+     produces confident nonsense. Refining a corner the user already chose adds
+     accuracy with no chance of inventing geometry. */
+  function bestCorner(gray, w, h, sigma) {
+    if (!gray || w < 9 || h < 9) return null;
+    var cx = (w - 1) / 2, cy = (h - 1) / 2;
+    var sg = sigma > 0 ? sigma : Math.max(3, w / 6);
+    var twoSig2 = 2 * sg * sg;
+
+    /* Sobel, then a 3x3 box sum of the structure tensor. Both margins are dropped
+       so no neighbourhood ever reads outside the patch. */
+    var n = w * h;
+    var gx = new Float32Array(n), gy = new Float32Array(n);
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        var i = y * w + x;
+        var tl = gray[i - w - 1], tc = gray[i - w], tr = gray[i - w + 1];
+        var ml = gray[i - 1], mr = gray[i + 1];
+        var bl = gray[i + w - 1], bc = gray[i + w], br = gray[i + w + 1];
+        gx[i] = (tr + 2 * mr + br) - (tl + 2 * ml + bl);
+        gy[i] = (bl + 2 * bc + br) - (tl + 2 * tc + tr);
+      }
+    }
+
+    var best = null, scores = [];
+    for (y = 2; y < h - 2; y++) {
+      for (x = 2; x < w - 2; x++) {
+        var a = 0, b = 0, c = 0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            var j = (y + dy) * w + (x + dx);
+            a += gx[j] * gx[j]; b += gx[j] * gy[j]; c += gy[j] * gy[j];
+          }
+        }
+        /* Smaller eigenvalue of [[a,b],[b,c]] — large only when BOTH gradient
+           directions are strong, which is what distinguishes a corner from an edge. */
+        var half = (a + c) / 2;
+        var disc = Math.sqrt(Math.max(0, ((a - c) / 2) * ((a - c) / 2) + b * b));
+        var lambda = half - disc;
+        scores.push(lambda);
+
+        var r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+        var s = lambda * Math.exp(-r2 / twoSig2);
+        if (!best || s > best.s) best = { x: x, y: y, s: s, lambda: lambda };
+      }
+    }
+    if (!best) return null;
+
+    /* Confidence against the patch's own texture, so a blank membrane cannot
+       produce a confident snap out of sensor noise. */
+    scores.sort(function (p, q) { return p - q; });
+    var median = scores[Math.floor(scores.length / 2)] || 0;
+    var p90 = scores[Math.floor(scores.length * 0.9)] || 0;
+
+    return {
+      x: best.x, y: best.y,
+      lambda: best.lambda,
+      ratio: median > 1e-9 ? best.lambda / median : (best.lambda > 1e-6 ? Infinity : 0),
+      p90: p90,
+      dist: Math.hypot(best.x - cx, best.y - cy)
+    };
   }
 
   /* ================= shape fitting ================= */
@@ -1223,7 +1382,8 @@ var EE = (function () {
     homographyFromQuad: homographyFromQuad, applyH: applyH, rectRefCorners: rectRefCorners,
     det3: det3, orientH: orientH, homographyFromPose: homographyFromPose,
     referenceQuality: referenceQuality, steppedReferenceError: steppedReferenceError,
-    meanAngleMod90: meanAngleMod90,
+    meanAngleMod90: meanAngleMod90, bestCorner: bestCorner,
+    normalFromAttitude: normalFromAttitude, deckTiltDeg: deckTiltDeg, deckBasis: deckBasis,
     jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
     clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,
     rotFromOrientation: rotFromOrientation, focalFromFov: focalFromFov,

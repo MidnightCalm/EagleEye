@@ -161,6 +161,149 @@ function near(name, a, b, tol) {
   })());
 })();
 
+/* ---- the deck plane from gravity ---- */
+(function () {
+  var D = Math.PI / 180;
+
+  /* A phone lying face-up on a level deck reports the normal as world up. */
+  var flat = EE.normalFromAttitude(0, 0, 0, false);
+  near('level deck normal is world up', flat[2], 1, 1e-12);
+  near('deck tilt of a level deck is zero', EE.deckTiltDeg(flat), 0, 1e-12);
+
+  /* Face down, the device +Z points into the deck, so the sign must flip. */
+  var down = EE.normalFromAttitude(0, 180, 0, true);
+  near('face-down on a level deck still yields up', down[2], 1, 1e-9);
+
+  /* A 2% drainage fall is 1.15 deg, which the reading must actually show. */
+  var slope = EE.normalFromAttitude(0, 1.1458, 0, false);
+  near('a 2% fall reads as 1.15 deg', EE.deckTiltDeg(slope), 1.1458, 1e-4);
+
+  var b = EE.deckBasis(flat);
+  near('level basis e1 is world east', b.e1[0], 1, 1e-12);
+  near('level basis e2 is world north', b.e2[1], 1, 1e-12);
+
+  var bs = EE.deckBasis(slope);
+  var dot = function (u, v) { return u[0]*v[0] + u[1]*v[1] + u[2]*v[2]; };
+  near('tilted basis stays orthonormal (e1.e2)', dot(bs.e1, bs.e2), 0, 1e-12);
+  near('tilted basis lies in the deck (e1.n)', dot(bs.e1, slope), 0, 1e-12);
+  near('tilted basis lies in the deck (e2.n)', dot(bs.e2, slope), 0, 1e-12);
+  near('tilted basis e1 is unit', Math.hypot(bs.e1[0],bs.e1[1],bs.e1[2]), 1, 1e-12);
+
+  /* Passing a level normal explicitly must change nothing anywhere. */
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W,H));
+  var R = EE.rotFromOrientation(17, 57, -4), camH = 1.55;
+  var worst = 0;
+  for (var px = 120; px < W; px += 260) {
+    for (var py = 700; py < H; py += 260) {
+      var a1 = EE.groundPoint(EE.rayForPixel(px,py,W,H,f,0), R, camH, 0);
+      var a2 = EE.groundPoint(EE.rayForPixel(px,py,W,H,f,0), R, camH, 0, [0,0,1]);
+      if (!a1 || !a2) continue;
+      worst = Math.max(worst, Math.hypot(a1.x-a2.x, a1.y-a2.y));
+    }
+  }
+  near('an explicit level normal is a no-op', worst, 0, 1e-12);
+
+  var Hl = EE.homographyFromPose(R, camH, f, W, H, 0);
+  var Hn = EE.homographyFromPose(R, camH, f, W, H, 0, [0,0,1]);
+  var hw = 0; for (var i=0;i<9;i++) hw = Math.max(hw, Math.abs(Hl[i]-Hn[i]));
+  near('and the pose homography is unchanged', hw, 0, 1e-12);
+
+  /* On a TILTED deck the whole chain must stay self-consistent. */
+  var n = EE.normalFromAttitude(0, 2.5, 1.5, false);
+  var Ht = EE.homographyFromPose(R, camH, f, W, H, 0, n);
+  var worstT = 0, cases = 0;
+  for (px = 120; px < W; px += 200) {
+    for (py = 760; py < H; py += 200) {
+      var g = EE.groundPoint(EE.rayForPixel(px,py,W,H,f,0), R, camH, 0, n);
+      if (!g) continue;
+      var viaH = EE.applyH(Ht, {x:px, y:py});
+      if (!viaH) { worstT = Infinity; continue; }
+      worstT = Math.max(worstT, Math.hypot(viaH.x-g.x, viaH.y-g.y));
+      var back = EE.projectToPixel(g, R, camH, W, H, f, 0, 0, n);
+      worstT = Math.max(worstT, Math.hypot(back.x-px, back.y-py) * 1e-6);
+      cases++;
+    }
+  }
+  ok('tilted-deck cases covered', cases > 8, cases);
+  near('pose homography, ray cast and reprojection all agree on a tilted deck', worstT, 0, 1e-8);
+
+  /* Height still comes back right when the deck is not level. */
+  var base = {x: 1.2, y: 7.0}, objH = 1.35;
+  var bp = EE.projectToPixel(base, R, camH, W, H, f, 0, 0, n);
+  var tp = EE.projectToPixel(base, R, camH, W, H, f, 0, objH, n);
+  var gb = EE.groundPoint(EE.rayForPixel(bp.x,bp.y,W,H,f,0), R, camH, 0, n);
+  var hm = EE.heightFromBaseTop(gb, EE.rayForPixel(tp.x,tp.y,W,H,f,0), R, camH, n);
+  near('height on a tilted deck recovers 1.35 m', hm, objH, 1e-8);
+
+  /* Ignoring a real slope costs range error, which is the point of measuring it. */
+  var gTilt = EE.groundPoint(EE.rayForPixel(W/2, H*0.72, W,H,f,0), R, camH, 0, n);
+  var gFlat = EE.groundPoint(EE.rayForPixel(W/2, H*0.72, W,H,f,0), R, camH, 0);
+  ok('a 3 deg slope moves a mid-field point measurably',
+     Math.hypot(gTilt.x-gFlat.x, gTilt.y-gFlat.y) > 0.05,
+     Math.hypot(gTilt.x-gFlat.x, gTilt.y-gFlat.y).toFixed(3) + ' m');
+
+  /* Scale-from-known-length must work on a tilted deck too. */
+  var pa = EE.projectToPixel({x:-1.5,y:6}, R, 1.72, W,H,f,0,0,n);
+  var pb = EE.projectToPixel({x: 1.5,y:6}, R, 1.72, W,H,f,0,0,n);
+  var solved = EE.camHeightFromKnown(
+      EE.rayForPixel(pa.x,pa.y,W,H,f,0), EE.rayForPixel(pb.x,pb.y,W,H,f,0), R, 3.0, n);
+  near('camera height solves on a tilted deck', solved, 1.72, 1e-9);
+})();
+
+/* ---- corner snapping ---- */
+(function () {
+  /* A synthetic dark quadrant on a light field: the corner is at (cx, cy). */
+  var mk = function (w, h, cx, cy, noise) {
+    var g = new Float32Array(w * h);
+    for (var y = 0; y < h; y++) for (var x = 0; x < w; x++) {
+      var v = (x < cx && y < cy) ? 40 : 200;
+      if (noise) v += ((x * 7919 + y * 104729) % 17 - 8) * noise;
+      g[y * w + x] = v;
+    }
+    return g;
+  };
+
+  var N = 41;
+  var c = EE.bestCorner(mk(N, N, 20, 20, 0), N, N, 8);
+  ok('finds a corner at the patch centre', c && Math.hypot(c.x - 19.5, c.y - 19.5) <= 1.5,
+     c && (c.x + ',' + c.y));
+  ok('and reports it as far above the local texture', c.ratio > 20, c.ratio.toFixed(1));
+
+  /* Offset corner: it must snap TO the corner, not stay at the tap. */
+  var off = EE.bestCorner(mk(N, N, 26, 15, 0), N, N, 8);
+  ok('snaps to an off-centre corner', Math.hypot(off.x - 25.5, off.y - 14.5) <= 1.5,
+     off.x + ',' + off.y);
+  ok('and reports how far it moved', off.dist > 4, off.dist.toFixed(1));
+
+  /* A straight EDGE is not a corner — Shi-Tomasi must not reward it. */
+  var edge = new Float32Array(N * N);
+  for (var y = 0; y < N; y++) for (var x = 0; x < N; x++) edge[y * N + x] = x < 20 ? 40 : 200;
+  var e = EE.bestCorner(edge, N, N, 8);
+  ok('an edge scores far lower than a corner', e.lambda < c.lambda / 50,
+     e.lambda.toFixed(1) + ' vs ' + c.lambda.toFixed(1));
+
+  /* Blank membrane must not manufacture a corner from noise. */
+  var blank = new Float32Array(N * N);
+  for (var i = 0; i < blank.length; i++) blank[i] = 128 + ((i * 7919) % 5 - 2) * 0.4;
+  var bl = EE.bestCorner(blank, N, N, 8);
+  ok('a featureless patch yields a weak response', bl.lambda < c.lambda / 200,
+     bl.lambda.toFixed(2));
+
+  /* The distance prior must stop it wandering to a better corner far away. */
+  var two = mk(N, N, 21, 21, 0);
+  for (y = 0; y < 6; y++) for (var x2 = 0; x2 < 6; x2++) two[y * N + x2] = 255;  // strong far corner
+  var pick = EE.bestCorner(two, N, N, 5);
+  ok('the prior keeps the snap near the tap', Math.hypot(pick.x - 20, pick.y - 20) < 8,
+     pick.x + ',' + pick.y);
+
+  /* Survives noise. */
+  var noisy = EE.bestCorner(mk(N, N, 20, 20, 1.5), N, N, 8);
+  ok('still finds the corner under noise', Math.hypot(noisy.x - 19.5, noisy.y - 19.5) <= 2,
+     noisy.x + ',' + noisy.y);
+
+  ok('rejects a tiny patch', EE.bestCorner(new Float32Array(16), 4, 4, 2) === null);
+})();
+
 /* ---- reference quality: pixels, not metres ---- */
 (function () {
   var quad = function (wPx, hPx) {

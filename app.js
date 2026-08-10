@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.5.0';
+var VERSION = '1.6.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -54,6 +54,7 @@ var DEFAULTS = {
   camH: 1.55,                  /* phone held at chest height, metres above the roof */
   nameTemplate: '{name} h={h}{u}',
   nameUnit: 'm',
+  cornerSnap: true,
   circleSegments: 24,
   maxPx: 1440,
   jpegQ: 0.72,
@@ -117,6 +118,8 @@ var ui = {
   scene: { yaw: 0.6, elev: 0.62 },
   imgCache: {},         /* stationId -> HTMLImageElement */
   urlCache: {},         /* stationId -> object URL, for thumbnails */
+  level: null,          /* deck-levelling countdown in progress */
+  levelTimer: null,
   sensors: { alpha: 0, beta: 90, gamma: 0, heading: null, headingAcc: null, live: false, denied: false },
   gps: null,
   gpsWatch: null,
@@ -279,7 +282,7 @@ function calMap(st) {
            is the frame the camera height passed alongside it refers to. */
         var inv = EE.applySimilarityInverse(c.pose, basePt);
         var b = { x: inv.x * c.pose.scale, y: inv.y * c.pose.scale };
-        return EE.heightFromBaseTop(b, ray, R, c.pose.scale);
+        return EE.heightFromBaseTop(b, ray, R, c.pose.scale, deckNormalOf(st));
       }
     };
   }
@@ -289,14 +292,14 @@ function calMap(st) {
     mode: 'ray',
     has3D: true,
     toGround: function (px, py, planeZ) {
-      return EE.groundPoint(EE.rayForPixel(px, py, st.imgW, st.imgH, c.f, st.screenAngle), R, c.camH, planeZ || 0);
+      return EE.groundPoint(EE.rayForPixel(px, py, st.imgW, st.imgH, c.f, st.screenAngle), R, c.camH, planeZ || 0, deckNormalOf(st));
     },
     toImg: function (g, planeZ) {
-      return EE.projectToPixel(g, R, c.camH, st.imgW, st.imgH, c.f, st.screenAngle, planeZ || 0);
+      return EE.projectToPixel(g, R, c.camH, st.imgW, st.imgH, c.f, st.screenAngle, planeZ || 0, deckNormalOf(st));
     },
     heightAt: function (basePt, topPx, topPy) {
       var ray = EE.rayForPixel(topPx, topPy, st.imgW, st.imgH, c.f, st.screenAngle);
-      return EE.heightFromBaseTop(basePt, ray, R, c.camH);
+      return EE.heightFromBaseTop(basePt, ray, R, c.camH, deckNormalOf(st));
     }
   };
 }
@@ -317,7 +320,7 @@ function calibrateQuad(st, quadPix, refW, refL) {
   if (st.att) {
     var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
     var unit = quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, st.screenAngle), R, 1, 0);
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, st.screenAngle), R, 1, 0, deckNormalOf(st));
     });
     if (unit.every(Boolean)) {
       /* Scale must be free here: it IS the camera height. */
@@ -345,7 +348,7 @@ function solveFocal(st, quadPix, refW, refL) {
   var cost = function (fovDeg) {
     var f = EE.focalFromFov(fovDeg, longPx);
     var g = quadPix.map(function (q) {
-      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, f, st.screenAngle), R, 1, 0);
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, f, st.screenAngle), R, 1, 0, deckNormalOf(st));
     });
     if (!g.every(Boolean)) return Infinity;
     /* The unit-height ray points differ from the reference by exactly the camera
@@ -366,6 +369,72 @@ function solveFocal(st, quadPix, refW, refL) {
   var fov = (lo + hi) / 2, rms = cost(fov);
   if (!isFinite(rms) || fov < 36 || fov > 114) return null;
   return { fov: fov, rms: rms };
+}
+
+/* ================= the deck plane =================
+
+   Gravity says where flat is; nothing else in the app can. Capturing it fixes the
+   two homography terms that ARE the vanishing line — the pair a small reference
+   like a bank card cannot pin down. After this, the card only has to supply a
+   length, which is the one thing it is good at.
+
+   Face-down is the better placement (the camera bump lifts a face-up phone by a
+   degree or so) but you cannot read the screen, so it runs on a countdown and
+   verifies the phone was actually still. */
+function levelSamples() {
+  var l = ui.level;
+  if (!l || !l.samples.length) return null;
+  var qs = l.samples.map(function (s) { return EE.quatFromOrientation(s.a, s.b, s.g); });
+  var ref = qs[0], spread = 0;
+  qs.forEach(function (q) { spread = Math.max(spread, EE.quatAngleDeg(ref, q)); });
+  var mid = l.samples[Math.floor(l.samples.length / 2)];
+  return { att: mid, spreadDeg: spread, n: qs.length };
+}
+
+function startLevel(faceDown) {
+  if (!ui.sensors.live) return toast('Enable the tilt sensor first');
+  ui.level = { faceDown: !!faceDown, count: 6, samples: [], done: null };
+  clearInterval(ui.levelTimer);
+  ui.levelTimer = setInterval(function () {
+    var l = ui.level;
+    if (!l) { clearInterval(ui.levelTimer); return; }
+    l.count--;
+    /* Only the last second is kept, by which time the phone is down and still. */
+    if (l.count <= 1) {
+      l.samples.push({ a: ui.sensors.alpha, b: ui.sensors.beta, g: ui.sensors.gamma });
+    }
+    if (l.count <= 0) {
+      clearInterval(ui.levelTimer);
+      var s = levelSamples();
+      if (!s || s.spreadDeg > 2.5) {
+        toast('It moved while reading — try again, and let it settle');
+        ui.level = null;
+      } else {
+        var p = currentProject();
+        p.deck = {
+          n: EE.normalFromAttitude(s.att.a, s.att.b, s.att.g, l.faceDown),
+          faceDown: l.faceDown,
+          spreadDeg: s.spreadDeg,
+          at: Date.now()
+        };
+        p.deck.tiltDeg = EE.deckTiltDeg(p.deck.n);
+        touchProject(p); save();
+        ui.level = null;
+        if (navigator.vibrate) navigator.vibrate(60);
+        toast('Deck read: ' + p.deck.tiltDeg.toFixed(1) + '° off level');
+      }
+      render();
+      return;
+    }
+    var el = $('#level-count');
+    if (el) el.textContent = l.count;
+  }, 1000);
+  render();
+}
+
+/* The normal a shot should be measured against. */
+function deckNormalOf(st) {
+  return (st && st.deckN) || null;
 }
 
 /* ================= coverage =================
@@ -394,7 +463,7 @@ function stationH(st) {
   if (c.mode === 'quad') return c.H;
   if (!st.att) return null;
   var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
-  return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, st.screenAngle);
+  return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, st.screenAngle, deckNormalOf(st));
 }
 
 /* Where the camera stood, in that station's own frame.
@@ -943,6 +1012,44 @@ function tplPlan(p) {
     '</div></div>';
 }
 
+/* The level reading, given first billing on the Check tab — it was the thing that
+   could not be found, and it is what makes a small reference usable. */
+function tplDeckPanel(p) {
+  var l = ui.level;
+  if (l) {
+    return '<div class="panel gold"><span class="p-tag">READING THE DECK</span>' +
+      '<div class="level-count" id="level-count">' + l.count + '</div>' +
+      '<div class="p-body">Lay the phone ' + (l.faceDown ? '<b>screen down</b>' : '<b>screen up</b>') +
+      ' on the roof and let it settle. It reads when the count hits zero.</div>' +
+      '<button class="btn ghost sm" data-act="level-cancel">Cancel</button></div>';
+  }
+
+  if (p.deck) {
+    var pct = Math.tan(p.deck.tiltDeg * Math.PI / 180) * 100;
+    return '<div class="panel good"><span class="p-tag">DECK LEVELLED</span>' +
+      '<div class="kv"><span>Off level</span><span>' + p.deck.tiltDeg.toFixed(2) + '° (' + pct.toFixed(1) + '% fall)</span></div>' +
+      '<div class="kv"><span>Read</span><span>' + (p.deck.faceDown ? 'screen down' : 'screen up') +
+      ', ±' + p.deck.spreadDeg.toFixed(1) + '°</span></div>' +
+      '<div class="p-body">New shots will be measured against this plane instead of assuming ' +
+      'level. Re-read it if you move to a roof section that falls a different way.</div>' +
+      '<div class="btn-row"><button class="btn ghost-gold sm" data-act="level-down">Re-read</button>' +
+      '<button class="btn ghost sm" data-act="clear-deck">Clear</button></div></div>';
+  }
+
+  return '<div class="panel warn"><span class="p-tag">DECK NOT LEVELLED</span>' +
+    '<div class="p-body">Lay the phone on the roof and Eagle Eye reads <b>where flat actually is</b> ' +
+    'from gravity.<br><br>This is what makes a small reference work. A homography has eight ' +
+    'degrees of freedom and two of them <b>are</b> the horizon — a bank card spanning a dozen ' +
+    'pixels cannot pin those down, so the scale comes out right along the card and the vanishing ' +
+    'point comes out wrong. Gravity fixes the plane exactly and carries no length; the card ' +
+    'carries length and no plane. Together they cover it.</div>' +
+    '<div class="btn-row">' +
+    '<button class="btn primary sm" data-act="level-down">Screen down</button>' +
+    '<button class="btn ghost-gold sm" data-act="level-up">Screen up</button></div>' +
+    '<div class="hint">Screen down is truer — the camera bump tilts a face-up phone about a ' +
+    'degree. Either way it counts down so you need not read the screen.</div></div>';
+}
+
 function tplCheck(p) {
   var items = buildChecklist(p);
   var glyph = { block: '●', warn: '▲', info: '·', ok: '✓' };
@@ -959,6 +1066,7 @@ function tplCheck(p) {
   var s = db.settings;
   var corr = totalScaleCorrection(p);
   return '<div class="screen" style="padding-top:14px">' +
+    tplDeckPanel(p) +
     '<div class="panel gold"><span class="p-tag">SIZE LOOKS WRONG?</span>' +
     '<div class="p-body">Camera height is a <b>pure scale</b>, so a survey can be the right ' +
     'shape at the wrong size. One tape measurement fixes every dimension in every shot — ' +
@@ -1105,6 +1213,11 @@ function tplCapture() {
       attCell('ROLL', (ui.sensors.gamma || 0).toFixed(0) + '°', Math.abs(ui.sensors.gamma) < 8 ? 'good' : 'bad') +
       attCell('HEADING', ui.sensors.heading == null ? '—' : ui.sensors.heading.toFixed(0) + '°', '') +
       '</div>' +
+      (currentProject() && currentProject().deck
+        ? '<div class="pill tiny" style="align-self:flex-start;color:var(--green);border-color:rgba(110,210,154,.5)">' +
+        '⌂ deck levelled · ' + currentProject().deck.tiltDeg.toFixed(1) + '°</div>'
+        : '<button class="pill tiny gold" data-act="level-down" style="align-self:flex-start">' +
+        '⌂ Set the flat plane first</button>') +
       '<div class="tilt-bar"><div class="band" style="left:27.7%;width:44.4%"></div>' +
       '<div class="mark" id="tilt-mark" style="left:' + clamp(tiltDeg(), 0, 90) / 90 * 100 + '%"></div></div>' +
       '<div class="hint" id="cap-hint">' + captureHint() + '</div>' +
@@ -1227,7 +1340,7 @@ function paintLive() {
   var camH = st.cal.camH || db.settings.camH;
   var f = EE.focalFromFov(db.settings.fov, Math.max(W, H));
   var R = EE.rotFromOrientation(ui.sensors.alpha, ui.sensors.beta, ui.sensors.gamma);
-  var Hm = EE.homographyFromPose(R, camH, f, W, H, screenAngle());
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, screenAngle(), deckNormalOf(st));
   var Hi = Hm && EE.invert3(Hm);
   if (!Hi) return;
 
@@ -1307,7 +1420,7 @@ function paintLive() {
     if (o.h > 0 && o.kind !== 'outline') {
       var top = base.map(function (q0) {
         var w = world(q0);
-        return w ? EE.projectToPixel(w, R, camH, W, H, f, screenAngle(), o.h) : null;
+        return w ? EE.projectToPixel(w, R, camH, W, H, f, screenAngle(), o.h, deckNormalOf(st)) : null;
       });
       g.globalAlpha = 0.85;
       g.beginPath(); strokeScreenPoly(g, top, true); g.stroke();
@@ -1474,6 +1587,12 @@ function tplTraceDraw(p, st, t) {
   var known = tiePoints(p, st.id);
 
   return rail +
+    '<div class="live-row">' +
+    '<button class="pill' + (db.settings.cornerSnap ? ' on' : '') + '" data-act="toggle-snap">' +
+    '⌖ Corner snap ' + (db.settings.cornerSnap ? 'on' : 'off') + '</button>' +
+    (t.lastSnap != null ? '<span class="pill tiny" style="color:var(--green);border-color:rgba(110,210,154,.5)">' +
+      'snapped ' + t.lastSnap.toFixed(0) + ' px</span>' : '') +
+    '</div>' +
     (unreg ? '<div class="panel warn"><span class="p-tag">SHOT NOT PLACED</span>' +
       '<div class="p-body">Mark <b>two landmarks</b> that already exist in the survey (' +
       (known.length ? known.slice(0, 4).map(function (k) { return esc(k.label); }).join(', ') : 'none yet') +
@@ -2595,7 +2714,12 @@ function bindTrace() {
     onUp: function () {
       if (t.loupe) {
         var ip = t.loupe.img;
-        if (ip.x >= 0 && ip.y >= 0 && ip.x <= st.imgW && ip.y <= st.imgH) addTap(ip);
+        if (ip.x >= 0 && ip.y >= 0 && ip.x <= st.imgW && ip.y <= st.imgH) {
+          var s = snapTap(st, ip);
+          if (s.snapped && navigator.vibrate) navigator.vibrate(15);
+          t.lastSnap = s.snapped ? s.moved : null;
+          addTap({ x: s.x, y: s.y });
+        }
       }
       t.loupe = null; hideLoupe();
       render();
@@ -2620,6 +2744,40 @@ function showLoupe(c) {
   el.style.left = lx + 'px'; el.style.top = ly + 'px';
 }
 function hideLoupe() { var el = $('#loupe'); if (el) el.remove(); }
+
+/* Pull the tap onto the nearest real corner.
+
+   A finger is about 3 px honest even with the loupe, and inside the trusted
+   radius that is the dominant error. A corner is exactly locatable from the
+   pixels, so the tap only needs to say WHICH corner. Refusing to snap when the
+   patch is featureless matters as much as snapping when it is not — a blank
+   membrane must not produce a confident answer out of sensor noise. */
+var snapCv = null;
+function snapTap(st, ip) {
+  if (!db.settings.cornerSnap) return ip;
+  var im = ui.imgCache[st.id];
+  if (!im) return ip;
+
+  var rad = 21, N = rad * 2 + 1;
+  var sx = Math.round(ip.x) - rad, sy = Math.round(ip.y) - rad;
+  if (sx < 0 || sy < 0 || sx + N > st.imgW || sy + N > st.imgH) return ip;
+
+  if (!snapCv) snapCv = document.createElement('canvas');
+  snapCv.width = N; snapCv.height = N;
+  var g = snapCv.getContext('2d', { willReadFrequently: true });
+  g.drawImage(im, sx, sy, N, N, 0, 0, N, N);
+  var d;
+  try { d = g.getImageData(0, 0, N, N).data; } catch (e) { return ip; }
+
+  var gray = new Float32Array(N * N);
+  for (var i = 0; i < N * N; i++) {
+    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  }
+  var c = EE.bestCorner(gray, N, N, 7);
+  if (!c || c.ratio < 6 || c.lambda < 400) return ip;
+
+  return { x: sx + c.x, y: sy + c.y, snapped: true, moved: c.dist };
+}
 
 function addTap(ip) {
   var t = ui.trace;
@@ -2703,6 +2861,11 @@ function handle(el, e) {
     case 'save-scale': return saveScaleRef();
     case 'rescale': ui.sheet = { kind: 'rescale', mode: 'object' }; return render();
     case 'howto': ui.sheet = { kind: 'howto' }; return render();
+    case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
+    case 'level-up': return startLevel(false);
+    case 'level-down': return startLevel(true);
+    case 'level-cancel': clearInterval(ui.levelTimer); ui.level = null; return render();
+    case 'clear-deck': { p.deck = null; touchProject(p); save(); toast('Deck reading cleared'); return render(); }
     case 'align': ui.sheet = { kind: 'align' }; return render();
     case 'apply-align': return applyAlign();
     case 'apply-rescale': return applyRescale();
@@ -2946,6 +3109,9 @@ function shoot() {
       heading: ui.sensors.heading, headingAcc: ui.sensors.headingAcc
     } : null,
     gps: ui.gps ? Object.assign({}, ui.gps) : null,
+    /* Copied onto the shot, not read from the project later: the deck reading is
+       only valid against the gyro's yaw reference as it stood at capture time. */
+    deckN: (p.deck && p.deck.n) ? p.deck.n.slice() : null,
     cal: null, reg: null
   };
 
@@ -3041,7 +3207,7 @@ function applyRay() {
     if (known > 0) {
       var a = EE.rayForPixel(t.taps[0].x, t.taps[0].y, st.imgW, st.imgH, f, st.screenAngle);
       var b = EE.rayForPixel(t.taps[1].x, t.taps[1].y, st.imgW, st.imgH, f, st.screenAngle);
-      var solved = EE.camHeightFromKnown(a, b, R, known);
+      var solved = EE.camHeightFromKnown(a, b, R, known, deckNormalOf(st));
       /* A plausible handheld camera height is roughly 1.2-1.8 m. Anything far
          outside that almost always means the two taps were NOT on the deck —
          a wall or the side of a unit gets projected onto the roof plane, which

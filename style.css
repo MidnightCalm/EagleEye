@@ -251,6 +251,11 @@ textarea.inp { min-height: 72px; resize: vertical; }
 .chk.ok { border-color: rgba(110,210,154,0.35); background: rgba(110,210,154,0.06); }
 .chk.ok .cg { color: var(--green); }
 
+.level-count {
+  font-family: ui-monospace, monospace; font-size: 52px; line-height: 1;
+  color: var(--gold); text-align: center; padding: 6px 0;
+  animation: eeBlink 1s infinite;
+}
 .chk-line {
   display: flex; align-items: center; gap: 10px; cursor: pointer;
   font-size: 13.5px; color: rgba(244,240,232,0.75); padding: 2px 0;
