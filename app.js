@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.0.0';
+var VERSION = '1.1.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -56,7 +56,14 @@ var DEFAULTS = {
   nameUnit: 'm',
   circleSegments: 24,
   maxPx: 1440,
-  jpegQ: 0.72
+  jpegQ: 0.72,
+
+  /* The survey's declared error model. These three numbers decide the trusted
+     radius of every standpoint, and therefore where coverage is green. */
+  tolerance: 0.25,     /* metres of position error the survey will accept */
+  attSigma: 0.5,       /* degrees of attitude error assumed, 1-sigma */
+  deckUnc: 0.08,       /* metres the deck may depart from the assumed plane */
+  coverageCell: 0.5    /* metres per coverage grid cell */
 };
 
 function load() {
@@ -237,6 +244,7 @@ function calMap(st) {
     return {
       mode: 'quad',
       has3D: !!(R && c.camH),
+      /* The horizon test lives in applyH, so there is exactly one of it. */
       toGround: function (px, py) { return EE.applyH(c.H, { x: px, y: py }); },
       toImg: function (g) { return Hi ? EE.applyH(Hi, g) : null; },
       /* Height still needs a 3D pose, which the homography alone does not carry.
@@ -342,6 +350,313 @@ function solveFocal(st, quadPix, refW, refL) {
   return { fov: fov, rms: rms };
 }
 
+/* ================= coverage =================
+
+   What has actually been seen well enough to trust, and what has not.
+
+   Coloured by POSITION error, never by ground sampling distance. GSD says how
+   sharp a pixel is; it says nothing about where the thing in it is, and the two
+   diverge quadratically with range — a cell 20 m out can resolve to 2 cm and
+   still sit 2.3 m from where it is drawn. Colouring by sharpness would paint that
+   cell green.
+
+   Green here means "seen at adequate geometry", NOT "measured". An area can be
+   fully green and contain nothing traced at all; that is what the checklist is
+   for. */
+
+var attSigmaRad = function () { return db.settings.attSigma * Math.PI / 180; };
+function trustedRadius() {
+  return EE.maxTrustedRange(db.settings.camH, attSigmaRad(), db.settings.tolerance, db.settings.deckUnc);
+}
+
+/* The ground-plane homography for a station, whichever way it was calibrated. */
+function stationH(st) {
+  var c = st && st.cal;
+  if (!c || !c.ok) return null;
+  if (c.mode === 'quad') return c.H;
+  if (!st.att) return null;
+  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+  return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, st.screenAngle);
+}
+
+/* Where the camera stood, in that station's own frame.
+
+   Ray mode puts it at the origin by construction. A quad calibration measures
+   everything relative to the tapped rectangle instead, so the camera sits
+   wherever the recovered pose says — which is only known when attitude was
+   recorded alongside. */
+function stationCameraLocal(st) {
+  var c = st && st.cal;
+  if (!c || !c.ok) return null;
+  if (c.mode === 'ray') return { x: 0, y: 0 };
+  return c.pose ? { x: c.pose.tx, y: c.pose.ty } : null;
+}
+function stationCamera(p, st) {
+  var l = stationCameraLocal(st);
+  var t = stationXform(st);
+  return (l && t) ? EE.applyRigid(t, l) : null;
+}
+
+/* Successive half-planes tangent to a circle — an inscribed polygon, so the clip
+   is slightly conservative rather than slightly generous. */
+function clipToCircle(poly, cx, cy, r, n) {
+  var out = poly;
+  for (var i = 0; i < n && out.length >= 3; i++) {
+    var a = (i / n) * Math.PI * 2;
+    var nx = Math.cos(a), ny = Math.sin(a);
+    out = EE.clipHalfPlane(out, -nx, -ny, nx * cx + ny * cy + r);
+  }
+  return out;
+}
+
+/* The patch of roof a station can be trusted for, in the project frame.
+   Bounded by the trusted radius rather than by resolution: sharpness runs out
+   long after position accuracy does. */
+function stationFootprint(p, st) {
+  var H = stationH(st);
+  var cam = stationCameraLocal(st);
+  var t = stationXform(st);
+  if (!H || !cam || !t) return null;
+
+  /* A generous resolution cap first, only to bound the polygon near the horizon. */
+  var fp = EE.frameFootprint(H, st.imgW, st.imgH, 0.25);
+  if (!fp) return null;
+
+  var poly = clipToCircle(fp.ground, cam.x, cam.y, Math.max(0.5, trustedRadius()), 24);
+  if (poly.length < 3) return null;
+  return poly.map(function (q) { return EE.applyRigid(t, q); });
+}
+
+function convexContains(poly, x, y) {
+  var pos = false, neg = false;
+  for (var i = 0, n = poly.length; i < n; i++) {
+    var a = poly[i], b = poly[(i + 1) % n];
+    var cr = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+    if (cr > 1e-12) pos = true;
+    else if (cr < -1e-12) neg = true;
+    if (pos && neg) return false;
+  }
+  return true;
+}
+
+/* Rasterises the best position error achieved at every cell.
+   Cached against the project's edit stamp and the error settings, because it is
+   recomputed on every plan repaint otherwise. */
+var coverageCache = { key: null, val: null };
+
+function coverageKey(p) {
+  var s = db.settings;
+  return [p.id, p.updatedAt, p.stations.length, s.tolerance, s.attSigma, s.deckUnc,
+    s.coverageCell, s.camH].join('|');
+}
+
+function computeCoverage(p) {
+  var key = coverageKey(p);
+  if (coverageCache.key === key) return coverageCache.val;
+
+  var shots = [];
+  p.stations.forEach(function (st) {
+    var poly = stationFootprint(p, st);
+    var cam = stationCamera(p, st);
+    var c = st.cal;
+    if (poly && cam && c && c.camH) shots.push({ poly: poly, cam: cam, camH: c.camH });
+  });
+
+  var val = null;
+  if (shots.length) {
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    shots.forEach(function (s) {
+      s.poly.forEach(function (q) {
+        if (q.x < minX) minX = q.x; if (q.x > maxX) maxX = q.x;
+        if (q.y < minY) minY = q.y; if (q.y > maxY) maxY = q.y;
+      });
+    });
+
+    var cell = Math.max(0.15, db.settings.coverageCell);
+    var cols = Math.min(600, Math.ceil((maxX - minX) / cell) + 1);
+    var rows = Math.min(600, Math.ceil((maxY - minY) / cell) + 1);
+    var data = new Float32Array(cols * rows);
+    for (var i = 0; i < data.length; i++) data[i] = Infinity;
+
+    var sig = attSigmaRad(), deck = db.settings.deckUnc;
+    shots.forEach(function (s) {
+      var bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+      s.poly.forEach(function (q) {
+        if (q.x < bx0) bx0 = q.x; if (q.x > bx1) bx1 = q.x;
+        if (q.y < by0) by0 = q.y; if (q.y > by1) by1 = q.y;
+      });
+      var c0 = Math.max(0, Math.floor((bx0 - minX) / cell));
+      var c1 = Math.min(cols - 1, Math.ceil((bx1 - minX) / cell));
+      var r0 = Math.max(0, Math.floor((by0 - minY) / cell));
+      var r1 = Math.min(rows - 1, Math.ceil((by1 - minY) / cell));
+
+      for (var r = r0; r <= r1; r++) {
+        var wy = minY + (r + 0.5) * cell;
+        for (var c = c0; c <= c1; c++) {
+          var wx = minX + (c + 0.5) * cell;
+          if (!convexContains(s.poly, wx, wy)) continue;
+          var d = Math.hypot(wx - s.cam.x, wy - s.cam.y);
+          var e = EE.positionSigma(s.camH, d, sig, deck);
+          var idx = r * cols + c;
+          if (e < data[idx]) data[idx] = e;
+        }
+      }
+    });
+    val = { minX: minX, minY: minY, cell: cell, cols: cols, rows: rows, data: data };
+  }
+
+  coverageCache = { key: key, val: val };
+  return val;
+}
+
+/* Coverage as an image, so the plan paints one drawImage rather than tens of
+   thousands of rectangles. */
+var coverageImgCache = { key: null, canvas: null };
+function coverageCanvas(p) {
+  var cov = computeCoverage(p);
+  if (!cov) return null;
+  var key = coverageKey(p);
+  if (coverageImgCache.key === key) return coverageImgCache.canvas;
+
+  var cv = document.createElement('canvas');
+  cv.width = cov.cols; cv.height = cov.rows;
+  var g = cv.getContext('2d');
+  var img = g.createImageData(cov.cols, cov.rows);
+  var tol = db.settings.tolerance;
+
+  for (var r = 0; r < cov.rows; r++) {
+    for (var c = 0; c < cov.cols; c++) {
+      var e = cov.data[r * cov.cols + c];
+      /* Image rows run downward; plan +Y runs up. */
+      var o = ((cov.rows - 1 - r) * cov.cols + c) * 4;
+      if (!isFinite(e)) { img.data[o + 3] = 0; continue; }
+      var col;
+      if (e <= tol) col = [110, 210, 154];
+      else if (e <= tol * 2) col = [212, 175, 55];
+      else col = [201, 106, 94];
+      img.data[o] = col[0]; img.data[o + 1] = col[1]; img.data[o + 2] = col[2];
+      img.data[o + 3] = 90;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  coverageImgCache = { key: key, canvas: cv };
+  return cv;
+}
+
+/* ================= completeness =================
+
+   Coverage answers "did I look at it". This answers "can I leave the roof",
+   which is a different and more useful question. */
+
+function objectRange(p, o) {
+  var st = findStation(p, o.stationId);
+  var cam = stationCameraLocal(st);
+  if (!cam) return null;
+  var c = o.kind === 'rect' || o.kind === 'cylinder'
+    ? { x: o.cx, y: o.cy }
+    : ((o.pts && o.pts[0]) || null);
+  if (!c) return null;
+  return Math.hypot(c.x - cam.x, c.y - cam.y);
+}
+
+function buildChecklist(p) {
+  var items = [];
+  var add = function (sev, title, detail, act, id) {
+    items.push({ sev: sev, title: title, detail: detail, act: act, id: id });
+  };
+
+  if (!p.stations.length) {
+    add('block', 'No shots yet', 'Capture the first one and calibrate it against something you have measured.', 'capture');
+    return items;
+  }
+
+  var uncal = p.stations.filter(function (s) { return !(s.cal && s.cal.ok); });
+  if (uncal.length) add('block', uncal.length + (uncal.length === 1 ? ' shot not calibrated' : ' shots not calibrated'),
+    'An uncalibrated shot contributes nothing — it has no scale.', 'station', uncal[0].id);
+
+  var unplaced = p.stations.filter(function (s) { return !s.reg; });
+  if (unplaced.length) add('block', unplaced.length + (unplaced.length === 1 ? ' shot not placed' : ' shots not placed'),
+    'Mark two landmarks it shares with another shot, or place it by hand.', 'place', unplaced[0].id);
+
+  var noH = p.objects.filter(function (o) {
+    return (o.kind === 'rect' || o.kind === 'cylinder') && !(o.h > 0);
+  });
+  if (noH.length) add('block', noH.length + (noH.length === 1 ? ' object has no height' : ' objects have no height'),
+    'HelioScope needs a height for every obstruction. Measure with the height tool or type it.', 'object', noH[0].id);
+
+  var far = [];
+  var tr = trustedRadius();
+  p.objects.forEach(function (o) {
+    if (o.kind === 'point') return;
+    var d = objectRange(p, o);
+    if (d != null && d > tr) far.push({ o: o, d: d });
+  });
+  if (far.length) {
+    far.sort(function (a, b) { return b.d - a.d; });
+    add('warn', far.length + (far.length === 1 ? ' object traced beyond the trusted radius' : ' objects traced beyond the trusted radius'),
+      'Furthest is ' + esc(far[0].o.name || 'unnamed') + ' at ' + EE.fmtLen(far[0].d, U(), 1) +
+      ', past ' + EE.fmtLen(tr, U(), 1) + '. Re-trace it from closer.', 'object', far[0].o.id);
+  }
+
+  if (!p.objects.some(function (o) { return o.kind === 'outline'; }))
+    add('warn', 'No roof outline', 'Without one there is no area and no boundary in the export.', 'tab', 'plan');
+
+  if (p.objects.filter(function (o) { return o.kind === 'point'; }).length < 2)
+    add('warn', 'Fewer than two landmarks', 'Two are needed to place the survey on the map, and to tie shots together.', 'tab', 'plan');
+
+  if (!p.anchor) add('warn', 'Survey not located', 'Pin two landmarks to their coordinates before exporting a KML.', 'geo');
+  else if (p.anchorMeta && p.anchorMeta.scaleError != null && Math.abs(p.anchorMeta.scaleError) > 0.02)
+    add('warn', 'Scale disagrees with the map by ' + fmtSigned(p.anchorMeta.scaleError * 100) + '%',
+      'The survey and the aerial do not agree on distance. One of them is wrong.', 'geo');
+
+  if (!p.scaleRef) add('warn', 'No scale reference recorded',
+    'Every length in the survey rides on one measured distance. Record which one, and how it was measured.', 'scale');
+
+  var cov = computeCoverage(p);
+  var outline = p.objects.find(function (o) { return o.kind === 'outline'; });
+  if (cov && outline && (outline.pts || []).length >= 3) {
+    var po = projObj(p, outline);
+    if (po) {
+      var area = EE.polygonArea(po.pts), inside = 0, good = 0;
+      var cell = cov.cell;
+      for (var r = 0; r < cov.rows; r++) {
+        for (var c = 0; c < cov.cols; c++) {
+          var wx = cov.minX + (c + 0.5) * cell, wy = cov.minY + (r + 0.5) * cell;
+          if (!pointInPolygon(po.pts, wx, wy)) continue;
+          inside++;
+          if (cov.data[r * cov.cols + c] <= db.settings.tolerance) good++;
+        }
+      }
+      /* Cells inside the outline are only a sample of it, so compare counts
+         rather than trusting the raster to reproduce the polygon's area. */
+      var pct = inside ? Math.round(good / inside * 100) : 0;
+      if (inside && pct < 95) {
+        var missM2 = (inside - good) * cell * cell;
+        add(pct < 60 ? 'warn' : 'info', pct + '% of the roof covered at tolerance',
+          Math.round(missM2) + ' m² still outside ' + EE.fmtLen(db.settings.tolerance, U(), 2) +
+          '. Stand in the gaps and shoot again.', 'tab', 'plan');
+      } else if (inside) {
+        add('ok', 'Roof fully covered at tolerance', 'Every part of the outline was seen at adequate geometry.', null);
+      }
+      if (area > 0 && !inside) add('info', 'Coverage does not reach the outline',
+        'No shot footprint overlaps the traced roof.', 'tab', 'plan');
+    }
+  }
+
+  if (!items.length) add('ok', 'Nothing outstanding', 'Every check passes. Export when ready.', 'tab', 'export');
+  return items;
+}
+
+/* Even-odd ray crossing; the roof outline is not necessarily convex. */
+function pointInPolygon(pts, x, y) {
+  var inside = false;
+  for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    var a = pts[i], b = pts[j];
+    if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
 /* ================= photos ================= */
 
 function photoKey(id) { return 'p:' + id; }
@@ -408,6 +723,9 @@ function onOrientation(e) {
     ui.sensors.heading = (360 - e.alpha) % 360;
   }
   if (ui.cap) paintCaptureHud();
+  /* The HUD is driven by the orientation event rather than by rAF: iOS polls
+     CoreMotion at 60 Hz, so there is nothing new to draw between samples. */
+  if (ui.live) paintLive();
 }
 
 function startSensors() {
@@ -441,13 +759,14 @@ function stopGps() {
 
 function render() {
   var app = $('#app');
-  var full = view.screen === 'capture' || view.screen === 'trace';
+  var full = view.screen === 'capture' || view.screen === 'trace' || view.screen === 'live';
   app.className = full ? 'wide' : '';
 
   var html = '';
   if (view.screen === 'home') html = tplHome();
   else if (view.screen === 'project') html = tplProject();
   else if (view.screen === 'capture') html = tplCapture();
+  else if (view.screen === 'live') html = tplLive();
   else if (view.screen === 'trace') html = tplTrace();
   html += tplSheet();
   app.innerHTML = html;
@@ -498,12 +817,15 @@ function tplProject() {
 
   var body = '';
   if (view.tab === 'plan') body = tplPlan(p);
+  else if (view.tab === 'check') body = tplCheck(p);
   else if (view.tab === 'scene') body = tplScene(p);
   else if (view.tab === 'objects') body = tplObjects(p);
   else body = tplExport(p);
 
-  var tab = function (k, label) {
-    return '<button class="' + (view.tab === k ? 'active' : '') + '" data-tab="' + k + '">' + label + '</button>';
+  var blockers = buildChecklist(p).filter(function (i) { return i.sev === 'block'; }).length;
+  var tab = function (k, label, badge) {
+    return '<button class="' + (view.tab === k ? 'active' : '') + '" data-tab="' + k + '">' + label +
+      (badge ? '<i class="tb-badge">' + badge + '</i>' : '') + '</button>';
   };
 
   return '<div style="flex:0 0 auto;padding:calc(var(--safe-top) + 18px) 20px 12px">' +
@@ -513,9 +835,11 @@ function tplProject() {
     '<span class="sub">' + esc(p.address || 'No address') + '</span></div>' +
     '<button class="icon-btn dots" data-act="project-menu">···</button>' +
     '</div></div>' +
-    '<div class="tabbar">' + tab('plan', 'Plan') + tab('scene', 'Scene') + tab('objects', 'Objects') + tab('export', 'Export') + '</div>' +
+    '<div class="tabbar">' + tab('plan', 'Plan') + tab('check', 'Check', blockers) +
+    tab('scene', 'Scene') + tab('objects', 'List') + tab('export', 'Export') + '</div>' +
     body +
     '<div class="bottom-bar">' +
+    '<button class="big-btn ghost" data-act="live"' + (p.stations.some(function (s) { return s.reg && s.cal && s.cal.ok; }) ? '' : ' disabled') + '>◈  Live</button>' +
     '<button class="big-btn" data-act="capture">◎  Capture</button>' +
     '</div>';
 }
@@ -531,10 +855,16 @@ function tplPlan(p) {
     '</div>' +
     '<div class="stage-chrome">' +
     '<button class="pill" data-act="plan-fit">Fit</button>' +
+    '<button class="pill' + (ui.showCoverage ? ' on' : '') + '" data-act="toggle-coverage">Coverage</button>' +
     '<button class="pill" data-act="toggle-unit">' + (U() === 'm' ? 'metres' : 'feet') + '</button>' +
     '<div style="flex:1"></div>' +
     '<button class="pill gold" data-act="geo-sheet">' + (p.anchor ? '◈ Located' : '◈ Locate') + '</button>' +
     '</div>' +
+    (ui.showCoverage ? '<div class="cov-legend">' +
+      '<span><i style="background:#6ED29A"></i>≤ ' + EE.fmtLen(db.settings.tolerance, U(), 2) + '</span>' +
+      '<span><i style="background:#D4AF37"></i>≤ ' + EE.fmtLen(db.settings.tolerance * 2, U(), 2) + '</span>' +
+      '<span><i style="background:#C96A5E"></i>worse</span>' +
+      '<em>seen, not measured</em></div>' : '') +
     '</div>' +
     '<div style="flex:0 0 auto;padding:10px 20px calc(var(--safe-bottom) + 86px)">' +
     '<div class="stn-list">' + p.stations.map(function (s, i) {
@@ -544,6 +874,34 @@ function tplPlan(p) {
     }).join('') +
     (p.stations.length ? '' : '<div class="hint" style="padding:14px 4px">No shots yet — tap <b>Capture</b>.</div>') +
     '</div></div>';
+}
+
+function tplCheck(p) {
+  var items = buildChecklist(p);
+  var glyph = { block: '●', warn: '▲', info: '·', ok: '✓' };
+  var rows = items.map(function (it) {
+    return '<div class="chk ' + it.sev + '"' + (it.act ? ' data-chk="' + it.act + '" data-chkid="' + esc(it.id || '') + '"' : '') + '>' +
+      '<span class="cg">' + glyph[it.sev] + '</span>' +
+      '<div class="cmain"><span class="ct">' + esc(it.title) + '</span>' +
+      '<span class="cd">' + esc(it.detail) + '</span></div>' +
+      (it.act ? '<span class="cx">›</span>' : '') +
+      '</div>';
+  }).join('');
+
+  var tr = trustedRadius();
+  var s = db.settings;
+  return '<div class="screen" style="padding-top:14px">' +
+    '<div class="panel"><span class="p-tag">TRUSTED RADIUS</span>' +
+    '<div class="kv"><span>From where you stand</span><span>' + EE.fmtLen(tr, U(), 1) + '</span></div>' +
+    '<div class="kv"><span>At tolerance</span><span>±' + EE.fmtLen(s.tolerance, U(), 2) + '</span></div>' +
+    '<div class="kv"><span>Assumed tilt error</span><span>' + s.attSigma.toFixed(1) + '°</span></div>' +
+    '<div class="p-body">Position error grows with the <b>square</b> of range: ' +
+    EE.fmtLen(EE.positionSigma(s.camH, 5, attSigmaRad(), s.deckUnc), U(), 2) + ' at ' + EE.fmtLen(5, U(), 0) +
+    ', ' + EE.fmtLen(EE.positionSigma(s.camH, 20, attSigmaRad(), s.deckUnc), U(), 2) + ' at ' + EE.fmtLen(20, U(), 0) +
+    '. Standing closer beats every other improvement.</div>' +
+    '<button class="btn ghost-gold sm" data-act="error-sheet">Error model</button></div>' +
+    '<div class="chk-list">' + rows + '</div>' +
+    '<div class="foot-spacer"></div></div>';
 }
 
 function tplScene(p) {
@@ -703,6 +1061,203 @@ function paintCaptureHud() {
   if (mark) mark.style.left = clamp(tiltDeg(), 0, 90) / 90 * 100 + '%';
 }
 
+/* ---------- live HUD ----------
+
+   The survey drawn back over the live camera, from a standpoint whose position is
+   already known. It is a DRIFT MONITOR, not a positioning system: nothing here
+   can know where you are standing, so it assumes you are at the chosen shot and
+   shows what the survey claims is in front of you. If the wireframe sits on the
+   real units, the survey is consistent. If it has slid, something is wrong — and
+   learning that on the roof is worth more than any number afterwards. */
+function tplLive() {
+  var p = currentProject();
+  var l = ui.live;
+  if (!p || !l) { view.screen = 'project'; return tplProject(); }
+  var placed = p.stations.filter(function (s) { return s.reg && s.cal && s.cal.ok; });
+
+  var foot;
+  if (l.err) {
+    foot = '<div class="panel warn"><span class="p-tag">CAMERA</span><div class="p-body">' + esc(l.err) + '</div></div>';
+  } else if (needsMotionPermission()) {
+    foot = '<div class="panel gold"><span class="p-tag">TILT SENSOR</span>' +
+      '<div class="p-body">The overlay is driven by the tilt sensor. Without it there is nothing to draw.</div>' +
+      '<button class="btn primary sm" data-act="ask-motion">Enable tilt sensor</button></div>';
+  } else {
+    var noH = p.objects.filter(function (o) { return (o.kind === 'rect' || o.kind === 'cylinder') && !(o.h > 0); }).length;
+    foot =
+      '<div class="live-row">' +
+      '<select class="inp live-sel" id="live-station">' + placed.map(function (s) {
+        return '<option value="' + s.id + '"' + (s.id === l.stationId ? ' selected' : '') +
+          '>Standing at shot ' + (p.stations.indexOf(s) + 1) + '</option>';
+      }).join('') + '</select>' +
+      '<button class="pill' + (l.showCoverage ? ' on' : '') + '" data-act="live-coverage">Gaps</button>' +
+      '</div>' +
+      '<div class="field"><label>ALIGN — NUDGE UNTIL THE WIREFRAME SITS ON THE REAL UNITS</label>' +
+      '<input type="range" class="slider" id="live-yaw" min="-180" max="180" step="0.5" value="' + (l.yaw || 0) + '"></div>' +
+      '<div class="hint">' + (noH ? '<b>' + noH + '</b> object' + (noH === 1 ? '' : 's') + ' still need a height — drawn amber. ' : '') +
+      'Trusted to <b>' + EE.fmtLen(trustedRadius(), U(), 1) + '</b> from here.</div>';
+  }
+
+  return '<div class="full">' +
+    '<div class="full-head"><span class="ftitle">LIVE — DRIFT CHECK</span>' +
+    '<button class="close-btn" data-act="close-live">×</button></div>' +
+    '<div class="full-body">' +
+    (l.err ? '' : '<video id="live-video" autoplay playsinline muted></video><canvas id="live-canvas"></canvas>') +
+    '</div>' +
+    '<div class="full-foot">' + foot + '</div></div>';
+}
+
+/* project frame -> the alpha-referenced world frame the live attitude lives in */
+function projToWorld(p, st, q) {
+  var local = fromProj(st, q);
+  var c = st.cal;
+  if (!c) return null;
+  if (c.mode === 'ray') return local;
+  if (!c.pose) return null;
+  var inv = EE.applySimilarityInverse(c.pose, local);
+  return { x: inv.x * c.pose.scale, y: inv.y * c.pose.scale };
+}
+
+function paintLive() {
+  var p = currentProject(), l = ui.live;
+  if (!p || !l) return;
+  var v = $('#live-video'), cv = $('#live-canvas');
+  if (!v || !cv || !v.videoWidth) return;
+  var st = findStation(p, l.stationId);
+  if (!st || !st.cal || !st.cal.ok) return;
+
+  /* The canvas takes the video's own pixel dimensions and the same object-fit, so
+     overlay and image align without ever computing the cover crop. */
+  if (cv.width !== v.videoWidth) { cv.width = v.videoWidth; cv.height = v.videoHeight; }
+  var W = cv.width, H = cv.height;
+  var g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, W, H);
+
+  var camH = st.cal.camH || db.settings.camH;
+  var f = EE.focalFromFov(db.settings.fov, Math.max(W, H));
+  var R = EE.rotFromOrientation(ui.sensors.alpha, ui.sensors.beta, ui.sensors.gamma);
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, screenAngle());
+  var Hi = Hm && EE.invert3(Hm);
+  if (!Hi) return;
+
+  var yaw = (l.yaw || 0) * Math.PI / 180;
+  var cw = Math.cos(yaw), sw = Math.sin(yaw);
+  var world = function (q) {
+    var w = projToWorld(p, st, q);
+    if (!w) return null;
+    return { x: w.x * cw - w.y * sw, y: w.x * sw + w.y * cw };
+  };
+  var toPix = function (q) { var w = world(q); return w ? EE.applyH(Hi, w) : null; };
+
+  var lw = Math.max(2, W / 500), scale = W / 1000;
+
+  if (Math.abs(Hm[7]) > 1e-12) {
+    g.strokeStyle = 'rgba(244,240,232,0.25)'; g.lineWidth = lw * 0.6;
+    g.beginPath();
+    g.moveTo(0, -(Hm[8]) / Hm[7]);
+    g.lineTo(W, -(Hm[8] + Hm[6] * W) / Hm[7]);
+    g.stroke();
+  }
+
+  var cam = stationCamera(p, st);
+  if (cam) {
+    g.strokeStyle = 'rgba(110,210,154,0.5)'; g.lineWidth = lw;
+    g.setLineDash([11 * scale, 9 * scale]);
+    g.beginPath();
+    strokeScreenPoly(g, EE.circlePoly(cam.x, cam.y, trustedRadius(), 72).map(toPix), true);
+    g.stroke(); g.setLineDash([]);
+  }
+
+  if (l.showCoverage) {
+    var cov = computeCoverage(p);
+    if (cov) {
+      g.fillStyle = 'rgba(201,106,94,0.32)';
+      for (var r = 0; r < cov.rows; r++) {
+        for (var c = 0; c < cov.cols; c++) {
+          var e = cov.data[r * cov.cols + c];
+          if (isFinite(e) && e <= db.settings.tolerance) continue;
+          var wx = cov.minX + (c + 0.5) * cov.cell, wy = cov.minY + (r + 0.5) * cov.cell;
+          if (cam && Math.hypot(wx - cam.x, wy - cam.y) > trustedRadius() * 1.7) continue;
+          var q = toPix({ x: wx, y: wy });
+          if (!q) continue;
+          var sz = Math.max(3, 30 * scale);
+          g.fillRect(q.x - sz / 2, q.y - sz / 2, sz, sz);
+        }
+      }
+    }
+  }
+
+  placedObjects(p).forEach(function (o) {
+    var needsH = (o.kind === 'rect' || o.kind === 'cylinder') && !(o.h > 0);
+    var base = o.kind === 'rect' ? EE.rectCorners(o)
+      : o.kind === 'cylinder' ? EE.circlePoly(o.cx, o.cy, o.r, 28)
+        : (o.pts || []);
+    if (base.length < 1) return;
+    var bp = base.map(toPix);
+    if (!bp.some(Boolean)) return;
+
+    if (o.kind === 'point') {
+      var q = bp[0]; if (!q) return;
+      g.strokeStyle = '#6ED29A'; g.lineWidth = lw;
+      g.beginPath();
+      g.moveTo(q.x - 15 * scale, q.y); g.lineTo(q.x + 15 * scale, q.y);
+      g.moveTo(q.x, q.y - 15 * scale); g.lineTo(q.x, q.y + 15 * scale);
+      g.stroke();
+      if (o.name) label(g, o.name, q.x + 18 * scale, q.y, '#6ED29A', scale);
+      return;
+    }
+
+    var col = needsH ? '#E8C96A' : (o.kind === 'outline' ? 'rgba(244,240,232,0.7)' : '#D4AF37');
+    g.strokeStyle = col; g.lineWidth = lw;
+    if (needsH) g.setLineDash([10 * scale, 8 * scale]);
+    g.beginPath(); strokeScreenPoly(g, bp, true); g.stroke();
+    g.setLineDash([]);
+
+    if (o.h > 0 && o.kind !== 'outline') {
+      var top = base.map(function (q0) {
+        var w = world(q0);
+        return w ? EE.projectToPixel(w, R, camH, W, H, f, screenAngle(), o.h) : null;
+      });
+      g.globalAlpha = 0.85;
+      g.beginPath(); strokeScreenPoly(g, top, true); g.stroke();
+      g.globalAlpha = 0.4;
+      g.beginPath();
+      var stepN = Math.max(1, Math.floor(base.length / 8));
+      for (var i = 0; i < base.length; i += stepN) {
+        if (bp[i] && top[i]) { g.moveTo(bp[i].x, bp[i].y); g.lineTo(top[i].x, top[i].y); }
+      }
+      g.stroke(); g.globalAlpha = 1;
+    }
+
+    var a = bp.find(Boolean);
+    if (o.name && a) {
+      label(g, o.name + (needsH ? '  NEEDS HEIGHT' : (o.h ? '  ' + EE.fmtLen(o.h, U(), 1) : '')),
+        a.x, a.y - 12 * scale, col, scale);
+    }
+  });
+}
+
+function strokeScreenPoly(g, pts, close) {
+  var started = false, first = null;
+  for (var i = 0; i < pts.length; i++) {
+    var q = pts[i];
+    if (!q || !isFinite(q.x) || !isFinite(q.y) || Math.abs(q.x) > 1e5 || Math.abs(q.y) > 1e5) { started = false; continue; }
+    if (started) g.lineTo(q.x, q.y);
+    else { g.moveTo(q.x, q.y); started = true; if (!first) first = q; }
+  }
+  if (close && first && started) g.lineTo(first.x, first.y);
+}
+
+function label(g, text, x, y, col, scale) {
+  g.font = '600 ' + Math.round(22 * scale) + 'px -apple-system, system-ui, sans-serif';
+  var w = g.measureText(text).width;
+  g.fillStyle = 'rgba(12,10,16,0.72)';
+  g.fillRect(x - 6 * scale, y - 19 * scale, w + 12 * scale, 26 * scale);
+  g.fillStyle = col;
+  g.fillText(text, x, y);
+}
+
 /* ---------- trace ---------- */
 function tplTrace() {
   var t = ui.trace;
@@ -830,6 +1385,8 @@ function tplSheet() {
   else if (s.kind === 'settings') inner = sheetSettings(s);
   else if (s.kind === 'menu') inner = sheetMenu(s);
   else if (s.kind === 'place') inner = sheetPlace(s);
+  else if (s.kind === 'error') inner = sheetError(s);
+  else if (s.kind === 'scale') inner = sheetScale(s);
   else if (s.kind === 'confirm') inner = sheetConfirm(s);
   return '<div class="scrim" data-act="close-sheet"></div><div class="sheet">' + inner + '</div>';
 }
@@ -948,6 +1505,65 @@ function sheetPlace(s) {
     '<button class="btn ghost" data-act="retry-tie">Retry landmarks</button></div>';
 }
 
+function sheetError() {
+  var s = db.settings;
+  var rows = [3, 5, 10, 15, 20, 30].map(function (d) {
+    var e = EE.positionSigma(s.camH, d, attSigmaRad(), s.deckUnc);
+    return '<div class="kv ' + (e <= s.tolerance ? 'good' : (e <= s.tolerance * 2 ? '' : 'warn')) + '">' +
+      '<span>' + EE.fmtLen(d, U(), 0) + ' away</span><span>±' + EE.fmtLen(e, U(), 2) + '</span></div>';
+  }).join('');
+
+  return '<div class="sheet-head"><span class="sh-title">Error model</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+    '<div class="p-body">A ray leaving at depression θ lands at h/tan θ, so an attitude error moves ' +
+    'the point by <b>(h² + d²)/h</b> per radian. It grows with the <b>square</b> of range and shrinks ' +
+    'with camera height — which is why standing closer beats every other improvement.</div>' +
+    rows +
+    '<div class="kv"><span>Trusted radius</span><span>' + EE.fmtLen(trustedRadius(), U(), 1) + '</span></div>' +
+    '<div class="row3">' +
+    '<div class="field"><label>TOLERANCE</label><input class="inp mono" id="err-tol" inputmode="decimal" value="' + EE.fromM(s.tolerance, U()).toFixed(2) + '"></div>' +
+    '<div class="field"><label>TILT σ (°)</label><input class="inp mono" id="err-att" inputmode="decimal" value="' + s.attSigma + '"></div>' +
+    '<div class="field"><label>DECK ±</label><input class="inp mono" id="err-deck" inputmode="decimal" value="' + EE.fromM(s.deckUnc, U()).toFixed(2) + '"></div>' +
+    '</div>' +
+    '<div class="hint">Deck uncertainty is <b>declared, never measured</b> — it is how far the roof may ' +
+    'depart from the flat plane every calculation assumes.</div>' +
+    '<div class="btn-row"><button class="btn primary" data-act="save-error">Apply</button></div>';
+}
+
+function sheetScale(s) {
+  var p = currentProject();
+  var cur = p.scaleRef;
+  var method = s.method || (cur && cur.method) || 'laser';
+  var seg = [['laser', 'Laser'], ['tape', 'Tape'], ['paced', 'Paced']].map(function (m) {
+    return '<button class="' + (method === m[0] ? 'active' : '') + '" data-srmethod="' + m[0] + '">' + m[1] + '</button>';
+  }).join('');
+  var sigma = { laser: 0.0015, tape: 0.01, paced: 0.25 }[method];
+
+  return '<div class="sheet-head"><span class="sh-title">Scale reference</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+    '<div class="p-body">Every length in the survey rides on one measured distance. Scale is a ' +
+    '<b>gauge freedom</b> — no amount of walking, photographing or correlating can recover it, so this ' +
+    'number is an input, not an output.</div>' +
+    '<div class="seg tight">' + seg + '</div>' +
+    '<div class="field"><label>MEASURED DISTANCE</label><div class="unit-suffix">' +
+    '<input class="inp mono" id="sr-len" inputmode="decimal" value="' +
+    esc(cur ? EE.fromM(cur.lengthM, U()).toFixed(2) : '') + '"><span>' + U() + '</span></div></div>' +
+    '<div class="field"><label>WHAT WAS MEASURED</label><input class="inp" id="sr-note" value="' +
+    esc(cur ? cur.note : '') + '" placeholder="parapet inside face, NE to SW"></div>' +
+    '<div class="hint">' + (method === 'laser'
+      ? 'Shoot the <b>inside face of the far parapet</b> — a large matte near-vertical target that returns in full sun. White membrane will not return past about 15–20 m.'
+      : method === 'tape' ? 'A 30 m fibreglass tape is about 0.05%. Keep the baseline over 10 m; a 2 m square is 0.5% and that lands on every dimension.'
+        : 'A paced estimate is roughly 5%. It will not be visible in the plan, but it is 5% on every length and 10% on every area.') +
+    '</div>' +
+    (function () {
+      var v = parseFloat(cur ? cur.lengthM : 0);
+      if (!(v > 0)) return '';
+      return '<div class="kv ' + (sigma / v < 0.002 ? 'good' : 'warn') + '"><span>Scale uncertainty</span>' +
+        '<span>±' + (sigma / v * 100).toFixed(3) + '%</span></div>';
+    })() +
+    '<div class="btn-row"><button class="btn primary" data-act="save-scale">Save</button></div>';
+}
+
 function sheetSettings() {
   var s = db.settings;
   return '<div class="sheet-head"><span class="sh-title">Settings</span>' +
@@ -1055,6 +1671,29 @@ function paintPlan() {
   for (var gx = x0; gx <= x1; gx += step) { g.moveTo(X(gx), 0); g.lineTo(X(gx), h); }
   for (var gy = y0; gy <= y1; gy += step) { g.moveTo(0, Y(gy)); g.lineTo(w, Y(gy)); }
   g.stroke();
+
+  /* coverage raster, under the geometry — it is context, not content */
+  if (ui.showCoverage) {
+    var cov = computeCoverage(p), cimg = coverageCanvas(p);
+    if (cov && cimg) {
+      g.save();
+      g.imageSmoothingEnabled = false;
+      var x0 = X(cov.minX), y0 = Y(cov.minY + cov.rows * cov.cell);
+      g.drawImage(cimg, x0, y0, cov.cols * cov.cell * S, cov.rows * cov.cell * S);
+      g.restore();
+    }
+    /* where each shot was taken from, and how far it reaches */
+    p.stations.forEach(function (st) {
+      var cam = stationCamera(p, st);
+      if (!cam) return;
+      var sx = X(cam.x), sy = Y(cam.y);
+      g.strokeStyle = 'rgba(244,240,232,0.35)'; g.lineWidth = 1; g.setLineDash([3, 4]);
+      g.beginPath(); g.arc(sx, sy, trustedRadius() * S, 0, Math.PI * 2); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = 'rgba(244,240,232,0.85)';
+      g.beginPath(); g.arc(sx, sy, 4, 0, Math.PI * 2); g.fill();
+    });
+  }
 
   /* objects */
   placedObjects(p).forEach(function (o) {
@@ -1447,12 +2086,17 @@ function bind() {
   var app = $('#app');
 
   app.onclick = function (e) {
-    var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],[data-unit],[data-nameunit],[data-geomethod],[data-menu],[data-object],[data-station],[data-setheight]');
+    /* Every attribute handle() dispatches on has to be listed here or the row is
+       silently inert — the delegated listener never sees it. */
+    var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
+      '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
+      '[data-station],[data-setheight],[data-chk]');
     if (!el) return;
     handle(el, e);
   };
 
   if (view.screen === 'capture') bindCapture();
+  if (view.screen === 'live') bindLive();
   if (view.screen === 'trace') bindTrace();
   if (view.screen === 'project' && view.tab === 'plan') bindPlan();
   if (view.screen === 'project' && view.tab === 'scene') bindScene();
@@ -1517,6 +2161,42 @@ function bindCapture() {
   if (!v || !ui.cap) return;
   if (ui.cap.stream) { v.srcObject = ui.cap.stream; return; }
   startCamera();
+}
+
+function bindLive() {
+  var l = ui.live; if (!l) return;
+
+  var sel = $('#live-station');
+  if (sel) sel.onchange = function () { l.stationId = sel.value; paintLive(); };
+
+  /* The slider must not re-render: innerHTML would tear down the <video> and
+     restart the camera on every drag. */
+  var yaw = $('#live-yaw');
+  if (yaw) yaw.oninput = function () { l.yaw = parseFloat(yaw.value) || 0; paintLive(); };
+
+  var v = $('#live-video');
+  if (!v) return;
+  if (l.stream) { v.srcObject = l.stream; v.onloadedmetadata = function () { paintLive(); }; return; }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    l.err = 'This browser exposes no camera. Open Eagle Eye over https in Safari.';
+    return render();
+  }
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1440 } },
+    audio: false
+  }).then(function (stream) {
+    if (!ui.live) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+    ui.live.stream = stream;
+    var vv = $('#live-video');
+    if (vv) { vv.srcObject = stream; vv.onloadedmetadata = function () { paintLive(); }; }
+  }).catch(function (err) {
+    if (!ui.live) return;
+    ui.live.err = (err && err.name === 'NotAllowedError')
+      ? 'Camera permission was declined. Allow it in Settings › Safari, then reopen.'
+      : 'Could not open the camera: ' + (err && err.message ? err.message : 'unknown');
+    render();
+  });
 }
 
 function bindTrace() {
@@ -1609,6 +2289,7 @@ function handle(el, e) {
   if (el.dataset.unit) { db.settings.unit = el.dataset.unit; save(); return render(); }
   if (el.dataset.nameunit) { db.settings.nameUnit = el.dataset.nameunit; save(); return render(); }
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
+  if (el.dataset.srmethod) { ui.sheet.method = el.dataset.srmethod; return render(); }
   if (el.dataset.station) return openStation(el.dataset.station);
   if (el.dataset.object) { ui.sel = el.dataset.object; ui.sheet = { kind: 'object', id: el.dataset.object }; return render(); }
   if (el.dataset.setheight) {
@@ -1616,6 +2297,17 @@ function handle(el, e) {
     return;
   }
   if (el.dataset.menu) return runMenu(el.dataset.menu);
+  if (el.dataset.chk) {
+    var a = el.dataset.chk, id = el.dataset.chkid;
+    if (a === 'tab') { view.tab = id; return render(); }
+    if (a === 'capture') return openCapture();
+    if (a === 'geo') { ui.sheet = { kind: 'geo', method: 'two' }; startGps(); return render(); }
+    if (a === 'scale') { ui.sheet = { kind: 'scale' }; return render(); }
+    if (a === 'place') { ui.sheet = { kind: 'place', id: id }; return render(); }
+    if (a === 'object') { ui.sel = id; ui.sheet = { kind: 'object', id: id }; return render(); }
+    if (a === 'station') return openStation(id);
+    return;
+  }
 
   switch (act) {
     case 'home': view.screen = 'home'; ui.sel = null; return render();
@@ -1639,6 +2331,13 @@ function handle(el, e) {
 
     case 'capture': return openCapture();
     case 'close-capture': return closeCapture();
+    case 'live': return openLive();
+    case 'close-live': return closeLive();
+    case 'live-coverage': ui.live.showCoverage = !ui.live.showCoverage; return render();
+    case 'toggle-coverage': ui.showCoverage = !ui.showCoverage; return render();
+    case 'error-sheet': ui.sheet = { kind: 'error' }; return render();
+    case 'scale': ui.sheet = { kind: 'scale' }; return render();
+    case 'save-scale': return saveScaleRef();
     case 'ask-motion': return startSensors().then(function (okd) {
       if (!okd) toast('Tilt sensor refused — use the rectangle route');
       render();
@@ -1674,6 +2373,17 @@ function handle(el, e) {
       return render();
     }
 
+    case 'save-error': {
+      var t2 = EE.toM(parseFloat($('#err-tol').value), U());
+      var a2 = parseFloat($('#err-att').value);
+      var d2 = EE.toM(parseFloat($('#err-deck').value), U());
+      if (t2 > 0) db.settings.tolerance = t2;
+      if (a2 > 0 && a2 < 30) db.settings.attSigma = a2;
+      if (d2 >= 0) db.settings.deckUnc = d2;
+      save(); ui.sheet = null;
+      toast('Trusted radius now ' + EE.fmtLen(trustedRadius(), U(), 1));
+      return render();
+    }
     case 'save-settings': return saveSettings();
     case 'purge-photos': ui.sheet = { kind: 'confirm', title: 'Drop all photos?', body: 'Every measurement is kept. You lose only the ability to trace more from the shots already taken.', yes: 'Drop photos', on: 'purge' }; return render();
     case 'confirm-yes': return confirmYes();
@@ -1777,6 +2487,46 @@ function startCamera() {
       : 'Could not open the camera: ' + (err && err.message ? err.message : 'unknown');
     render();
   });
+}
+
+function openLive() {
+  var p = currentProject();
+  var st = p.stations.filter(function (s) { return s.reg && s.cal && s.cal.ok; })[0];
+  if (!st) return toast('Calibrate and place a shot first');
+  ui.live = { stationId: st.id, stream: null, err: null, yaw: 0, showCoverage: true };
+  view.screen = 'live';
+  if (!needsMotionPermission()) startSensors();
+  render();
+}
+
+function closeLive() {
+  if (ui.live && ui.live.stream) ui.live.stream.getTracks().forEach(function (t) { t.stop(); });
+  ui.live = null;
+  view.screen = 'project';
+  render();
+}
+
+/* Scale rides on one measured distance, and which one it was matters as much as
+   the number. A laser to the inside face of a far parapet is ~0.005%; a 2 m tape
+   square is ~0.5%, and that 100x lands on every length and doubles on every area. */
+function saveScaleRef() {
+  var p = currentProject();
+  var v = parseFloat(($('#sr-len') || {}).value);
+  if (!(v > 0)) return toast('Enter the measured distance');
+  var m = EE.toM(v, U());
+  var method = (document.querySelector('.seg [data-srmethod].active') || {}).dataset;
+  var sigma = { laser: 0.0015, tape: 0.01, paced: 0.25 }[(ui.sheet.method || 'laser')];
+  p.scaleRef = {
+    lengthM: m,
+    method: ui.sheet.method || 'laser',
+    note: (($('#sr-note') || {}).value || '').trim(),
+    relSigma: sigma / m,
+    at: Date.now()
+  };
+  touchProject(p); save();
+  ui.sheet = null;
+  toast('Scale reference: ' + EE.fmtLen(m, U()) + ' · ±' + (p.scaleRef.relSigma * 100).toFixed(3) + '%');
+  render();
 }
 
 function closeCapture() {

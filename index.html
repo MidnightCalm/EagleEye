@@ -16,11 +16,17 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Marcellus&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<!-- ?v= is not decoration. With no build step these filenames never change, and a
+     static host that sends Last-Modified without Cache-Control invites the browser
+     to cache them heuristically — so a deploy can be invisible on the very first
+     load, before any service worker exists to go to the network. Bump this on
+     every release; the service worker matches with ignoreSearch, so its offline
+     copy is unaffected. -->
+<link rel="stylesheet" href="style.css?v=1.1.0">
 </head>
 <body>
 <div id="app"></div>
-<script src="geo.js"></script>
-<script src="app.js"></script>
+<script src="geo.js?v=1.1.0"></script>
+<script src="app.js?v=1.1.0"></script>
 </body>
 </html>

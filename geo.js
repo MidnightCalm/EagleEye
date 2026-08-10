@@ -129,6 +129,27 @@ var EE = (function () {
     /* Scale so h8 = 1 — keeps stored values readable and comparisons stable. */
     if (Math.abs(H[8]) > 1e-14) { for (var k = 0; k < 9; k++) H[k] /= H[8]; }
     for (k = 0; k < 9; k++) if (!isFinite(H[k])) return null;
+
+    /* The four reference corners are by construction in front of the camera, so
+       their centroid fixes which sign of w means "roof". */
+    var cx = 0, cy = 0;
+    for (var j = 0; j < 4; j++) { cx += src[j].x / 4; cy += src[j].y / 4; }
+    return orientH(H, { x: cx, y: cy });
+  }
+
+  function det3(m) {
+    return m[0] * (m[4] * m[8] - m[5] * m[7])
+      - m[1] * (m[3] * m[8] - m[5] * m[6])
+      + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  }
+
+  /* H and -H are the same projective map, so the solver's choice of sign is
+     arbitrary — but the sign of w is what separates roof from sky. Pinning it so
+     that w > 0 in front of the camera makes `w > 0` a universally valid horizon
+     test, whichever calibration produced the matrix. */
+  function orientH(H, insidePt) {
+    var w = H[6] * insidePt.x + H[7] * insidePt.y + H[8];
+    if (w < 0) for (var i = 0; i < 9; i++) H[i] = -H[i];
     return H;
   }
 
@@ -137,7 +158,13 @@ var EE = (function () {
      a mirrored point somewhere behind the camera. */
   function applyH(H, p) {
     var w = H[6] * p.x + H[7] * p.y + H[8];
-    if (Math.abs(w) < 1e-12) return null;
+    /* w <= 0, not |w| < eps. The comment above promised this and the code did not
+       deliver it: a negative w passed straight through and returned a mirrored
+       point behind the camera. Now that orientH pins the sign, one test serves
+       both directions — a sky pixel has no ground point, and a ground point
+       behind the camera has no pixel, so shapes off the back of the frame stop
+       being drawn as ghosts. */
+    if (w <= 1e-12) return null;
     var out = { x: (H[0] * p.x + H[1] * p.y + H[2]) / w, y: (H[3] * p.x + H[4] * p.y + H[5]) / w };
     if (!isFinite(out.x) || !isFinite(out.y)) return null;
     return out;
@@ -170,6 +197,75 @@ var EE = (function () {
       sA * cG + cA * sB * sG, cA * cB, sA * sG - cA * sB * cG,
       -cB * sG, sB, cB * cG
     ];
+  }
+
+  /* ---- attitude as a quaternion ----
+
+     A frame almost never coincides with an attitude sample: iOS polls CoreMotion
+     at 60 Hz on the main thread, the camera delivers on its own schedule, and
+     neither carries a sensor timestamp. The attitude belonging to a frame has to
+     be interpolated between the samples either side of it.
+
+     Interpolating alpha/beta/gamma directly is wrong — they are a rotation
+     sequence, not a vector. Halfway between alpha 359 and alpha 1 is alpha 180,
+     pointing the camera backwards, and near beta = +-90 the remaining two axes
+     collapse into each other. Quaternions have neither problem, so samples are
+     converted on arrival and interpolated as rotations. */
+  function quatMul(a, b) {
+    return [
+      a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+      a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+      a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+      a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0]
+    ];
+  }
+
+  /* Same Z-X'-Y'' order as rotFromOrientation, so the two agree exactly. */
+  function quatFromOrientation(alphaDeg, betaDeg, gammaDeg) {
+    var a = (alphaDeg || 0) * DEG / 2, b = (betaDeg || 0) * DEG / 2, g = (gammaDeg || 0) * DEG / 2;
+    var qz = [Math.cos(a), 0, 0, Math.sin(a)];
+    var qx = [Math.cos(b), Math.sin(b), 0, 0];
+    var qy = [Math.cos(g), 0, Math.sin(g), 0];
+    return quatMul(qz, quatMul(qx, qy));
+  }
+
+  function quatToMatrix(q) {
+    var w = q[0], x = q[1], y = q[2], z = q[3];
+    var n = Math.hypot(w, x, y, z);
+    if (n < 1e-12) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    w /= n; x /= n; y /= n; z /= n;
+    return [
+      1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+      2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+      2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)
+    ];
+  }
+
+  /* Shortest-arc spherical interpolation. Antipodal representations describe the
+     same rotation, so one is flipped when the dot product is negative — without
+     that the phone appears to spin the long way round between two samples 3 ms
+     apart. Falls back to a normalised lerp when the arc is too small to divide. */
+  function quatSlerp(a, b, t) {
+    var d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    var bb = b;
+    if (d < 0) { bb = [-b[0], -b[1], -b[2], -b[3]]; d = -d; }
+    var k0, k1;
+    if (d > 0.9995) { k0 = 1 - t; k1 = t; }
+    else {
+      var th = Math.acos(Math.min(1, Math.max(-1, d))), s = Math.sin(th);
+      k0 = Math.sin((1 - t) * th) / s;
+      k1 = Math.sin(t * th) / s;
+    }
+    var q = [k0 * a[0] + k1 * bb[0], k0 * a[1] + k1 * bb[1], k0 * a[2] + k1 * bb[2], k0 * a[3] + k1 * bb[3]];
+    var n = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+    return [q[0] / n, q[1] / n, q[2] / n, q[3] / n];
+  }
+
+  /* Angle between two attitudes, in degrees — the "how fast is it moving" and
+     "has it turned enough to be worth a new keyframe" measure. */
+  function quatAngleDeg(a, b) {
+    var d = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+    return 2 * Math.acos(Math.min(1, d)) / DEG;
   }
 
   /* Focal length in pixels from a horizontal field of view, for an image whose
@@ -231,6 +327,252 @@ var EE = (function () {
     else if (ang === 270) { x = -ry; y = rx; }
 
     return { x: x + imgW / 2, y: y + imgH / 2 };
+  }
+
+  /* The ray cast expressed as a single 3x3 image -> ground homography.
+
+     The two calibration modes look unrelated in code but describe the same kind
+     of object: a plane projectivity. Writing the pose-based one out as a matrix
+     collapses that difference, so a mosaic renderer, a footprint test and a
+     ground-sampling calculation can each be written once and fed by either mode.
+
+     Derivation: the device ray is linear in the pixel, d = R.M.S.(u,v,1), where S
+     recentres and undoes the screen rotation and M turns that into camera-frame
+     directions. Intersecting z = 0 from height h gives x = h.d0/(-d2) and
+     y = h.d1/(-d2), which is exactly the matrix below. Because the third row is
+     -d2, w > 0 lands in front of the camera for free. */
+  function homographyFromPose(R, camHeight, f, imgW, imgH, screenAngle) {
+    if (!R || !(camHeight > 0) || !(f > 0)) return null;
+    var cx = imgW / 2, cy = imgH / 2;
+    var ang = ((screenAngle || 0) % 360 + 360) % 360;
+
+    var S;
+    if (ang === 90) S = [0, -1, cy, 1, 0, -cx, 0, 0, 1];
+    else if (ang === 180) S = [-1, 0, cx, 0, -1, cy, 0, 0, 1];
+    else if (ang === 270) S = [0, 1, -cy, -1, 0, cx, 0, 0, 1];
+    else S = [1, 0, -cx, 0, 1, -cy, 0, 0, 1];
+
+    var M = [1 / f, 0, 0, 0, -1 / f, 0, 0, 0, -1];
+    var A = mul3(R, mul3(M, S));
+
+    return [
+      camHeight * A[0], camHeight * A[1], camHeight * A[2],
+      camHeight * A[3], camHeight * A[4], camHeight * A[5],
+      -A[6], -A[7], -A[8]
+    ];
+  }
+
+  /* Jacobian of the plane projectivity at an image pixel — how a pixel-sized
+     square lands on the roof. Returned row-major as [dx/du, dx/dv, dy/du, dy/dv]. */
+  function jacobianAtPixel(H, p) {
+    var w = H[6] * p.x + H[7] * p.y + H[8];
+    if (w <= 1e-9) return null;
+    var X = H[0] * p.x + H[1] * p.y + H[2];
+    var Y = H[3] * p.x + H[4] * p.y + H[5];
+    var iw2 = 1 / (w * w);
+    return [
+      (H[0] * w - X * H[6]) * iw2, (H[1] * w - X * H[7]) * iw2,
+      (H[3] * w - Y * H[6]) * iw2, (H[4] * w - Y * H[7]) * iw2
+    ];
+  }
+
+  /* Ground sampling distance: how much roof one image pixel covers, reported as
+     the WORST direction — the larger singular value of the Jacobian.
+
+     sqrt(|det J|) was the obvious choice and it flatters a grazing view badly.
+     Looking along a roof from eye height, a pixel lands on a long thin slice:
+     fine across the view, dreadful along it. The geometric mean of those two
+     averages a 40 cm smear and a 2 cm width into a comfortable-looking 9 cm,
+     which is exactly the corner a survey must not trust. The larger singular
+     value reports the 40 cm.
+
+     For a 2x2 J the singular values follow from the Frobenius norm and the
+     determinant without forming J'J explicitly. */
+  function gsdAtPixel(H, p) {
+    var J = jacobianAtPixel(H, p);
+    if (!J) return Infinity;
+    var F = J[0] * J[0] + J[1] * J[1] + J[2] * J[2] + J[3] * J[3];
+    var D = J[0] * J[3] - J[1] * J[2];
+    var disc = Math.max(0, F * F - 4 * D * D);
+    var s1 = Math.sqrt(Math.max(0, (F + Math.sqrt(disc)) / 2));
+    return isFinite(s1) ? s1 : Infinity;
+  }
+
+  /* The w at which the frame stops meeting `maxGsd`.
+
+     With the determinant form this was closed-form: a constant w, and therefore a
+     straight line in the image parallel to the horizon. The worst-direction
+     figure has no such luck — range grows towards the frame corners, so quality
+     varies along a line of constant w and the true contour is curved. Rather than
+     pretend otherwise, bisect on w and test the clipped polygon's own vertices,
+     where the worst case always sits. Twenty iterations settle it. */
+  function wForGsd(H, imgW, imgH, maxGsd) {
+    if (!(maxGsd > 0)) return 1e-9;
+    var rect = [{ x: 0, y: 0 }, { x: imgW, y: 0 }, { x: imgW, y: imgH }, { x: 0, y: imgH }];
+
+    var worstAt = function (w) {
+      var poly = clipHalfPlane(rect, H[6], H[7], H[8] - w);
+      if (poly.length < 3) return -1;                 /* nothing left: trivially fine */
+      var m = 0;
+      for (var i = 0; i < poly.length; i++) m = Math.max(m, gsdAtPixel(H, poly[i]));
+      return m;
+    };
+
+    /* An upper bound on w: the largest the frame can produce anywhere. */
+    var hi = 1e-9;
+    for (var i = 0; i < 4; i++) {
+      var w = H[6] * rect[i].x + H[7] * rect[i].y + H[8];
+      if (w > hi) hi = w;
+    }
+    if (worstAt(1e-9) <= maxGsd) return 1e-9;         /* whole frame already passes */
+
+    var lo = 1e-9;
+    for (var k = 0; k < 24; k++) {
+      var mid = (lo + hi) / 2;
+      if (worstAt(mid) > maxGsd) lo = mid; else hi = mid;
+    }
+    return hi;
+  }
+
+  /* Sutherland-Hodgman against the half-plane a.x + b.y + c >= 0. */
+  function clipHalfPlane(poly, a, b, c) {
+    var out = [], n = poly.length;
+    if (!n) return out;
+    for (var i = 0; i < n; i++) {
+      var cur = poly[i], nxt = poly[(i + 1) % n];
+      var dc = a * cur.x + b * cur.y + c;
+      var dn = a * nxt.x + b * nxt.y + c;
+      if (dc >= 0) out.push(cur);
+      if ((dc >= 0) !== (dn >= 0)) {
+        var t = dc / (dc - dn);
+        out.push({ x: cur.x + t * (nxt.x - cur.x), y: cur.y + t * (nxt.y - cur.y) });
+      }
+    }
+    return out;
+  }
+
+  /* The patch of roof a frame actually contributes, as a ground polygon.
+
+     The image rectangle is clipped in IMAGE space first — against the horizon,
+     and against the quality limit — because both are straight lines there. Only
+     then is it mapped to the ground. Mapping first and clipping after would send
+     near-horizon corners to infinity and take the polygon with them. */
+  function frameFootprint(H, imgW, imgH, maxGsd) {
+    if (!H) return null;
+    var rect = [{ x: 0, y: 0 }, { x: imgW, y: 0 }, { x: imgW, y: imgH }, { x: 0, y: imgH }];
+    var wMin = wForGsd(H, imgW, imgH, maxGsd);
+    var img = clipHalfPlane(rect, H[6], H[7], H[8] - wMin);
+    if (img.length < 3) return null;
+
+    var ground = [], lo = Infinity, hi = 0;
+    for (var i = 0; i < img.length; i++) {
+      var g = applyH(H, img[i]);
+      if (!g) return null;
+      ground.push(g);
+      var s = gsdAtPixel(H, img[i]);
+      if (s < lo) lo = s;
+      if (s > hi) hi = s;
+    }
+    return { image: img, ground: ground, minGsd: lo, maxGsd: hi, area: polygonArea(ground) };
+  }
+
+  /* ================= where a point IS =================
+
+     Ground sampling distance answers "how sharp is this pixel". It does not
+     answer "where is this thing", and the two diverge quadratically with range —
+     a cell 20 m out can be crisp and still be metres from where it is drawn.
+     Confidence anywhere in the UI must come from position error, never from GSD.
+
+     Two independent sources dominate, and both scale badly with range:
+
+     - Attitude. A ray leaving at depression theta lands at d = h/tan(theta), so
+       d(d)/d(theta) = -(h^2 + d^2)/h. At 1.55 m and 10 m out, half a degree of
+       tilt error moves the point 58 cm. It grows as the SQUARE of range while the
+       camera height divides it, which is the whole argument for standing closer
+       rather than looking further.
+
+     - The deck itself. If the roof is not the plane it is assumed to be, an error
+       of delta in deck height drags the intersection out by delta.d/h. This one
+       is declared by the operator, never measured, so it must be stated. */
+
+  /* Metres of ground movement per radian of attitude error, at range d. */
+  function bearingSensitivity(camHeight, d) {
+    if (!(camHeight > 0)) return Infinity;
+    return (camHeight * camHeight + d * d) / camHeight;
+  }
+
+  /* Combined 1-sigma position error at range d, in metres. */
+  function positionSigma(camHeight, d, attSigmaRad, deckUncertainty) {
+    if (!(camHeight > 0)) return Infinity;
+    var att = bearingSensitivity(camHeight, d) * (attSigmaRad || 0);
+    var deck = (deckUncertainty || 0) * d / camHeight;
+    return Math.hypot(att, deck);
+  }
+
+  /* How far out the survey still meets a stated tolerance — the honest radius of
+     a standpoint, and the reason a roof is walked rather than scanned from one
+     corner.
+
+     This MUST invert the same sigma the coverage map is coloured by, deck term
+     included. Solving it for attitude alone drew a ring labelled "trusted" with
+     amber cells inside it, which is worse than either answer on its own.
+
+     It looks quartic in d and is not: substituting u = d^2 into
+     tol^2 = (A(h^2+u))^2 + (Bu... ) leaves a plain quadratic in u, so it stays
+     closed-form. With deck = 0 it reduces to tol.h/sigma - h^2 as before. */
+  function maxTrustedRange(camHeight, attSigmaRad, tolerance, deckUncertainty) {
+    if (!(camHeight > 0) || !(attSigmaRad > 0)) return 0;
+    var A = attSigmaRad / camHeight;
+    var B = (deckUncertainty || 0) / camHeight;
+    var h2 = camHeight * camHeight;
+
+    var a = A * A;
+    var b = 2 * a * h2 + B * B;
+    var c = a * h2 * h2 - tolerance * tolerance;
+    if (a < 1e-30) return 0;
+
+    var disc = b * b - 4 * a * c;
+    if (disc <= 0) return 0;
+    var u = (-b + Math.sqrt(disc)) / (2 * a);
+    return u > 0 ? Math.sqrt(u) : 0;
+  }
+
+  /* ================= relief displacement =================
+
+     The hard limit on any ground-plane mosaic, and the reason one is a picture of
+     the roof DECK rather than of the roof.
+
+     Everything projected onto the plane is assumed to lie on it. Anything that
+     does not — the top of a unit, a parapet, a stack — is thrown outward from the
+     camera. A point z above the deck at ground range r lands at r.h/(h-z): the
+     ray from the camera through it only meets the deck further out.
+
+     Handheld, that factor is brutal. At h = 1.6 m a z = 1.0 m unit top lands 2.7x
+     its true range — 8 m becomes 21 m — and at z = h it never meets the deck at
+     all. Aerial photogrammetry gets away with ignoring this because h is hundreds
+     of metres and z/h vanishes; at chest height z/h is the whole story.
+
+     So: trace bases, never tops, and warn when an object is tall relative to the
+     camera. */
+
+  /* Multiplier on ground range suffered by a point `objectHeight` above the deck. */
+  function layoverFactor(camHeight, objectHeight) {
+    var d = camHeight - (objectHeight || 0);
+    if (!(camHeight > 0) || d <= 1e-9) return Infinity;
+    return camHeight / d;
+  }
+
+  /* How far outward that point is smeared, in metres. */
+  function reliefDisplacement(range, objectHeight, camHeight) {
+    var k = layoverFactor(camHeight, objectHeight);
+    return isFinite(k) ? range * (k - 1) : Infinity;
+  }
+
+  /* The tallest thing whose top still lands within `maxFactor` of its true range —
+     the honest ceiling on what a deck mosaic can depict rather than smear. */
+  function maxSafeObjectHeight(camHeight, maxFactor) {
+    if (!(camHeight > 0) || !(maxFactor > 1)) return 0;
+    return camHeight * (1 - 1 / maxFactor);
   }
 
   /* Height of something standing on the roof, from its base and top pixels.
@@ -698,9 +1040,18 @@ var EE = (function () {
     M_PER_FT: M_PER_FT, DEG: DEG,
     solveLinear: solveLinear, mul3: mul3, invert3: invert3, applyM3: applyM3, transpose3: transpose3,
     homographyFromQuad: homographyFromQuad, applyH: applyH, rectRefCorners: rectRefCorners,
+    det3: det3, orientH: orientH, homographyFromPose: homographyFromPose,
+    jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
+    clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,
     rotFromOrientation: rotFromOrientation, focalFromFov: focalFromFov,
+    quatMul: quatMul, quatFromOrientation: quatFromOrientation, quatToMatrix: quatToMatrix,
+    quatSlerp: quatSlerp, quatAngleDeg: quatAngleDeg,
     rayForPixel: rayForPixel, groundPoint: groundPoint, projectToPixel: projectToPixel,
     heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
+    layoverFactor: layoverFactor, reliefDisplacement: reliefDisplacement,
+    maxSafeObjectHeight: maxSafeObjectHeight,
+    bearingSensitivity: bearingSensitivity, positionSigma: positionSigma,
+    maxTrustedRange: maxTrustedRange,
     hull: hull, fitOrientedRect: fitOrientedRect, rectCorners: rectCorners,
     fitCircle: fitCircle, circlePoly: circlePoly, polygonArea: polygonArea,
     rigid2D: rigid2D, applyRigid: applyRigid,

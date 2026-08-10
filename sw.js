@@ -5,8 +5,16 @@
    keeps a complete offline copy — the point of the whole exercise, since a roof
    in an industrial park is exactly where the signal dies.
 
+   `cache: 'no-cache'` on that fetch is load-bearing, and its absence is a trap
+   this worker fell into: network-first defeats the SERVICE WORKER cache, but a
+   bare fetch() still consults the browser's HTTP cache first. A static host that
+   sends Last-Modified without Cache-Control — python http.server, and plenty of
+   real ones — invites heuristic caching, and the worker then serves a stale file
+   while looking, in its own logs, like it went to the network. no-cache forces
+   revalidation, so an unchanged file still costs only a 304.
+
    Fonts are cache-first: immutable and versioned by URL. */
-const CACHE = 'eagle-eye-1.0.0';
+const CACHE = 'eagle-eye-1.1.0';
 const ASSETS = [
   './',
   'index.html',
@@ -41,7 +49,7 @@ self.addEventListener('fetch', e => {
 
   if (sameOrigin) {
     e.respondWith(
-      fetch(e.request).then(res => {
+      fetch(e.request, { cache: 'no-cache' }).then(res => {
         if (res.ok) {
           const copy = res.clone();
           caches.open(CACHE).then(c => c.put(e.request, copy));

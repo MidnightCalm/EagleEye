@@ -142,6 +142,13 @@ disagree, and it is worth knowing before the layout is drawn.
 
 ## Export
 
+> **Verify this before relying on it.** An exhaustive search of HelioScope's documentation
+> turned up *no* evidence that it imports vector KML geometry — no polygon, no keepout, no
+> field segment; CAD and PVsyst are export-only. What *is* documented is Designer → Advanced →
+> Overlays, which accepts jpg/png/kmz/kml as **georeferenced imagery** locked to true scale.
+> Upload one of each and record what actually lands. If vector import does not work, the right
+> answer is a georeferenced raster, not this KML.
+
 **KML** — one folder for the roof outline, one for obstructions. Rectangles export as
 polygons; cylinders as 24-sided polygons (adjustable). Each placemark is extruded to its real
 height with `relativeToGround`, so **opening the KML in Google Earth first shows you solid
@@ -175,25 +182,126 @@ base64 in localStorage would inflate that by a third and hit the wall at about t
 Settings shows the total and offers **Drop all photos** — this keeps every measurement and
 frees the space, costing only the ability to go back and trace more from those shots.
 
+## Coverage, the checklist, and the live view
+
+Three things answer "what do I still need", and they answer different questions.
+
+**Coverage** (Plan tab → Coverage) shades the roof by **position error**, not by
+resolution. Green means a cell was seen at adequate *geometry* — it does **not** mean
+anything in it was measured. An area can be fully green and contain nothing traced.
+
+Position error is what matters and it behaves badly with distance. A ray leaving at
+depression θ lands at `h/tan θ`, so an attitude error moves the point by `(h² + d²)/h` per
+radian — growing with the **square** of range:
+
+| range | 0.5° tilt error | 1.0° |
+|---|---|---|
+| 3 m | 0.06 m | 0.13 m |
+| 10 m | 0.58 m | 1.15 m |
+| 20 m | 2.27 m | 4.53 m |
+
+Which gives the number that governs the whole survey:
+
+> **Trusted radius: ~4.3 m** at 1.55 m camera height, ±0.25 m tolerance, 0.5° tilt error and
+> a deck assumed flat to ±0.08 m. Attitude alone it would be 6.5 m; the deck assumption costs
+> the rest.
+
+Standing closer beats every other improvement. The Check tab shows this live and lets you
+edit all three inputs under **Error model**.
+
+**The checklist** (Check tab) is what answers "can I leave the roof": objects with no height,
+shots not placed or not calibrated, objects traced beyond the trusted radius, missing
+landmarks, no scale reference, and the percentage of the outline actually covered. Blockers
+badge the tab. Every row is tappable and jumps straight to the thing that needs fixing.
+
+**Live** (bottom bar) draws the survey back over the camera feed from a standpoint you have
+already placed. It is a **drift monitor, not a positioning system** — nothing here can know
+where you are standing, so it assumes you are at the chosen shot and shows what the survey
+claims is in front of you. If the wireframe sits on the real units, the survey is consistent.
+If it has slid, something is wrong. Objects with no height draw amber and dashed. Coverage
+gaps are shaded on the deck where they actually are, so you can walk to them.
+
+The yaw slider exists because iOS `alpha` drifts; nudge until the wireframe lines up.
+
+## Scale is an input, not an output
+
+Every length rides on one measured distance, and no amount of photography recovers it —
+scale is a gauge freedom of the projection equations, so the information for it is
+identically zero. Record it under Check → *No scale reference* :
+
+| method | on a 24 m baseline |
+|---|---|
+| laser | ±0.006% |
+| 30 m fibreglass tape | ±0.04% |
+| paced | ±1% |
+
+Shoot the laser at the **inside face of the far parapet** — a large matte near-vertical
+target that returns in full sun. White membrane often will not return past 15–20 m.
+
+A scale error is invisible in the plan and lands on every length and doubly on every area.
+
+## What a deck mosaic could and could not be
+
+Worth recording, since it was investigated and rejected for v1. Projecting frames onto the
+roof plane gives a picture of the **deck** only. Anything above it is thrown outward by
+`h/(h−z)`:
+
+| object height | apparent range, from 1.55 m |
+|---|---|
+| 0.30 m | 1.24× |
+| 0.90 m | 2.38× |
+| 1.20 m | 4.43× |
+| ≥ 1.55 m | never meets the deck |
+
+So a mosaic is a tracing base, never a measurement surface — and continuous capture while
+walking is self-defeating regardless: normal gait puts 20–60°/s on the phone, while
+frame-to-attitude skew needs under ~15°/s to stay inside the error budget. If it is ever
+built, it should be **step-and-stand bursts**, not video.
+
 ## Accuracy, honestly
 
 - A measured-rectangle calibration is exact in the plane. Error comes from where your finger
   lands, which is what the loupe is for.
 - Error grows with how obliquely you are looking. Keep the tilt between **25° and 65°** below
-  horizontal — the capture screen colours the readout and says so — and stay within roughly
-  10–15× your camera height of the target.
+  horizontal — the capture screen colours the readout and says so — and stay inside the
+  trusted radius shown on the Check tab.
+- **Do not read accuracy off sharpness.** A pixel 20 m away can resolve to 2 cm and still sit
+  2.3 m from where it is drawn. Ground sampling distance says how sharp something is; it says
+  nothing about where it is. Nothing in the UI colours by resolution.
+- **Do not treat a closed loop as validation.** A 10% scale error closes a 130 m perimeter to
+  0.000 m while inflating the enclosed area by 21%. Closure is a heading check, never a scale
+  check.
+- Eagle Eye is a **field measurement aid**, not a survey. It does not replace a stamped
+  survey, an EagleView report or a drone flight, and it does not replace the tape or laser —
+  the measured baseline is an input to it.
 - Height measurement is geometrically exact but leans on tilt and lens. Trust it more after a
   rectangle calibration has solved the lens; for a rooftop unit a few metres away it is good.
 - The registration residual and the scale check are real diagnostics. Look at them.
 
 ## Testing
 
-`tools/test-geo.html` runs 90 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 175 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.
 
-Two bugs it earned its keep on:
+Bugs it earned its keep on:
+
+- `applyH` guarded `|w| < 1e-12` while its comment claimed it rejected points behind the
+  horizon. A negative `w` passed straight through and returned a **mirrored point behind the
+  camera** — so a tap on the sky became a measurement, and geometry off the back of a frame
+  drew as a ghost.
+- The confidence metric started as `sqrt(|det J|)`, the *geometric mean* of the two principal
+  scales. At a grazing angle, fine cross-track resolution masks a terrible along-track smear:
+  40 cm along × 2 cm across averages to a comfortable-looking 9 cm. Replaced first by the
+  worst singular value, then abandoned entirely in favour of position error.
+- The trusted-radius ring was computed from attitude alone while the coverage map was coloured
+  by attitude *and* deck uncertainty, so cells inside the "trusted" ring painted amber. Both
+  now invert one sigma.
+- The service worker's network-first path called `fetch(e.request)`, which consults the
+  browser's HTTP cache — so on a host sending `Last-Modified` without `Cache-Control` it
+  served stale files while appearing to go to the network. **Ledger and Trove share this
+  worker and have the same bug.**
 
 - The minimum-area box is **degenerate for three points** — around a right triangle,
   aligning to the hypotenuse encloses exactly the same area as aligning to the legs, so a

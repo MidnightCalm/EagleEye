@@ -1,0 +1,6 @@
+# Keep the repo LF-only. Without this, Windows checkouts write CRLF back and a
+# one-line change shows up as a whole-file diff.
+* text=auto eol=lf
+
+*.png binary
+*.kmz binary

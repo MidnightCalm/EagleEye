@@ -229,6 +229,66 @@ textarea.inp { min-height: 72px; resize: vertical; }
 }
 .tabbar > button.active { background: var(--gold); color: var(--ink); }
 
+/* ============ checklist ============ */
+.chk-list { display: flex; flex-direction: column; gap: 8px; }
+.chk {
+  display: flex; align-items: flex-start; gap: 11px; padding: 12px 13px;
+  border-radius: 14px; border: 1px solid rgba(244,240,232,0.1);
+  background: rgba(244,240,232,0.04);
+}
+.chk[data-chk] { cursor: pointer; }
+.chk[data-chk]:active { border-color: var(--gold); }
+.chk .cg { font-size: 13px; line-height: 1.35; flex-shrink: 0; width: 14px; text-align: center; }
+.chk .cmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.chk .ct { font-size: 14.5px; color: var(--cream); }
+.chk .cd { font-size: 12.5px; line-height: 1.45; color: rgba(244,240,232,0.55); }
+.chk .cx { color: rgba(244,240,232,0.3); font-size: 18px; flex-shrink: 0; }
+.chk.block { border-color: rgba(201,106,94,0.5); background: rgba(201,106,94,0.08); }
+.chk.block .cg { color: var(--red-light); }
+.chk.warn { border-color: rgba(212,175,55,0.4); background: rgba(212,175,55,0.06); }
+.chk.warn .cg { color: var(--gold); }
+.chk.info .cg { color: rgba(244,240,232,0.4); }
+.chk.ok { border-color: rgba(110,210,154,0.35); background: rgba(110,210,154,0.06); }
+.chk.ok .cg { color: var(--green); }
+
+/* ============ tab badge ============ */
+.tabbar { overflow-x: auto; scrollbar-width: none; }
+.tabbar::-webkit-scrollbar { display: none; }
+.tabbar > button { position: relative; flex: 1 0 auto; min-width: 58px; }
+.tb-badge {
+  position: absolute; top: 1px; right: 4px; min-width: 15px; height: 15px; border-radius: 8px;
+  background: var(--red); color: #2A0F0B; font-size: 10px; font-weight: 700; font-style: normal;
+  display: flex; align-items: center; justify-content: center; padding: 0 3px;
+}
+.tabbar > button.active .tb-badge { background: var(--ink); color: var(--gold); }
+
+/* ============ coverage legend ============ */
+.cov-legend {
+  position: absolute; top: 12px; left: 12px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: rgba(12,10,16,0.8); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  border: 1px solid rgba(244,240,232,0.14); border-radius: 12px; padding: 7px 11px;
+  font-family: ui-monospace, monospace; font-size: 10px; color: rgba(244,240,232,0.75);
+  pointer-events: none;
+}
+.cov-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.cov-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+/* the coverage map says a cell was SEEN well, never that anything in it was measured */
+.cov-legend em { font-style: normal; color: rgba(244,240,232,0.42); }
+
+/* ============ live HUD ============ */
+.live-row { display: flex; gap: 8px; align-items: center; }
+.live-sel { flex: 1; padding: 10px 12px; font-size: 14px; }
+.slider {
+  width: 100%; -webkit-appearance: none; appearance: none; height: 3px; border-radius: 2px;
+  background: rgba(244,240,232,0.18); outline: none; margin: 8px 0 2px;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 26px; height: 26px; border-radius: 999px;
+  background: var(--gold); border: 3px solid var(--ink); cursor: pointer;
+}
+.full-body > canvas#live-canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+
 /* ============ canvas stages ============ */
 .stage {
   position: relative; flex: 1 1 auto; min-height: 0; margin: 0;

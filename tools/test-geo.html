@@ -56,6 +56,45 @@ function near(name, a, b, tol) {
   near('flat phone: camera points straight down', down[2], -1, 1e-9);
 })();
 
+/* ---- attitude quaternions ---- */
+(function () {
+  /* The quaternion path must reproduce the Euler matrix exactly, or frame
+     attitudes and shutter attitudes would disagree. */
+  var worst = 0;
+  [[0,90,0],[37,62,-18],[180,10,80],[-140,-75,44],[359,89,-89],[0,0,0]].forEach(function (e) {
+    var A = EE.rotFromOrientation(e[0], e[1], e[2]);
+    var B = EE.quatToMatrix(EE.quatFromOrientation(e[0], e[1], e[2]));
+    for (var i = 0; i < 9; i++) worst = Math.max(worst, Math.abs(A[i] - B[i]));
+  });
+  near('quaternion attitude matches the Euler matrix', worst, 0, 1e-12);
+
+  /* Slerp endpoints and midpoint. */
+  var qa = EE.quatFromOrientation(0, 60, 0), qb = EE.quatFromOrientation(40, 60, 0);
+  near('slerp at t=0 is the first sample', EE.quatAngleDeg(EE.quatSlerp(qa, qb, 0), qa), 0, 1e-9);
+  near('slerp at t=1 is the second sample', EE.quatAngleDeg(EE.quatSlerp(qa, qb, 1), qb), 0, 1e-9);
+  near('slerp midpoint is equidistant',
+       EE.quatAngleDeg(EE.quatSlerp(qa, qb, 0.5), qa) - EE.quatAngleDeg(EE.quatSlerp(qa, qb, 0.5), qb), 0, 1e-9);
+  near('slerp midpoint of a 40 deg pan is 20 deg', EE.quatAngleDeg(EE.quatSlerp(qa, qb, 0.5), qa), 20, 1e-9);
+
+  /* The wraparound that naive Euler interpolation gets catastrophically wrong:
+     halfway between alpha 359 and alpha 1 must be alpha 0, not alpha 180. */
+  var w1 = EE.quatFromOrientation(359, 60, 0), w2 = EE.quatFromOrientation(1, 60, 0);
+  var mid = EE.quatSlerp(w1, w2, 0.5);
+  near('slerp crosses the alpha wrap correctly',
+       EE.quatAngleDeg(mid, EE.quatFromOrientation(0, 60, 0)), 0, 1e-9);
+  ok('naive Euler averaging would have pointed the camera backwards',
+     Math.abs((359 + 1) / 2 - 180) < 1e-9);
+
+  /* Antipodal representations are the same rotation and must not spin the long way. */
+  var q = EE.quatFromOrientation(20, 55, 3);
+  var negq = [-q[0], -q[1], -q[2], -q[3]];
+  near('antipodal quaternions are the same attitude', EE.quatAngleDeg(q, negq), 0, 1e-6);
+  near('slerp between antipodes does not travel', EE.quatAngleDeg(EE.quatSlerp(q, negq, 0.5), q), 0, 1e-6);
+
+  near('quatAngleDeg of a known 30 deg pan',
+       EE.quatAngleDeg(EE.quatFromOrientation(0, 90, 0), EE.quatFromOrientation(30, 90, 0)), 30, 1e-9);
+})();
+
 /* ---- ray cast: closed-form check ---- */
 (function () {
   /* alpha 0, beta 60 -> camera depressed 30 deg below horizon, facing north. */
@@ -122,6 +161,157 @@ function near(name, a, b, tol) {
   })());
 })();
 
+/* ---- pose expressed as a homography must reproduce the ray cast exactly ---- */
+[0, 90, 180, 270].forEach(function (ang) {
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(31, 57, -6), camH = 1.62;
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, ang);
+  ok('homographyFromPose builds @' + ang, !!Hm);
+
+  var worst = 0, n = 0;
+  for (var px = 60; px <= W - 60; px += 170) {
+    for (var py = 60; py <= H - 60; py += 170) {
+      var ray = EE.groundPoint(EE.rayForPixel(px, py, W, H, f, ang), R, camH, 0);
+      var hom = EE.applyH(Hm, { x: px, y: py });
+      /* Both engines must agree on which pixels are sky. */
+      if (!ray) { ok('sky pixel rejected by both @' + ang, !hom || (Hm[6]*px + Hm[7]*py + Hm[8]) <= 0); continue; }
+      if (!hom) { worst = Infinity; continue; }
+      worst = Math.max(worst, Math.hypot(hom.x - ray.x, hom.y - ray.y));
+      n++;
+    }
+  }
+  ok('pose homography covered ground pixels @' + ang, n > 10, 'n=' + n);
+  near('pose homography == ray cast @' + ang + ' (m)', worst, 0, 1e-9);
+});
+
+/* ---- w > 0 is a valid horizon test for BOTH constructions ---- */
+(function () {
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.6;
+  var Hp = EE.homographyFromPose(R, camH, f, W, H, 0);
+  var wAt = function (Hm, x, y) { return Hm[6]*x + Hm[7]*y + Hm[8]; };
+  ok('pose H: bottom of frame is in front (w>0)', wAt(Hp, W/2, H - 10) > 0);
+  ok('pose H: top of frame is sky (w<=0)', wAt(Hp, W/2, 10) <= 0);
+
+  /* the quad solver picks an arbitrary sign; orientH must pin it the same way */
+  var ref = EE.rectRefCorners(2.4, 1.2);
+  var pix = ref.map(function (p) { return EE.projectToPixel({x: p.x + 1, y: p.y + 5}, R, camH, W, H, f, 0, 0); });
+  var Hq = EE.homographyFromQuad(pix, ref);
+  ok('quad H: reference corners all have w>0', pix.every(function (p) { return wAt(Hq, p.x, p.y) > 0; }));
+  ok('quad H: sky has w<=0', wAt(Hq, W/2, 10) <= 0);
+
+  /* negating the input solution must not change the oriented result */
+  var flipped = EE.orientH([-Hq[0],-Hq[1],-Hq[2],-Hq[3],-Hq[4],-Hq[5],-Hq[6],-Hq[7],-Hq[8]], pix[0]);
+  var d = 0; for (var i = 0; i < 9; i++) d = Math.max(d, Math.abs(flipped[i] - Hq[i]));
+  near('orientH is idempotent under sign flip', d, 0, 1e-12);
+})();
+
+/* ---- ground sampling distance (worst direction) ---- */
+(function () {
+  /* A pure scale homography is isotropic: both singular values are s. */
+  var s = 0.017;
+  near('gsd of a pure scale map', EE.gsdAtPixel([s,0,0, 0,s,0, 0,0,1], {x: 123, y: 456}), s, 1e-12);
+  /* An anisotropic map must report the WORSE axis, not the average. */
+  near('gsd reports the worse axis of an anisotropic map',
+       EE.gsdAtPixel([0.02,0,0, 0,0.5,0, 0,0,1], {x: 10, y: 10}), 0.5, 1e-12);
+
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.6;
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, 0);
+
+  var nearG = EE.gsdAtPixel(Hm, {x: W/2, y: H - 40});
+  var farG  = EE.gsdAtPixel(Hm, {x: W/2, y: H * 0.62});
+  ok('gsd degrades towards the horizon', farG > nearG * 2, nearG.toFixed(4) + ' -> ' + farG.toFixed(4));
+  ok('gsd at the bottom of frame is centimetric', nearG > 0.0002 && nearG < 0.02, nearG);
+  ok('gsd above the horizon is infinite', EE.gsdAtPixel(Hm, {x: W/2, y: 10}) === Infinity);
+
+  /* The regression this metric exists for. Anisotropy grows as r/h, so it has to
+     be measured near the horizon — the horizon's pixel row is where w = 0, so
+     solve for it rather than guessing a fraction of the frame. */
+  var horizonY = -(Hm[8] + Hm[6] * (W/2)) / Hm[7];
+  ok('horizon lies inside the frame', horizonY > 0 && horizonY < H, horizonY);
+
+  var ratioAt = function (y) {
+    var q = {x: W/2, y: y};
+    var J = EE.jacobianAtPixel(Hm, q);
+    return EE.gsdAtPixel(Hm, q) / Math.sqrt(Math.abs(J[0]*J[3] - J[1]*J[2]));
+  };
+  var grazing = ratioAt(horizonY + 40), close = ratioAt(H - 40);
+  ok('anisotropy grows towards the horizon', grazing > close * 2,
+     'close ' + close.toFixed(2) + 'x -> grazing ' + grazing.toFixed(2) + 'x');
+  ok('a grazing pixel is several times worse than its determinant mean suggests',
+     grazing > 3, grazing.toFixed(2) + 'x');
+  ok('and close in, the two metrics nearly agree', close < 1.35, close.toFixed(2) + 'x');
+
+  /* Central differences: second-order, so this actually tests the analytic form
+     rather than the truncation error of a one-sided step. */
+  /* h = 0.1 px: central-difference truncation falls as h^2, so a whole-pixel step
+     leaves ~1e-9 of its own error and would be testing the approximation rather
+     than the analytic form. */
+  var p = {x: W/2, y: H*0.8}, hh = 0.1;
+  var du = [EE.applyH(Hm, {x: p.x+hh, y: p.y}), EE.applyH(Hm, {x: p.x-hh, y: p.y})];
+  var dv = [EE.applyH(Hm, {x: p.x, y: p.y+hh}), EE.applyH(Hm, {x: p.x, y: p.y-hh})];
+  var fd = [(du[0].x-du[1].x)/(2*hh), (dv[0].x-dv[1].x)/(2*hh),
+            (du[0].y-du[1].y)/(2*hh), (dv[0].y-dv[1].y)/(2*hh)];
+  var Ja = EE.jacobianAtPixel(Hm, p);
+  var dmax = 0; for (var i = 0; i < 4; i++) dmax = Math.max(dmax, Math.abs(fd[i] - Ja[i]));
+  near('analytic Jacobian matches central differences', dmax, 0, 1e-10);
+
+  /* The bisected clip must sit right on the limit. */
+  var lim = 0.05;
+  var wl = EE.wForGsd(Hm, W, H, lim);
+  var fpv = EE.clipHalfPlane([{x:0,y:0},{x:W,y:0},{x:W,y:H},{x:0,y:H}], Hm[6], Hm[7], Hm[8] - wl);
+  var worst = 0; fpv.forEach(function (q) { worst = Math.max(worst, EE.gsdAtPixel(Hm, q)); });
+  ok('clip meets the quality limit', worst <= lim + 1e-6, worst);
+  ok('clip is not needlessly conservative', worst > lim * 0.9, worst);
+
+  /* A nadir view of the same roof is uniformly good, so nothing gets clipped. */
+  var down = EE.homographyFromPose(EE.rotFromOrientation(0, 0, 0), camH, f, W, H, 0);
+  near('nadir view needs no clipping', EE.wForGsd(down, W, H, 0.05), 1e-9, 1e-12);
+})();
+
+/* ---- frame footprint ---- */
+(function () {
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.6;
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, 0);
+
+  var fp = EE.frameFootprint(Hm, W, H, 0.05);
+  ok('footprint produced', !!fp && fp.ground.length >= 3);
+  ok('footprint respects the quality limit', fp.maxGsd <= 0.05 + 1e-9, fp.maxGsd);
+  ok('footprint has real area', fp.area > 1, fp.area);
+  ok('every footprint vertex is in front of the camera',
+     fp.image.every(function (p) { return Hm[6]*p.x + Hm[7]*p.y + Hm[8] > 0; }));
+
+  /* A looser limit must see further and cover more. */
+  var loose = EE.frameFootprint(Hm, W, H, 0.15);
+  ok('a looser quality limit covers more roof', loose.area > fp.area, fp.area + ' -> ' + loose.area);
+
+  /* Straight down: the whole frame is usable, so the footprint keeps 4 corners. */
+  var down = EE.homographyFromPose(EE.rotFromOrientation(0, 0, 0), 1.6, f, W, H, 0);
+  var dfp = EE.frameFootprint(down, W, H, 1);
+  ok('nadir view keeps all four corners', dfp && dfp.image.length === 4, dfp && dfp.image.length);
+
+  /* A level camera is NOT blind: the bottom of the frame still points ~34 deg
+     down (half the vertical field of view), so it sees the roof about
+     1.6/tan(34) = 2.4 m ahead. Only the far half of the frame is sky. */
+  var level = EE.homographyFromPose(EE.rotFromOrientation(0, 90, 0), 1.6, f, W, H, 0);
+  var lfp = EE.frameFootprint(level, W, H, 0.05);
+  ok('a level camera still sees the ground at its feet', !!lfp, 'got null');
+  ok('and its reach is bounded by the quality limit',
+     lfp && lfp.ground.every(function (g) { return Math.hypot(g.x, g.y) < 14; }),
+     lfp && Math.max.apply(null, lfp.ground.map(function (g) { return Math.hypot(g.x, g.y); })).toFixed(1) + ' m');
+
+  /* Tilted up past half the vertical field of view: genuinely nothing. */
+  ok('a camera tilted 40 deg up has no footprint',
+     EE.frameFootprint(EE.homographyFromPose(EE.rotFromOrientation(0, 130, 0), 1.6, f, W, H, 0), W, H, 0.05) === null);
+
+  /* Clipper sanity: halving a unit square. */
+  var sq = [{x:0,y:0},{x:1,y:0},{x:1,y:1},{x:0,y:1}];
+  near('clipHalfPlane halves a unit square', EE.polygonArea(EE.clipHalfPlane(sq, 1, 0, -0.5)), 0.5, 1e-12);
+  ok('clipHalfPlane can reject entirely', EE.clipHalfPlane(sq, 1, 0, -2).length === 0);
+})();
+
 /* ---- camera height from a known length ---- */
 (function () {
   var W = 1440, H = 1920, f = EE.focalFromFov(69, H);
@@ -133,6 +323,129 @@ function near(name, a, b, tol) {
     EE.rayForPixel(pa.x, pa.y, W, H, f, 0),
     EE.rayForPixel(pb.x, pb.y, W, H, f, 0), R, 3.0);
   near('camHeightFromKnown recovers 1.72', solved, 1.72, 1e-9);
+})();
+
+/* ---- position error: the only honest confidence metric ---- */
+(function () {
+  var camH = 1.55, d = 10;
+
+  /* Validate the closed form against the real projection rather than against any
+     asserted figure: aim the camera axis at a point 10 m out, nudge the tilt, and
+     measure how far the intersection actually travels. */
+  var depression = Math.atan(camH / d);
+  var beta = 90 - depression * 180 / Math.PI;
+  var yAt = function (b) {
+    return EE.groundPoint([0, 0, -1], EE.rotFromOrientation(0, b, 0), camH, 0).y;
+  };
+  near('camera axis lands where intended', yAt(beta), d, 1e-9);
+
+  var eps = 1e-4;                                    /* degrees */
+  var measured = Math.abs(yAt(beta + eps) - yAt(beta - eps)) / (2 * eps * Math.PI / 180);
+  near('bearingSensitivity matches the real projection (m per rad)',
+       EE.bearingSensitivity(camH, d), measured, 1e-3);
+  near('and it is (h^2 + d^2)/h', EE.bearingSensitivity(camH, d), (camH*camH + d*d)/camH, 1e-12);
+
+  var half = 0.5 * Math.PI / 180;
+  var sig = EE.positionSigma(camH, d, half, 0);
+  near('half a degree at 10 m moves the point 58 cm', sig, 0.5766, 5e-4);
+  ok('position error grows quadratically, not linearly',
+     EE.positionSigma(camH, 20, half, 0) / sig > 3.5,
+     (EE.positionSigma(camH, 20, half, 0) / sig).toFixed(2) + 'x for 2x the range');
+
+  /* Standing closer is worth more than any amount of resolution. */
+  ok('halving the range cuts the error roughly fourfold',
+     EE.positionSigma(camH, 5, half, 0) < sig / 3.4,
+     EE.positionSigma(camH, 5, half, 0).toFixed(3));
+
+  /* Deck uncertainty is a separate, declared term. */
+  near('deck uncertainty drags the point out by delta.d/h',
+       EE.positionSigma(camH, d, 0, 0.08), 0.08 * d / camH, 1e-12);
+  near('the two combine in quadrature',
+       EE.positionSigma(camH, d, half, 0.08),
+       Math.hypot(0.5766, 0.08 * d / camH), 5e-4);
+
+  /* The trusted radius must invert the sigma exactly — attitude alone... */
+  [0.10, 0.25, 0.50].forEach(function (tol) {
+    var r = EE.maxTrustedRange(camH, half, tol);
+    near('maxTrustedRange(' + tol + ' m) inverts positionSigma', EE.positionSigma(camH, r, half, 0), tol, 1e-9);
+  });
+  near('trusted radius at 0.25 m tolerance is 6.5 m', EE.maxTrustedRange(camH, half, 0.25), 6.481, 2e-3);
+
+  /* ...and with the deck term too, or the ring disagrees with the colour inside
+     it. This is the regression: the radius and the coverage colouring must use
+     one sigma. */
+  [[0.10, 0.05], [0.25, 0.08], [0.50, 0.15]].forEach(function (pair) {
+    var r = EE.maxTrustedRange(camH, half, pair[0], pair[1]);
+    near('maxTrustedRange inverts positionSigma with deck ' + pair[1] + ' m',
+         EE.positionSigma(camH, r, half, pair[1]), pair[0], 1e-9);
+  });
+  ok('deck uncertainty shrinks the trusted radius',
+     EE.maxTrustedRange(camH, half, 0.25, 0.08) < EE.maxTrustedRange(camH, half, 0.25),
+     EE.maxTrustedRange(camH, half, 0.25, 0.08).toFixed(2) + ' m vs ' + EE.maxTrustedRange(camH, half, 0.25).toFixed(2) + ' m');
+  near('deck 0 reduces to the attitude-only closed form',
+       EE.maxTrustedRange(camH, half, 0.25, 0), EE.maxTrustedRange(camH, half, 0.25), 1e-12);
+
+  ok('a degree of skew nearly halves the trusted radius',
+     EE.maxTrustedRange(camH, 2 * half, 0.25) < EE.maxTrustedRange(camH, half, 0.25) * 0.72,
+     EE.maxTrustedRange(camH, 2*half, 0.25).toFixed(2) + ' m vs ' + EE.maxTrustedRange(camH, half, 0.25).toFixed(2) + ' m');
+  ok('an impossible tolerance yields no radius', EE.maxTrustedRange(camH, half, 0.001) === 0);
+  ok('an impossible tolerance yields no radius with deck too', EE.maxTrustedRange(camH, half, 0.001, 0.08) === 0);
+
+  /* Sharpness and position must be shown to disagree — the reason GSD was
+     rejected as a confidence colour. */
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var Hm = EE.homographyFromPose(EE.rotFromOrientation(0, 58, 0), camH, f, W, H, 0);
+  var far = EE.applyH(Hm, { x: W/2, y: H * 0.55 });
+  var gsdFar = EE.gsdAtPixel(Hm, { x: W/2, y: H * 0.55 });
+  var posFar = EE.positionSigma(camH, Math.hypot(far.x, far.y), half, 0);
+  ok('a pixel can be sharp and badly located at once', posFar > gsdFar * 3,
+     'gsd ' + (gsdFar*100).toFixed(1) + ' cm vs position ' + posFar.toFixed(2) + ' m at ' +
+     Math.hypot(far.x, far.y).toFixed(1) + ' m');
+})();
+
+/* ---- applyH must refuse both kinds of behind-the-camera point ---- */
+(function () {
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.6;
+  var Hm = EE.homographyFromPose(R, camH, f, W, H, 0);
+  var Hi = EE.invert3(Hm);
+
+  var horizonY = -(Hm[8] + Hm[6] * (W/2)) / Hm[7];
+  ok('image -> ground refuses a sky pixel', EE.applyH(Hm, { x: W/2, y: horizonY - 20 }) === null);
+  ok('image -> ground accepts a roof pixel', !!EE.applyH(Hm, { x: W/2, y: H - 40 }));
+
+  /* A point behind the camera has no pixel; it used to return a mirrored ghost. */
+  ok('ground -> image refuses a point behind the camera', EE.applyH(Hi, { x: 0, y: -25 }) === null);
+  ok('ground -> image accepts a point in front', !!EE.applyH(Hi, { x: 0, y: 8 }));
+
+  /* Round trip still exact for valid points. */
+  var g = { x: 2.5, y: 9 };
+  var back = EE.applyH(Hm, EE.applyH(Hi, g));
+  near('ground -> image -> ground round trip', Math.hypot(back.x - g.x, back.y - g.y), 0, 1e-9);
+})();
+
+/* ---- relief displacement: the ceiling on any deck mosaic ---- */
+(function () {
+  near('layover factor at h=1.6, z=1.0', EE.layoverFactor(1.6, 1.0), 1.6 / 0.6, 1e-12);
+  near('a 1.0 m unit top 8 m away lands at 21.33 m',
+       8 + EE.reliefDisplacement(8, 1.0, 1.6), 8 * 1.6 / 0.6, 1e-9);
+  ok('an object as tall as the camera never meets the deck',
+     EE.layoverFactor(1.6, 1.6) === Infinity && EE.reliefDisplacement(8, 1.6, 1.6) === Infinity);
+  ok('a taller object is worse still', EE.layoverFactor(1.6, 1.9) === Infinity);
+  near('something lying on the deck is not displaced', EE.reliefDisplacement(20, 0, 1.6), 0, 1e-12);
+
+  /* Cross-check the closed form against an actual projection: put a raised point
+     in frame, project it, then read it back on the deck assumption. */
+  var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));
+  var R = EE.rotFromOrientation(0, 58, 0), camH = 1.6;
+  var r = 8, z = 1.0;
+  var pix = EE.projectToPixel({ x: 0, y: r }, R, camH, W, H, f, 0, z);
+  var onDeck = EE.groundPoint(EE.rayForPixel(pix.x, pix.y, W, H, f, 0), R, camH, 0);
+  near('closed form matches the actual mis-projection', onDeck.y, r * 1.6 / 0.6, 1e-6);
+
+  near('maxSafeObjectHeight at 1.25x from 1.6 m', EE.maxSafeObjectHeight(1.6, 1.25), 0.32, 1e-12);
+  ok('raising the camera raises the ceiling',
+     EE.maxSafeObjectHeight(3.0, 1.25) > EE.maxSafeObjectHeight(1.6, 1.25));
 })();
 
 /* ---- object height from base + top pixels ---- */
