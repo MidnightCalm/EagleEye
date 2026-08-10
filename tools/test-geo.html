@@ -161,6 +161,83 @@ function near(name, a, b, tol) {
   })());
 })();
 
+/* ---- reference quality: pixels, not metres ---- */
+(function () {
+  var quad = function (wPx, hPx) {
+    return [{x:0,y:0},{x:wPx,y:0},{x:wPx,y:hPx},{x:0,y:hPx}];
+  };
+
+  var big = EE.referenceQuality(quad(900, 700), 3);
+  near('a reference spanning 700 px gives 0.43% scale error', big.relScaleErr, 3/700, 1e-12);
+  ok('and reads as good', big.verdict === 'good', big.verdict);
+
+  /* The boundary is 0.5%: over a 20 m roof that is 10 cm, which is where a
+     reference stops being comfortably inside a 25 cm tolerance. */
+  ok('500 px is only fair', EE.referenceQuality(quad(800, 500), 3).verdict === 'fair',
+     EE.referenceQuality(quad(800, 500), 3).verdict);
+  ok('600 px just makes good', EE.referenceQuality(quad(900, 600), 3).verdict === 'good');
+
+  var small = EE.referenceQuality(quad(200, 120), 3);
+  near('a 120 px reference gives 2.5%', small.relScaleErr, 3/120, 1e-12);
+  ok('and reads as poor', small.verdict === 'poor', small.verdict);
+
+  /* The point that matters: a SHORT object close to the lens can beat a LONG one
+     across the roof, because only pixels count. */
+  ok('a phone close up beats a kerb far away',
+     EE.referenceQuality(quad(600, 300), 3).relScaleErr <
+     EE.referenceQuality(quad(90, 40), 3).relScaleErr);
+
+  /* Foreshortening is caught even when the spans are long. */
+  var oblique = EE.referenceQuality([{x:0,y:0},{x:900,y:0},{x:700,y:60},{x:200,y:60}], 3);
+  ok('a grazing quad is downgraded', oblique.verdict !== 'good',
+     oblique.verdict + ' foreshorten=' + oblique.foreshorten.toFixed(2));
+  ok('foreshorten is 1 for a square-on quad',
+     Math.abs(EE.referenceQuality(quad(500,500), 3).foreshorten - 1) < 1e-12);
+
+  ok('needs four points', EE.referenceQuality([{x:0,y:0}], 3) === null);
+  ok('degenerate quad rejected', EE.referenceQuality(quad(0, 0), 3) === null);
+
+  /* Stepping a short reference: error falls as 1/sqrt(n). */
+  near('four placements halve the error', EE.steppedReferenceError(0.02, 4), 0.01, 1e-12);
+  near('nine placements cut it to a third', EE.steppedReferenceError(0.03, 9), 0.01, 1e-12);
+  ok('one placement changes nothing', EE.steppedReferenceError(0.02, 1) === 0.02);
+})();
+
+/* ---- shared building axis ---- */
+(function () {
+  var d = Math.PI / 180;
+
+  /* 1 deg and 89 deg are the SAME alignment for a rectangle; a naive mean would
+     answer 45 and rotate every unit on the roof. */
+  var m = EE.meanAngleMod90([1*d, 89*d]);
+  ok('1 deg and 89 deg average to 0, not 45',
+     Math.abs(m.angle / d) < 1e-6 || Math.abs(Math.abs(m.angle/d) - 90) < 1e-6,
+     (m.angle/d).toFixed(4));
+
+  var tight = EE.meanAngleMod90([20*d, 20.5*d, 19.4*d, 20.2*d]);
+  near('a tight cluster averages near 20 deg', tight.angle / d, 20.025, 0.1);
+  ok('and reports high agreement', tight.agreement > 0.99, tight.agreement.toFixed(4));
+  ok('with a small spread', tight.spreadDeg < 1.5, tight.spreadDeg.toFixed(2));
+
+  /* Units at 20 and 110 deg are parallel as far as a rectangle is concerned. */
+  var eq = EE.meanAngleMod90([20*d, 110*d]);
+  ok('90 deg apart counts as aligned', eq.agreement > 0.999, eq.agreement.toFixed(4));
+
+  var loose = EE.meanAngleMod90([0*d, 22*d, 47*d]);
+  ok('a scattered set reports low agreement', loose.agreement < 0.6, loose.agreement.toFixed(3));
+  ok('and a large spread', loose.spreadDeg > 5, loose.spreadDeg.toFixed(1));
+
+  /* 0, 30 and 60 land exactly 120 deg apart once mapped through 4x, so they
+     cancel: three units at those angles have no dominant axis at all, and saying
+     so beats inventing one. */
+  ok('a perfectly spread set has no axis and returns null',
+     EE.meanAngleMod90([0*d, 30*d, 60*d]) === null);
+
+  ok('empty input -> null', EE.meanAngleMod90([]) === null);
+  var one = EE.meanAngleMod90([37*d]);
+  near('a single angle returns itself (mod 90)', ((one.angle/d)%90+90)%90, 37, 1e-6);
+})();
+
 /* ---- pose expressed as a homography must reproduce the ray cast exactly ---- */
 [0, 90, 180, 270].forEach(function (ang) {
   var W = 1080, H = 1440, f = EE.focalFromFov(68, Math.max(W, H));

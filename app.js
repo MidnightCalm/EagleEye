@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.4.0';
+var VERSION = '1.5.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -61,6 +61,8 @@ var DEFAULTS = {
   /* The survey's declared error model. These three numbers decide the trusted
      radius of every standpoint, and therefore where coverage is green. */
   labelLift: 1.0,      /* metres a floating name hangs above its object */
+  phoneW: 0.0716,      /* your handset, measured once — a table would only guess */
+  phoneL: 0.1476,
   tolerance: 0.25,     /* metres of position error the survey will accept */
   attSigma: 0.5,       /* degrees of attitude error assumed, 1-sigma */
   deckUnc: 0.08,       /* metres the deck may depart from the assumed plane */
@@ -85,6 +87,21 @@ function save() {
   catch (e) { toast('Storage full — export a backup'); }
 }
 function uid(p) { return (p || 'x') + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+/* Things you can calibrate against when there is no tape to hand.
+
+   A bank card is the standout: ISO/IEC 7810 ID-1 fixes it at 85.60 x 53.98 mm
+   worldwide, to a tighter tolerance than anything else in a pocket — and unlike a
+   phone it needs no lookup and no trust in a spec sheet. All of them are SMALL
+   though, which the quality readout will say plainly: a pocket reference is a
+   rescue, not a plan. Measure your own phone once and it beats any table here. */
+var REF_PRESETS = [
+  { label: 'Bank card', w: 0.0540, l: 0.0856 },
+  { label: 'A4 sheet', w: 0.2100, l: 0.2970 },
+  { label: 'Letter', w: 0.2159, l: 0.2794 },
+  { label: 'My phone', w: null, l: null },      /* filled from settings */
+  { label: 'Paver 24"', w: 0.6096, l: 0.6096 }
+];
 
 var db = load();
 
@@ -949,6 +966,7 @@ function tplCheck(p) {
     (Math.abs(corr - 1) > 1e-9 ? '<br>Already corrected by <b>' + fmtSigned((corr - 1) * 100) + '%</b>.' : '') +
     '</div>' +
     '<button class="btn primary sm" data-act="rescale">Correct the scale</button>' +
+    '<button class="btn ghost-gold sm" data-act="align">Align to the building</button>' +
     '<button class="btn ghost-gold sm" data-act="howto">How to measure well</button></div>' +
     '<div class="panel"><span class="p-tag">TRUSTED RADIUS</span>' +
     '<div class="kv"><span>From where you stand</span><span>' + EE.fmtLen(tr, U(), 1) + '</span></div>' +
@@ -1370,14 +1388,34 @@ function tplTraceCal(st, t) {
         '<div class="hint">Tap the <b>four corners</b> in order, going round.<br>' +
         'Corner <b>' + (n + 1) + ' of 4</b>. Press and drag for the loupe.</div>' + dots(n, 4);
     } else {
-      body = '<div class="row2">' +
+      var q = EE.referenceQuality(t.taps.slice(0, 4), 3);
+      var qCls = { good: 'good', fair: 'gold', poor: 'warn' }[q ? q.verdict : 'poor'];
+      var over = 20;   /* a typical roof span, for making the number concrete */
+
+      var presets = REF_PRESETS.map(function (r, i) {
+        return '<button data-refpreset="' + i + '">' + esc(r.label) + '</button>';
+      }).join('');
+
+      body = '<div class="panel ' + qCls + '"><span class="p-tag">REFERENCE QUALITY</span>' +
+        (q ? '<div class="kv"><span>Shortest edge</span><span>' + Math.round(q.minSpanPx) + ' px</span></div>' +
+          '<div class="kv ' + (q.verdict === 'good' ? 'good' : q.verdict === 'poor' ? 'warn' : '') +
+          '"><span>Scale error it implies</span><span>±' + (q.relScaleErr * 100).toFixed(2) + '%</span></div>' +
+          '<div class="kv"><span>Over ' + EE.fmtLen(over, U(), 0) + ' that is</span><span>±' +
+          EE.fmtLen(over * q.relScaleErr, U(), 2) + '</span></div>' +
+          (q.foreshorten < 0.35 ? '<div class="p-body">Seen at a grazing angle — the corners are ' +
+            'least certain this way. Stand more square to it.</div>' : '') +
+          (q.verdict !== 'good' ? '<div class="p-body">A reference is only as good as the ' +
+            '<b>pixels</b> it spans, not the metres. Fill more of the frame with it, or use ' +
+            'something longer.</div>' : '')
+          : '<div class="p-body">Tap four corners first.</div>') +
+        '</div>' +
+        '<div class="seg tight">' + presets + '</div>' +
+        '<div class="row2">' +
         '<div class="field"><label>WIDTH (first edge)</label><div class="unit-suffix">' +
         '<input class="inp mono" id="ref-w" inputmode="decimal" value="' + esc(t.refW) + '"><span>' + U() + '</span></div></div>' +
         '<div class="field"><label>LENGTH (second edge)</label><div class="unit-suffix">' +
         '<input class="inp mono" id="ref-l" inputmode="decimal" value="' + esc(t.refL) + '"><span>' + U() + '</span></div></div>' +
-        '</div>' +
-        '<div class="hint">No lens data, no tilt, no guessed eye height — this route needs ' +
-        'none of them. It is the accurate one.</div>';
+        '</div>';
     }
     return modeSeg + body +
       '<div class="btn-row">' +
@@ -1464,6 +1502,7 @@ function tplSheet() {
   else if (s.kind === 'scale') inner = sheetScale(s);
   else if (s.kind === 'rescale') inner = sheetRescale(s);
   else if (s.kind === 'howto') inner = sheetHowTo(s);
+  else if (s.kind === 'align') inner = sheetAlign(s);
   else if (s.kind === 'confirm') inner = sheetConfirm(s);
   return '<div class="scrim" data-act="close-sheet"></div><div class="sheet">' + inner + '</div>';
 }
@@ -1641,6 +1680,84 @@ function sheetScale(s) {
     '<div class="btn-row"><button class="btn primary" data-act="save-scale">Save</button></div>';
 }
 
+/* Rooftop units are almost always parallel to the building. When that is true,
+   their rotations are ONE shared unknown rather than N independent ones — so
+   snapping them to a common axis removes an entire error mode instead of merely
+   tidying the drawing. The agreement figure says whether the assumption holds
+   before it is applied. */
+function buildingAxis(p) {
+  var rects = p.objects.filter(function (o) { return o.kind === 'rect'; });
+  if (rects.length < 2) return null;
+  var m = EE.meanAngleMod90(rects.map(function (o) {
+    var po = projObj(p, o);
+    return po ? po.rot : o.rot;
+  }));
+  return m ? { angle: m.angle, agreement: m.agreement, spreadDeg: m.spreadDeg, n: rects.length } : null;
+}
+
+function sheetAlign(s) {
+  var p = currentProject();
+  var ax = buildingAxis(p);
+  if (!ax) {
+    return '<div class="sheet-head"><span class="sh-title">Align to the building</span>' +
+      '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+      '<div class="panel warn"><span class="p-tag">NEED TWO BOXES</span>' +
+      '<div class="p-body">Trace at least two rectangles and Eagle Eye can work out the axis they share.</div></div>';
+  }
+  var good = ax.agreement > 0.9;
+  return '<div class="sheet-head"><span class="sh-title">Align to the building</span>' +
+    '<button class="close-btn" data-act="close-sheet">×</button></div>' +
+    '<div class="p-body">Units on a roof are nearly always parallel to the building. If they are, ' +
+    'their rotations are <b>one</b> unknown rather than ' + ax.n + ' — so snapping them to a shared ' +
+    'axis removes an error rather than just tidying the plan.</div>' +
+    '<div class="panel ' + (good ? 'good' : 'warn') + '">' +
+    '<span class="p-tag">' + (good ? 'THEY AGREE' : 'THEY DISAGREE') + '</span>' +
+    '<div class="kv"><span>Shared axis</span><span>' + (ax.angle * 180 / Math.PI).toFixed(1) + '°</span></div>' +
+    '<div class="kv"><span>Boxes</span><span>' + ax.n + '</span></div>' +
+    '<div class="kv ' + (good ? 'good' : 'warn') + '"><span>Spread</span><span>±' +
+    ax.spreadDeg.toFixed(1) + '°</span></div>' +
+    '<div class="p-body">' + (good
+      ? 'Tight enough that a shared axis is a safe assumption.'
+      : 'Too scattered to be one axis. Either the units really are at different angles, or a ' +
+      'shot is misplaced — check before snapping.') + '</div></div>' +
+    '<label class="chk-line"><input type="checkbox" id="al-round" checked> ' +
+    'Also round dimensions to the nearest ' + (U() === 'ft' ? 'inch' : '5 cm') + '</label>' +
+    '<div class="btn-row"><button class="btn ' + (good ? 'primary' : 'danger') + '" data-act="apply-align">' +
+    'Snap ' + ax.n + ' boxes to ' + (ax.angle * 180 / Math.PI).toFixed(1) + '°</button></div>';
+}
+
+function applyAlign() {
+  var p = currentProject();
+  var ax = buildingAxis(p);
+  if (!ax) return;
+  var roundIt = ($('#al-round') || {}).checked;
+  var stepM = U() === 'ft' ? EE.M_PER_FT / 12 : 0.05;
+  var n = 0;
+
+  p.objects.forEach(function (o) {
+    if (o.kind !== 'rect') return;
+    var st = findStation(p, o.stationId);
+    var t = stationXform(st);
+    /* The axis was measured in the project frame, so it has to come back through
+       the station's own rotation before it is stored. */
+    var target = ax.angle - (t ? t.theta : 0);
+    /* Snap to whichever quarter-turn is nearest, so a unit is not spun 90 deg
+       and left describing its width as its length. */
+    var d = o.rot - target;
+    var k = Math.round(d / (Math.PI / 2));
+    o.rot = target + k * (Math.PI / 2);
+    if (roundIt) {
+      o.w = Math.max(stepM, Math.round(o.w / stepM) * stepM);
+      o.l = Math.max(stepM, Math.round(o.l / stepM) * stepM);
+    }
+    n++;
+  });
+  touchProject(p); save();
+  ui.sheet = null; ui.plan.fitted = false; coverageCache = { key: null, val: null };
+  toast('Snapped ' + n + ' boxes to ' + (ax.angle * 180 / Math.PI).toFixed(1) + '°');
+  render();
+}
+
 function sheetHowTo() {
   var step = function (n, title, body) {
     return '<div class="chk info"><span class="cg">' + n + '</span>' +
@@ -1805,6 +1922,14 @@ function sheetSettings() {
     'rectangle once and Eagle Eye solves it for you.</div>' +
     '<div class="field"><label>DEFAULT CAMERA HEIGHT</label><div class="unit-suffix">' +
     '<input class="inp mono" id="set-camh" inputmode="decimal" value="' + EE.fromM(s.camH, s.unit).toFixed(2) + '"><span>' + s.unit + '</span></div></div>' +
+    '<div class="field"><label>YOUR PHONE, MEASURED (W × L)</label><div class="row2">' +
+    '<div class="unit-suffix"><input class="inp mono" id="set-phw" inputmode="decimal" value="' +
+    EE.fromM(s.phoneW, s.unit).toFixed(4) + '"><span>' + s.unit + '</span></div>' +
+    '<div class="unit-suffix"><input class="inp mono" id="set-phl" inputmode="decimal" value="' +
+    EE.fromM(s.phoneL, s.unit).toFixed(4) + '"><span>' + s.unit + '</span></div></div></div>' +
+    '<div class="hint">Measure the handset itself with a rule — a spec sheet quotes the design ' +
+    'size, and a case changes it. This is the reference of last resort; it is small, so the ' +
+    'calibration screen will tell you what that costs.</div>' +
     '<div class="field"><label>CIRCLE SEGMENTS PER CYLINDER</label>' +
     '<input class="inp mono" id="set-seg" inputmode="numeric" value="' + s.circleSegments + '"></div>' +
     '<div class="field"><label>PHOTO LONG EDGE (PX)</label>' +
@@ -2318,7 +2443,7 @@ function bind() {
        silently inert — the delegated listener never sees it. */
     var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
       '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
-      '[data-station],[data-setheight],[data-chk],[data-rsmode]');
+      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset]');
     if (!el) return;
     handle(el, e);
   };
@@ -2519,6 +2644,15 @@ function handle(el, e) {
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
   if (el.dataset.srmethod) { ui.sheet.method = el.dataset.srmethod; return render(); }
   if (el.dataset.rsmode) { ui.sheet.mode = el.dataset.rsmode; return render(); }
+  if (el.dataset.refpreset) {
+    var r = REF_PRESETS[parseInt(el.dataset.refpreset, 10)];
+    var w = r.w == null ? db.settings.phoneW : r.w;
+    var l = r.l == null ? db.settings.phoneL : r.l;
+    if (!(w > 0) || !(l > 0)) { toast('Measure your phone in Settings first'); return; }
+    ui.trace.refW = EE.fromM(w, U()).toFixed(4);
+    ui.trace.refL = EE.fromM(l, U()).toFixed(4);
+    return render();
+  }
   if (el.dataset.station) return openStation(el.dataset.station);
   if (el.dataset.object) { ui.sel = el.dataset.object; ui.sheet = { kind: 'object', id: el.dataset.object }; return render(); }
   if (el.dataset.setheight) {
@@ -2569,6 +2703,8 @@ function handle(el, e) {
     case 'save-scale': return saveScaleRef();
     case 'rescale': ui.sheet = { kind: 'rescale', mode: 'object' }; return render();
     case 'howto': ui.sheet = { kind: 'howto' }; return render();
+    case 'align': ui.sheet = { kind: 'align' }; return render();
+    case 'apply-align': return applyAlign();
     case 'apply-rescale': return applyRescale();
     case 'undo-rescale': {
       var log = p.scaleLog || [];
@@ -2702,6 +2838,10 @@ function saveSettings() {
   if (seg >= 6 && seg <= 128) s.circleSegments = seg;
   var mp = parseInt($('#set-maxpx').value, 10);
   if (mp >= 640 && mp <= 4032) s.maxPx = mp;
+  var pw = EE.toM(parseFloat(($('#set-phw') || {}).value), s.unit);
+  var pl = EE.toM(parseFloat(($('#set-phl') || {}).value), s.unit);
+  if (pw > 0.02 && pw < 0.3) s.phoneW = pw;
+  if (pl > 0.02 && pl < 0.4) s.phoneL = pl;
   save(); ui.sheet = null; toast('Settings saved'); render();
 }
 

@@ -262,6 +262,44 @@ gaps are shaded on the deck where they actually are, so you can walk to them.
 
 The yaw slider exists because iOS `alpha` drifts; nudge until the wireframe lines up.
 
+## A reference is measured in pixels, not metres
+
+The most consequential number in a calibration, and the least obvious. A reference does not
+fix scale in metres — it fixes the **ratio** of real length to pixel length. So the error in
+that ratio is your tap error divided by how many **pixels** the reference spans.
+
+A finger lands within ~3 px with the loupe. Measured at 2.2 m range:
+
+| reference | pixels spanned | scale error | over a 20 m roof |
+|---|---|---|---|
+| 2.4 m kerb | ~240 | ±1.3% | ±0.25 m |
+| bank card | ~12 | ±25% | ±4.9 m |
+| bank card, stepped 10× | — | ±7.8% | ±1.6 m |
+
+Metres are a red herring: a small object held close to the lens can span more pixels than a
+long one across the roof. **Fill the frame with the reference.** The calibration screen shows
+the pixel span, the implied scale error, and what that costs over 20 m, live — so a bad
+reference is visible while you can still retake the shot.
+
+Presets cover a bank card (ISO/IEC 7810 ID-1 fixes it at 85.60 × 53.98 mm worldwide, tighter
+than any spec sheet), A4, Letter, a 24″ paver, and your own phone measured once in Settings.
+They are a rescue, not a plan.
+
+Stepping a short reference end to end helps, but slowly: length grows as *n* while placement
+error grows as √*n*, so relative error improves only as 1/√*n*.
+
+## Locking things down
+
+Redundancy beats precision, and the cheapest redundancy on a roof is an assumption you can
+check. **Check → Align to the building** finds the axis your rectangles share and reports how
+well they agree before snapping them to it.
+
+When units really are parallel to the building — nearly always — their rotations are **one**
+unknown rather than *N*, so this removes an error mode rather than tidying the drawing. The
+mean is taken modulo 90°, because 1° and 89° describe the same alignment of a rectangle and
+averaging them naively answers 45° and spins every unit on the roof. If the spread is wide,
+it says so and does not pretend: either the units genuinely differ, or a shot is misplaced.
+
 ## Scale is an input, not an output
 
 Every length rides on one measured distance, and no amount of photography recovers it —
@@ -319,7 +357,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 189 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 213 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

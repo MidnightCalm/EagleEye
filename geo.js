@@ -176,6 +176,83 @@ var EE = (function () {
     return [{ x: 0, y: 0 }, { x: w, y: 0 }, { x: w, y: l }, { x: 0, y: l }];
   }
 
+  /* ================= how good is that reference? =================
+
+     The single most consequential number in a calibration, and the one nobody
+     thinks about: a reference does not fix scale in metres, it fixes scale as a
+     RATIO of real length to pixel length. So the error in that ratio is the tap
+     error divided by how many PIXELS the reference spans — not how many metres.
+
+     A finger lands within about 3 px with the loupe. Across a kerb spanning
+     800 px that is 0.4%. Across a phone spanning 120 px it is 2.5%, and that 2.5%
+     multiplies every dimension in the survey and doubles on every area.
+
+     Metres are a red herring: a short reference held close to the lens can span
+     more pixels than a long one across the roof. Pixels are what count. */
+  function referenceQuality(quadPix, tapErrPx) {
+    if (!quadPix || quadPix.length < 4) return null;
+    var tap = tapErrPx > 0 ? tapErrPx : 3;
+
+    var spans = [];
+    for (var i = 0; i < 4; i++) {
+      var a = quadPix[i], b = quadPix[(i + 1) % 4];
+      spans.push(Math.hypot(b.x - a.x, b.y - a.y));
+    }
+    var minSpan = Math.min.apply(null, spans);
+    var maxSpan = Math.max.apply(null, spans);
+    if (!(minSpan > 0)) return null;
+
+    /* The shortest edge sets the worst-conditioned direction, so it governs. */
+    var relScaleErr = tap / minSpan;
+
+    /* Foreshortening: opposite edges of a rectangle project to equal lengths only
+       when it is viewed square-on. A large disparity means the quad is being read
+       at a grazing angle, where corner positions are least certain. */
+    var squash = Math.min(spans[0], spans[2]) / Math.max(spans[0], spans[2]);
+    var squash2 = Math.min(spans[1], spans[3]) / Math.max(spans[1], spans[3]);
+    var foreshorten = Math.min(squash, squash2);
+
+    return {
+      minSpanPx: minSpan,
+      maxSpanPx: maxSpan,
+      relScaleErr: relScaleErr,
+      foreshorten: foreshorten,
+      verdict: relScaleErr <= 0.005 && foreshorten >= 0.45 ? 'good'
+        : relScaleErr <= 0.02 && foreshorten >= 0.25 ? 'fair' : 'poor'
+    };
+  }
+
+  /* Laying a short reference end to end n times: the length grows as n while the
+     placement error grows only as sqrt(n), so the relative error improves as
+     1/sqrt(n). Ten placements of a phone beat one by roughly three times. */
+  function steppedReferenceError(singleRelErr, n) {
+    if (!(n > 0)) return Infinity;
+    return singleRelErr / Math.sqrt(n);
+  }
+
+  /* Circular mean of angles whose period is 90 degrees.
+
+     Rooftop units are almost always parallel to the building, so their rotations
+     are one shared unknown rather than N independent ones. Averaging them
+     directly is wrong — 1 degree and 89 degrees describe the same alignment of a
+     rectangle. Mapping through 4x makes the period come out right, and the
+     resultant length doubles as a measure of how well they actually agree. */
+  function meanAngleMod90(angles) {
+    if (!angles || !angles.length) return null;
+    var sx = 0, sy = 0;
+    for (var i = 0; i < angles.length; i++) {
+      sx += Math.cos(4 * angles[i]);
+      sy += Math.sin(4 * angles[i]);
+    }
+    var r = Math.hypot(sx, sy) / angles.length;
+    if (r < 1e-9) return null;
+    var m = Math.atan2(sy, sx) / 4;
+    while (m > Math.PI / 4) m -= Math.PI / 2;
+    while (m < -Math.PI / 4) m += Math.PI / 2;
+    /* Circular standard deviation, mapped back through the same 4x. */
+    return { angle: m, agreement: r, spreadDeg: Math.sqrt(-2 * Math.log(Math.max(1e-12, r))) / 4 / DEG };
+  }
+
   /* ================= device attitude ================= */
 
   /* W3C device orientation is an intrinsic Z-X'-Y'' Tait-Bryan triple. The
@@ -1145,6 +1222,8 @@ var EE = (function () {
     solveLinear: solveLinear, mul3: mul3, invert3: invert3, applyM3: applyM3, transpose3: transpose3,
     homographyFromQuad: homographyFromQuad, applyH: applyH, rectRefCorners: rectRefCorners,
     det3: det3, orientH: orientH, homographyFromPose: homographyFromPose,
+    referenceQuality: referenceQuality, steppedReferenceError: steppedReferenceError,
+    meanAngleMod90: meanAngleMod90,
     jacobianAtPixel: jacobianAtPixel, gsdAtPixel: gsdAtPixel, wForGsd: wForGsd,
     clipHalfPlane: clipHalfPlane, frameFootprint: frameFootprint,
     rotFromOrientation: rotFromOrientation, focalFromFov: focalFromFov,
