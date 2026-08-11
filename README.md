@@ -289,6 +289,19 @@ Every measurement path uses the reading once it exists — ray casting, the pose
 reprojection, and the height tool. With no reading, the deck is assumed level exactly as
 before.
 
+## The horizon trim
+
+Phone pitch sensors genuinely carry a per-device bias — a degree or three from assembly
+tolerance, more with a case; it is why Apple's own Measure app has a recalibration flow. At
+this geometry one degree of pitch is ~30 cm of range error at 5 m, so it matters.
+
+The **▲ / ▼ horizon** steppers (calibrate and trace screens, 0.2° per tap) nudge the drawn
+horizon until it sits on the real one — and on a roof the real horizon is always visible,
+which makes eyeballing it a genuinely good calibration. The trim is stored per device and
+applied to **every** attitude the geometry consumes: shots, the live HUD, and the deck
+levelling. Verified: a sensor lying by 1° distorts a true 0.5 m square to 0.516 × 0.529;
+trim −1° restores 0.500 × 0.500 exactly. Roll trim lives in the tilt-mode diagnostics.
+
 ## Corner snapping
 
 **On by default**, toggled in the trace toolbar. A finger is about 3 px honest even with the

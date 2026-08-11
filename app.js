@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.13.0';
+var VERSION = '1.14.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -62,6 +62,8 @@ var DEFAULTS = {
   /* The survey's declared error model. These three numbers decide the trusted
      radius of every standpoint, and therefore where coverage is green. */
   labelLift: 1.0,      /* metres a floating name hangs above its object */
+  pitchTrim: 0,        /* degrees added to every sensor pitch — a per-device bias knob */
+  rollTrim: 0,
   phoneW: 0.0716,      /* your handset, measured once — a table would only guess */
   phoneL: 0.1476,
   tolerance: 0.25,     /* metres of position error the survey will accept */
@@ -270,7 +272,7 @@ function ensureOrigin(p) {
 function calMap(st) {
   var c = st && st.cal;
   if (!c || !c.ok) return null;
-  var R = st.att ? EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma) : null;
+  var R = st.att ? attMatrix(st.att) : null;
 
   if (c.mode === 'quad') {
     var Hi = EE.invert3(c.H);
@@ -370,7 +372,7 @@ function calibrateQuad(st, quadPix, refW, refL) {
   }
 
   if (st.att) {
-    var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var R = attMatrix(st.att);
     var unit = quadPix.map(function (q) {
       return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, effAngle(st)), R, 1, 0, deckNormalOf(st));
     });
@@ -448,7 +450,7 @@ function calibrateFromMap(st, pixPts, lls) {
   /* Recover the camera pose the same way the tape route does, so the height tool
      and the coverage model keep working. */
   if (st.att) {
-    var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var R = attMatrix(st.att);
     var unit = cal.quadPix.map(function (q) {
       return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, effAngle(st)),
         R, 1, 0, deckNormalOf(st));
@@ -539,7 +541,8 @@ function tickLevel() {
     var mid = l.samples[Math.floor(l.samples.length / 2)];
     var p = currentProject();
     p.deck = {
-      n: EE.normalFromAttitude(mid.a, mid.b, mid.g, l.faceDown),
+      n: EE.normalFromAttitude(mid.a, mid.b + (db.settings.pitchTrim || 0),
+        mid.g + (db.settings.rollTrim || 0), l.faceDown),
       faceDown: l.faceDown, spreadDeg: spread, at: now
     };
     p.deck.tiltDeg = EE.deckTiltDeg(p.deck.n);
@@ -621,7 +624,7 @@ function stationH(st) {
   if (!c || !c.ok) return null;
   if (c.mode === 'quad') return c.H;
   if (!st.att) return null;
-  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+  var R = attMatrix(st.att);
   return EE.homographyFromPose(R, c.camH, c.f, st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
 }
 
@@ -635,6 +638,17 @@ function stationH(st) {
    the drawn horizon. */
 function effAngle(st) {
   return (((st && st.screenAngle) || 0) + ((st && st.angleFix) || 0) + 360) % 360;
+}
+
+/* Every attitude the geometry consumes passes through here, so a per-device
+   sensor bias has exactly one knob. Phone pitch sensors genuinely carry one —
+   a degree or three from assembly tolerance, more with a case — and at this
+   geometry one degree of pitch is ~30 cm of range error at 5 m. The trim is
+   eyeballed against a visible horizon, which on a roof is always available. */
+function attMatrix(a) {
+  return EE.rotFromOrientation(a.alpha,
+    a.beta + (db.settings.pitchTrim || 0),
+    a.gamma + (db.settings.rollTrim || 0));
 }
 
 /* Where the camera stood, in that station's own frame.
@@ -1629,7 +1643,7 @@ function paintLive() {
 
   var camH = st.cal.camH || db.settings.camH;
   var f = EE.focalFromFov(db.settings.fov, Math.max(W, H));
-  var R = EE.rotFromOrientation(ui.sensors.alpha, ui.sensors.beta, ui.sensors.gamma);
+  var R = attMatrix(ui.sensors);
   var Hm = EE.homographyFromPose(R, camH, f, W, H, screenAngle(), deckNormalOf(st));
   var Hi = Hm && EE.invert3(Hm);
   if (!Hi) return;
@@ -1782,6 +1796,20 @@ function tplTraceCal(st, t) {
     '<button class="' + (t.calMode === 'ray' ? 'active' : '') + '" data-calmode="ray">Tilt + height</button>' +
     '</div>';
 
+  /* The manual horizon offset. ▲ moves the drawn horizon UP the image, which
+     means the sensor was reading the phone as more upright than it is. Stored
+     per device, applied to every attitude everywhere. */
+  if (st.att) {
+    modeSeg += '<div class="live-row" style="justify-content:center">' +
+      '<button class="pill tiny" data-act="trim-pitch" data-d="-1">▲ horizon</button>' +
+      '<span class="pill tiny' + (db.settings.pitchTrim ? ' gold' : '') + '">trim ' +
+      fmtSigned(db.settings.pitchTrim || 0) + '°</span>' +
+      '<button class="pill tiny" data-act="trim-pitch" data-d="1">▼ horizon</button>' +
+      ((db.settings.pitchTrim || db.settings.rollTrim)
+        ? '<button class="pill tiny" data-act="trim-reset">reset</button>' : '') +
+      '</div>';
+  }
+
   if (t.calMode === 'ball') {
     if (!st.att) {
       return modeSeg +
@@ -1818,10 +1846,19 @@ function tplTraceCal(st, t) {
         '</div>';
     }
 
+    var offDeg = 0;
+    if (bn >= 1) {
+      var fOff = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+      offDeg = Math.atan(Math.abs(t.taps[0].x - st.imgW / 2) / fOff) * 180 / Math.PI;
+    }
     return modeSeg +
-      '<div class="hint">Every ball is the same ball — <b>42.67 mm</b> is written into the rules — ' +
-      'and a sphere reads identically from any angle. The plane comes from gravity; the ball only ' +
-      'supplies the length.</div>' +
+      '<div class="hint">Every ball is the same ball — <b>42.67 mm</b> is written into the rules. ' +
+      'A slightly <b>oval</b> look away from the frame centre is expected (a sphere\'s silhouette ' +
+      'stretches radially off-axis); only the <b>level width across</b> is measured, so keep the ' +
+      'ball near the vertical midline and the oval costs nothing.</div>' +
+      (offDeg > 14 ? '<div class="panel warn"><span class="p-tag">BALL FAR OFF-CENTRE</span>' +
+        '<div class="p-body">It sits ' + offDeg.toFixed(0) + '° off the vertical midline, where the ' +
+        'sideways stretch starts leaking into the width. Recompose with the ball nearer the middle.</div></div>' : '') +
       body +
       (bn >= 2 ? '<div class="field"><label>BALL DIAMETER</label><div class="unit-suffix">' +
         '<input class="inp mono" id="ball-dia" inputmode="decimal" value="' +
@@ -2003,7 +2040,13 @@ function tplTraceCal(st, t) {
     '<div class="seg tight">' + [0, 90, 180, 270].map(function (a) {
       return '<button class="' + ((st.angleFix || 0) === a ? 'active' : '') + '" data-anglefix="' + a + '">' +
         (a === 0 ? 'none' : a + '°') + '</button>';
-    }).join('') + '</div></div>';
+    }).join('') + '</div>' +
+    '<div class="live-row" style="justify-content:center">' +
+    '<button class="pill tiny" data-act="trim-roll" data-d="-1">⟲ level</button>' +
+    '<span class="pill tiny' + (db.settings.rollTrim ? ' gold' : '') + '">roll trim ' +
+    fmtSigned(db.settings.rollTrim || 0) + '°</span>' +
+    '<button class="pill tiny" data-act="trim-roll" data-d="1">⟳ level</button>' +
+    '</div></div>';
   /* Pocket-sized known lengths. The golf ball is the odd one out and the
      interesting one: its visible rim sits one radius above the deck, and layover
      makes the two-tap solve return exactly h - r — so picking it arms a +21.3 mm
@@ -2077,6 +2120,10 @@ function tplTraceDraw(p, st, t) {
     '⌖ Corner snap ' + (db.settings.cornerSnap ? 'on' : 'off') + '</button>' +
     (t.lastSnap != null ? '<span class="pill tiny" style="color:var(--green);border-color:rgba(110,210,154,.5)">' +
       'snapped ' + t.lastSnap.toFixed(0) + ' px</span>' : '') +
+    (st.att ? '<button class="pill tiny" data-act="trim-pitch" data-d="-1">▲</button>' +
+      '<span class="pill tiny' + (db.settings.pitchTrim ? ' gold' : '') + '">horizon ' +
+      fmtSigned(db.settings.pitchTrim || 0) + '°</span>' +
+      '<button class="pill tiny" data-act="trim-pitch" data-d="1">▼</button>' : '') +
     '</div>' +
     (unreg ? '<div class="panel warn"><span class="p-tag">SHOT NOT PLACED</span>' +
       '<div class="p-body">Mark <b>two landmarks</b> that already exist in the survey (' +
@@ -3006,7 +3053,7 @@ function paintTrace() {
   var calH = map ? (st.cal.mode === 'quad' ? st.cal.H : stationH(st)) : null;
   var calAng = null, gravAng = null;
   if (st.att) {
-    var Rg = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var Rg = attMatrix(st.att);
     var fg = (st.cal && st.cal.f) || EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
     var Hg = EE.homographyFromPose(Rg, 1, fg, st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
     gravAng = drawHorizon(EE.horizonLine(Hg, st.imgW, st.imgH),
@@ -3696,6 +3743,17 @@ function handle(el, e) {
     case 'toggle-diag': ui.trace.showDiag = !ui.trace.showDiag; return render();
     case 'swap-ref': ui.trace.refSwap = !ui.trace.refSwap; return render();
     case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
+    case 'trim-pitch': {
+      var dtp = parseFloat(el.dataset.d) * 0.2;
+      db.settings.pitchTrim = Math.max(-6, Math.min(6, +(((db.settings.pitchTrim || 0) + dtp).toFixed(1))));
+      save(); return render();
+    }
+    case 'trim-roll': {
+      var dtr = parseFloat(el.dataset.d) * 0.2;
+      db.settings.rollTrim = Math.max(-4, Math.min(4, +(((db.settings.rollTrim || 0) + dtr).toFixed(1))));
+      save(); return render();
+    }
+    case 'trim-reset': db.settings.pitchTrim = 0; db.settings.rollTrim = 0; save(); return render();
     case 'level-up': return startLevel(false);
     case 'level-down': return startLevel(true);
     case 'level-cancel': clearInterval(ui.levelTimer); ui.level = null; return render();
@@ -4115,7 +4173,7 @@ function applyQuad() {
      calibration produced a horizon through the floor for anyone who had not yet
      calibrated on something big - which is everyone, on day one. */
   if (small && st.att) {
-    var Rp = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+    var Rp = attMatrix(st.att);
     var fp = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
     var unit = quad.map(function (qp) {
       return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fp, effAngle(st)),
@@ -4239,7 +4297,7 @@ function applyBall() {
   if (!(xR - xL > 6)) return toast('That circle is too small to measure — get closer');
 
   var f = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
-  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+  var R = attMatrix(st.att);
   var a = EE.rayForPixel(xL, cyRow, st.imgW, st.imgH, f, effAngle(st));
   var b = EE.rayForPixel(xR, cyRow, st.imgW, st.imgH, f, effAngle(st));
   var solved = EE.camHeightFromKnown(a, b, R, D, deckNormalOf(st));
@@ -4252,6 +4310,7 @@ function applyBall() {
     mode: 'ray', camH: solved, f: f, ok: true, source: 'ball',
     provisionalScale: !db.settings.fovAt
   };
+  db.settings.camH = solved;
   touchProject(p); save();
   coverageCache = { key: null, val: null };
 
@@ -4305,7 +4364,7 @@ function applyRay() {
   if (!st.att) return toast('This shot has no tilt recorded');
 
   var f = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
-  var R = EE.rotFromOrientation(st.att.alpha, st.att.beta, st.att.gamma);
+  var R = attMatrix(st.att);
   var camH = EE.toM(parseFloat($('#cam-h').value), U());
 
   var knownEl = $('#known-len');
