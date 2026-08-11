@@ -1019,27 +1019,55 @@ var EE = (function () {
         gray[i + w] * (1 - fx) * fy + gray[i + w + 1] * fx * fy;
     };
 
-    /* Strongest edge crossing along one spoke, searched around radius rc. */
-    var edgeAlong = function (cx, cy, ang, rc) {
-      var ca = Math.cos(ang), sa = Math.sin(ang);
-      var lo = 0.55 * rc, hi = 1.55 * rc, step = 0.5;
-      var vals = [];
-      for (var r = lo; r <= hi; r += step) vals.push(bil(cx + ca * r, cy + sa * r));
-      if (vals.length < 5) return null;
-      var bi = -1, bg = 0;
-      for (var k = 1; k < vals.length - 1; k++) {
-        var g = Math.abs(vals[k + 1] - vals[k - 1]);
-        if (g > bg) { bg = g; bi = k; }
+    /* Where does this spoke cross from ball-coloured to background-coloured?
+
+       Chasing the strongest gradient was the first design and the field killed
+       it: on carpet, the strongest gradient along a spoke is a carpet fibre, and
+       the ball's own rim — soft with defocus and bloom — loses the contest. So
+       instead: measure what the inside and the outside actually look like, and
+       find the FIRST sustained crossing of their midpoint walking outward. A
+       dimple never crosses the midpoint; a fibre beyond the rim is never reached,
+       because the walk stops at the first crossing. */
+    var innerOuter = function (cx, cy, rc) {
+      var inn = [], out = [];
+      for (var i3 = 0; i3 < 24; i3++) {
+        var a3 = i3 / 24 * 2 * Math.PI, c3 = Math.cos(a3), s3 = Math.sin(a3);
+        inn.push(bil(cx + c3 * rc * 0.20, cy + s3 * rc * 0.20));
+        inn.push(bil(cx + c3 * rc * 0.42, cy + s3 * rc * 0.42));
+        out.push(bil(cx + c3 * rc * 1.32, cy + s3 * rc * 1.32));
+        out.push(bil(cx + c3 * rc * 1.55, cy + s3 * rc * 1.55));
       }
-      /* Below this the "edge" is sensor noise, and refusing beats guessing. */
-      if (bi < 1 || bg < 18) return null;
-      var g0 = Math.abs(vals[bi] - vals[bi - 2 >= 0 ? bi - 2 : 0]);
-      var g1 = bg;
-      var g2 = Math.abs(vals[bi + 2 <= vals.length - 1 ? bi + 2 : vals.length - 1] - vals[bi]);
-      var den = g0 - 2 * g1 + g2;
-      var d = Math.abs(den) > 1e-9 ? 0.5 * (g0 - g2) / den : 0;
-      if (d > 1) d = 1; if (d < -1) d = -1;
-      return { r: lo + (bi + d) * step, g: bg };
+      inn.sort(function (a4, b4) { return a4 - b4; });
+      out.sort(function (a4, b4) { return a4 - b4; });
+      return { inner: inn[Math.floor(inn.length / 2)], outer: out[Math.floor(out.length / 2)] };
+    };
+
+    var model = null;   /* set per pass */
+
+    var edgeAlong = function (cx, cy, ang, rc) {
+      if (!model) return null;
+      var ca = Math.cos(ang), sa = Math.sin(ang);
+      var lo = 0.45 * rc, hi = 1.60 * rc, step = 0.5;
+      var mid = (model.inner + model.outer) / 2;
+      var sign = model.outer > model.inner ? 1 : -1;   /* which side of mid is "outside" */
+      var wasInside = false, prevV = null, prevR = null;
+      for (var r = lo; r <= hi; r += step) {
+        var v = bil(cx + ca * r, cy + sa * r);
+        var inside = sign * (v - mid) < 0;
+        if (inside) wasInside = true;
+        else if (wasInside && prevV != null) {
+          /* confirm it stays outside for one more step — a single noisy sample
+             must not read as the rim */
+          var v2 = bil(cx + ca * (r + step), cy + sa * (r + step));
+          if (sign * (v2 - mid) >= 0) {
+            var f = (mid - prevV) / (v - prevV);
+            if (!isFinite(f) || f < 0) f = 0; if (f > 1) f = 1;
+            return { r: prevR + f * step, g: Math.abs(model.outer - model.inner) };
+          }
+        }
+        prevV = v; prevR = r;
+      }
+      return null;
     };
 
     var N = 48;
@@ -1050,6 +1078,9 @@ var EE = (function () {
        the whole pass is run again from the refined centre, where the spokes are
        symmetric. Two passes settle it. */
     var collectAndFit = function (cx, cy, rc) {
+      model = innerOuter(cx, cy, rc);
+      /* No contrast, no ball. Refusing beats guessing. */
+      if (Math.abs(model.inner - model.outer) < 20) return null;
       var pts = [];
       for (var i2 = 0; i2 < N; i2++) {
         var ang = i2 / N * 2 * Math.PI;
@@ -1081,6 +1112,11 @@ var EE = (function () {
     if (!fit) return null;
     var fitB = collectAndFit(fit.cx, fit.cy, fit.r);
     if (fitB) fit = fitB;
+    /* The field caught a fit that reported success with 3 of 48 spokes in
+       agreement — the fit stage demanded half the spokes find SOME edge, but
+       never demanded they agree with the answer. A lock most spokes disagree
+       with is not a lock. */
+    if (fit.n < N * 0.45) return null;
     var rms = fit.rms;
 
     /* The measurement itself: left and right rim, probed from the refined centre. */

@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     302 assertions over geo.js — open it in a browser
+    ├── test-geo.html     307 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -289,6 +289,27 @@ Every measurement path uses the reading once it exists — ray casting, the pose
 reprojection, and the height tool. With no reading, the deck is assumed level exactly as
 before.
 
+## The sensor check — the Measure-style calibration
+
+**Check → deck panel → Read + sensor check.** Lay the phone screen-down on the deck, let it
+settle, then spin it half a turn flat when it buzzes. The true deck slope reverses in the
+device frame under the spin; a sensor bias does not — so half the sum is your phone's bias
+and half the difference is the real slope. It is the same trick Apple's Measure uses. The
+trims are then **set from measurement, not eyeballed**, and the stored deck plane has the
+bias removed. Verified: a sensor lying by +1.6°/−0.7° is measured to a tenth of a degree, and
+a 0.5 m square then traces 0.5000 × 0.5000 through the corrected pipeline. A "bias" over 8°
+is refused — that is not a sensor, that is a magnetic case or a moving surface.
+
+**The shutter tap was the other horizon-killer.** Tapping the shutter rocks the phone about
+your grip — the top tips back, the sensor reads more upright at exactly the instant the
+attitude was sampled, and every horizon drawn from that shot sits too low: precisely the
+symptom reported from the field. Shots now carry the median attitude from a window ending
+120 ms *before* the tap, and warn when the phone was moving fast at the shutter.
+
+An off-frame horizon now says so — "⇡ N px above the photo" — instead of pinning its label
+to the top of the screen, which read as a wildly wrong calibration when it was actually a
+steep close-up behaving correctly.
+
 ## The horizon trim
 
 Phone pitch sensors genuinely carry a per-device bias — a degree or three from assembly
@@ -485,7 +506,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 302 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 307 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

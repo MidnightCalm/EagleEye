@@ -529,6 +529,47 @@ function near(name, a, b, tol) {
   for (var i = 0; i < blank.length; i++) blank[i] = 128;
   ok('a blank patch yields nothing', EE.refineCircleEdge(blank, W, HH, 64, 64, 20) === null);
   ok('a tiny seed yields nothing', EE.refineCircleEdge(mkDisk(64, 64, 24, 24, 0, false), W, HH, 64, 64, 3) === null);
+
+  /* THE FIELD CASE. A real ball on real carpet defeated the old max-gradient
+     detector: carpet fibre contrast out-gradients a soft, defocused rim, and
+     dimples add strong gradients inside the ball. It shipped a "lock" that only
+     3 of 48 spokes agreed with. This scene reproduces all three conditions. */
+  var mkField = function (cx, cy, r) {
+    var g = new Float32Array(W * HH);
+    var cl = function (v) { return v < 0 ? 0 : v > 1 ? 1 : v; };
+    for (var y = 0; y < HH; y++) for (var x = 0; x < W; x++) {
+      var d = Math.hypot(x - cx, y - cy);
+      /* carpet: strong high-frequency hash, ±45 about 120 */
+      var carpet = 120 + ((x * 7919 + y * 104729) % 91 - 45);
+      /* ball: bright, with dimples — smooth ±14 wobble */
+      var ball = 228 + 14 * Math.sin(x * 1.7) * Math.cos(y * 1.9);
+      /* soft rim: 2.6 px transition, like defocus + bloom */
+      var t = cl((r - d) / 2.6 + 0.5);
+      g[y * W + x] = carpet * (1 - t) + ball * t;
+    }
+    return g;
+  };
+  var ff = EE.refineCircleEdge(mkField(60.4, 58.7, 24.3), W, HH, 63, 55, 20);
+  ok('locks a soft rim against carpet and dimples', !!ff, 'null');
+  ok('with broad spoke agreement, not 3 of 48', ff.n >= 34, ff.n + ' of 48');
+  near('centre within a pixel', Math.hypot(ff.cx - 60.4, ff.cy - 58.7), 0, 1.0);
+  near('width within 1.5 px on a 2.6 px-soft rim', ff.dh, 48.6, 1.5);
+
+  /* Clutter with no ball at all: scattered dark blobs. The missing gate — a fit
+     only a few spokes agree with must be refused, not reported as a lock. */
+  var mkClutter = function () {
+    var g = new Float32Array(W * HH);
+    for (var y = 0; y < HH; y++) for (var x = 0; x < W; x++) {
+      var v = 200;
+      for (var b2 = 0; b2 < 6; b2++) {
+        var bx = 20 + (b2 * 37) % 90, by = 15 + (b2 * 53) % 95;
+        if (Math.hypot(x - bx, y - by) < 7) v = 70;
+      }
+      g[y * W + x] = v + ((x * 31 + y * 57) % 9 - 4);
+    }
+    return g;
+  };
+  ok('scattered clutter with no ball is refused', EE.refineCircleEdge(mkClutter(), W, HH, 64, 60, 22) === null);
 })();
 
 /* ---- reference quality: pixels, not metres ---- */

@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.14.0';
+var VERSION = '1.15.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -359,7 +359,7 @@ function calibrateQuad(st, quadPix, refW, refL) {
   var H = EE.homographyFromQuad(quadPix, ref);
   if (!H) return { ok: false, err: 'Those four points do not form a usable quad — retake them further apart.' };
 
-  var cal = { mode: 'quad', H: H, quadPix: quadPix, refW: refW, refL: refL, f: EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH)), ok: true };
+  var cal = { mode: 'quad', H: H, quadPix: quadPix, refW: refW, refL: refL, f: stationF(st), ok: true };
 
   /* The lens, straight out of the same four corners. No attitude, no search.
      Whatever Safari actually handed us — main, ultra-wide, cropped — this is its
@@ -436,7 +436,7 @@ function calibrateFromMap(st, pixPts, lls) {
   var cal = {
     mode: 'quad', H: H, quadPix: pixPts.slice(0, 4),
     refW: spread, refL: spread,
-    f: EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH)),
+    f: stationF(st),
     ok: true, source: 'map', originLL: origin, spread: spread
   };
 
@@ -493,10 +493,67 @@ function levelSamples() {
    wait after you have finished. Stillness is the thing that actually matters, so
    watch for it: once the attitude has held within a fraction of a degree for a
    second and a half, take the reading. */
-function startLevel(faceDown) {
+/* Gravity seen from inside the phone, raw — the bias must not be pre-corrected
+   when the point is to measure it. */
+function gravityDev(a, b, g2) {
+  return EE.applyM3(EE.transpose3(EE.rotFromOrientation(a, b, g2)), [0, 0, -1]);
+}
+
+/* The sensor check: read the deck, spin the phone half a turn flat, read again.
+   The true deck slope reverses in the device frame under the spin; a sensor bias
+   does not. Half the sum is the bias, half the difference is the slope — the
+   same trick Apple's Measure uses to calibrate, and the reason its level asks
+   you to flip the phone. Sets the trims from measurement instead of eyeballing,
+   and stores the bias-free deck plane. */
+function finishFlipCheck(l, mid, now) {
+  var p = currentProject();
+  var g1 = l.phase1.gdev, g2v = gravityDev(mid.a, mid.b, mid.g);
+  var bias = [(g1[0] + g2v[0]) / 2, (g1[1] + g2v[1]) / 2];
+
+  /* Convert the device-frame gravity bias into Euler trims numerically, at the
+     phase-1 attitude — convention-proof, no small-angle sign gymnastics. */
+  var a1 = l.phase1.att;
+  var base = gravityDev(a1.a, a1.b, a1.g);
+  var hstep = 0.25;
+  var db1 = gravityDev(a1.a, a1.b + hstep, a1.g);
+  var dg1 = gravityDev(a1.a, a1.b, a1.g + hstep);
+  var J = [(db1[0] - base[0]) / hstep, (dg1[0] - base[0]) / hstep,
+           (db1[1] - base[1]) / hstep, (dg1[1] - base[1]) / hstep];
+  var det = J[0] * J[3] - J[1] * J[2];
+  if (Math.abs(det) < 1e-9) { toast('Sensor check failed to solve — try again'); return false; }
+  var dBeta = (J[3] * bias[0] - J[1] * bias[1]) / det;
+  var dGamma = (-J[2] * bias[0] + J[0] * bias[1]) / det;
+
+  var biasTilt = Math.hypot(dBeta, dGamma);
+  if (biasTilt > 8) {
+    toast('Sensor check read a ' + biasTilt.toFixed(1) + '° bias — that is beyond any normal sensor. Check for a magnetic case, and retry on a truly still surface.');
+    return false;
+  }
+
+  db.settings.pitchTrim = +(-dBeta).toFixed(2);
+  db.settings.rollTrim = +(-dGamma).toFixed(2);
+  db.settings.biasMeasured = { p: +dBeta.toFixed(2), r: +dGamma.toFixed(2), at: now };
+
+  /* The deck plane, with the bias removed: recompute the phase-1 reading through
+     the freshly set trims — exactly the path every future shot will use. */
+  p.deck = {
+    n: EE.normalFromAttitude(a1.a, a1.b + db.settings.pitchTrim,
+      a1.g + db.settings.rollTrim, l.faceDown),
+    faceDown: l.faceDown, spreadDeg: l.spread || 0, at: now, checked: true
+  };
+  p.deck.tiltDeg = EE.deckTiltDeg(p.deck.n);
+  touchProject(p); save();
+  buzz([40, 60, 40, 60, 40]);
+  toast('Sensor bias ' + fmtSigned(dBeta) + '° pitch, ' + fmtSigned(dGamma) +
+    '° roll — trims set. Deck ' + p.deck.tiltDeg.toFixed(2) + '° off level.');
+  return true;
+}
+
+function startLevel(faceDown, check) {
   var go = function () {
     clearInterval(ui.levelTimer);
-    ui.level = { faceDown: !!faceDown, samples: [], started: Date.now(), spread: null, held: 0 };
+    ui.level = { faceDown: !!faceDown, check: !!check, phase: 1, phase1: null,
+      samples: [], started: Date.now(), spread: null, held: 0 };
     ui.levelTimer = setInterval(tickLevel, 100);
     render();
   };
@@ -537,8 +594,34 @@ function tickLevel() {
   l.held = (spread < LEVEL_SPREAD) ? span : 0;
 
   if (l.samples.length >= 8 && span >= LEVEL_WINDOW - 150 && spread < LEVEL_SPREAD) {
-    clearInterval(ui.levelTimer);
     var mid = l.samples[Math.floor(l.samples.length / 2)];
+
+    if (l.check && l.phase === 1) {
+      /* Phase one banked; now the half-turn. Accept phase two only once the yaw
+         has actually moved ~180°, so putting it down unturned cannot pass. */
+      l.phase1 = { att: mid, gdev: gravityDev(mid.a, mid.b, mid.g) };
+      l.phase = 2; l.samples = []; l.started = now; l.held = 0;
+      buzz([30, 50, 30]);
+      paintLevelHud();
+      return;
+    }
+    if (l.check && l.phase === 2) {
+      var da = ((mid.a - l.phase1.att.a + 540) % 360) - 180;
+      if (Math.abs(da) < 140) {
+        /* still, but not spun — keep waiting */
+        l.samples = []; l.held = 0;
+        paintLevelHud();
+        return;
+      }
+      clearInterval(ui.levelTimer);
+      l.spread = spread;
+      var okd = finishFlipCheck(l, mid, now);
+      ui.level = null;
+      render();
+      return;
+    }
+
+    clearInterval(ui.levelTimer);
     var p = currentProject();
     p.deck = {
       n: EE.normalFromAttitude(mid.a, mid.b + (db.settings.pitchTrim || 0),
@@ -570,9 +653,13 @@ function paintLevelHud() {
   var bar = $('#level-bar'), txt = $('#level-txt');
   if (bar) bar.style.width = Math.min(100, l.held / LEVEL_WINDOW * 100) + '%';
   if (txt) {
-    txt.textContent = l.spread == null ? 'waiting for the sensor…'
-      : l.spread < LEVEL_SPREAD ? 'holding still — ' + (l.held / 1000).toFixed(1) + ' s'
-        : 'still moving — ' + l.spread.toFixed(1) + '°';
+    if (l.check && l.phase === 2) {
+      txt.textContent = 'now SPIN it half a turn, flat, same spot — then let it settle';
+    } else {
+      txt.textContent = l.spread == null ? 'waiting for the sensor…'
+        : l.spread < LEVEL_SPREAD ? 'holding still — ' + (l.held / 1000).toFixed(1) + ' s'
+          : 'still moving — ' + l.spread.toFixed(1) + '°';
+    }
   }
 }
 
@@ -645,6 +732,18 @@ function effAngle(st) {
    a degree or three from assembly tolerance, more with a case — and at this
    geometry one degree of pitch is ~30 cm of range error at 5 m. The trim is
    eyeballed against a visible horizon, which on a roof is always available. */
+/* The lens, for a given frame geometry. A measured field of view belongs to the
+   camera AND the crop Safari delivered — a 4:3 measurement quietly applied to a
+   16:9 stream is wrong by the crop. Keyed by frame size, global as fallback. */
+function fovValueFor(w, h2) {
+  var key = w + 'x' + h2;
+  var m = db.settings.fovByFrame || {};
+  return m[key] || db.settings.fov;
+}
+function stationF(st) {
+  return EE.focalFromFov(fovValueFor(st.imgW, st.imgH), Math.max(st.imgW, st.imgH));
+}
+
 function attMatrix(a) {
   return EE.rotFromOrientation(a.alpha,
     a.beta + (db.settings.pitchTrim || 0),
@@ -1141,10 +1240,39 @@ function onOrientation(e) {
   } else if (e.absolute && e.alpha != null) {
     ui.sensors.heading = (360 - e.alpha) % 360;
   }
+  /* Ring of recent samples, for reading the attitude from BEFORE the shutter
+     tap. Tapping the shutter rocks the phone about your grip — top tips back,
+     the sensor reads more upright at exactly the instant the old code sampled
+     it, and every horizon drawn from that shot sits too low. The sign of the
+     error the field reported matches this precisely. */
+  (ui.attRing || (ui.attRing = [])).push({
+    t: performance.now(),
+    a: ui.sensors.alpha, b: ui.sensors.beta, g: ui.sensors.gamma,
+    q: EE.quatFromOrientation(ui.sensors.alpha, ui.sensors.beta, ui.sensors.gamma)
+  });
+  if (ui.attRing.length > 50) ui.attRing.shift();
+
   if (ui.cap) paintCaptureHud();
   /* The HUD is driven by the orientation event rather than by rAF: iOS polls
      CoreMotion at 60 Hz, so there is nothing new to draw between samples. */
   if (ui.live) paintLive();
+}
+
+/* The attitude the shot should carry: the median sample from a window ending
+   well before the tap's mechanical impact, plus how fast the phone was moving. */
+function preTapAttitude(tapT) {
+  var ring = ui.attRing || [];
+  if (!ring.length) return null;
+  var win = ring.filter(function (s2) { return s2.t >= tapT - 450 && s2.t <= tapT - 120; });
+  if (!win.length) win = [ring[ring.length - 1]];
+  var mid = win[Math.floor(win.length / 2)];
+  var recent = ring.filter(function (s2) { return s2.t >= tapT - 300; });
+  var wob = 0;
+  for (var i = 1; i < recent.length; i++) {
+    var dt = Math.max(1, recent[i].t - recent[i - 1].t);
+    wob = Math.max(wob, EE.quatAngleDeg(recent[i - 1].q, recent[i].q) * 1000 / dt);
+  }
+  return { alpha: mid.a, beta: mid.b, gamma: mid.g, wobble: wob };
 }
 
 function startSensors() {
@@ -1326,6 +1454,8 @@ function tplDeckPanel(p) {
       '<div class="kv"><span>Off level</span><span>' + p.deck.tiltDeg.toFixed(2) + '° (' + pct.toFixed(1) + '% fall)</span></div>' +
       '<div class="kv"><span>Read</span><span>' + (p.deck.faceDown ? 'screen down' : 'screen up') +
       ', ±' + p.deck.spreadDeg.toFixed(2) + '°</span></div>' +
+      (db.settings.biasMeasured ? '<div class="kv good"><span>Sensor bias (corrected)</span><span>' +
+        fmtSigned(db.settings.biasMeasured.p) + '° / ' + fmtSigned(db.settings.biasMeasured.r) + '°</span></div>' : '') +
       '<div class="p-body">New shots are measured against this plane instead of assuming level. ' +
       'Re-read it if you move to a section that falls a different way.</div>' +
       '<div class="btn-row">' +
@@ -1342,7 +1472,9 @@ function tplDeckPanel(p) {
     'point comes out wrong. Gravity fixes the plane exactly and carries no length; the card ' +
     'carries length and no plane. Together they cover it.</div>' +
     '<div class="btn-row">' +
-    '<button class="btn primary sm" data-act="level-down">Screen down</button>' +
+    '<button class="btn primary sm" data-act="level-check">Read + sensor check</button></div>' +
+    '<div class="btn-row">' +
+    '<button class="btn ghost-gold sm" data-act="level-down">Quick read, screen down</button>' +
     '<button class="btn ghost-gold sm" data-act="level-up">Screen up</button></div>' +
     '<div class="hint">Screen down is truer — the camera bump tilts a face-up phone about a ' +
     'degree. Either way it counts down so you need not read the screen.</div></div>';
@@ -1831,8 +1963,10 @@ function tplTraceCal(st, t) {
       body = '<div class="hint">Now press on the centre again and <b>drag out to its edge</b> — ' +
         'a circle follows your finger. Let go on the rim.</div>';
     } else {
-      body = '<div class="panel ' + (fitb ? 'good' : 'warn') + '">' +
-        '<span class="p-tag">' + (fitb ? 'RIM LOCKED' : 'USING YOUR CIRCLE') + '</span>' +
+      var weak = fitb && fitb.n < 34;
+      body = '<div class="panel ' + (fitb ? (weak ? '' : 'good') : 'warn') + '">' +
+        '<span class="p-tag">' + (fitb ? (weak ? 'RIM LOCKED — WEAKLY' : 'RIM LOCKED') : 'USING YOUR CIRCLE') + '</span>' +
+        (weak ? '<div class="p-body">Only ' + fitb.n + ' of 48 spokes agree — check the green circle actually hugs the ball before trusting it.</div>' : '') +
         (fitb
           ? '<div class="kv"><span>Rim found on</span><span>' + fitb.n + ' of 48 spokes, ±' +
           fitb.rms.toFixed(1) + ' px</span></div>' +
@@ -1848,7 +1982,7 @@ function tplTraceCal(st, t) {
 
     var offDeg = 0;
     if (bn >= 1) {
-      var fOff = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+      var fOff = stationF(st);
       offDeg = Math.atan(Math.abs(t.taps[0].x - st.imgW / 2) / fOff) * 180 / Math.PI;
     }
     return modeSeg +
@@ -3025,10 +3159,39 @@ function paintTrace() {
     if (!line) return null;
     var a = img2cv(v, { x: line.x0, y: line.y0 }), b = img2cv(v, { x: line.x1, y: line.y1 });
     g.save();
+    g.font = '600 12px ui-monospace, monospace';
+
+    /* An off-frame horizon must SAY it is off-frame. Clamping the label to the
+       top of the canvas made a steep close-up look like the app believed the
+       horizon sat at the top of the photo — a UI lie that read as a broken
+       calibration. */
+    var yMid = (line.y0 + line.y1) / 2;
+    if (line.y0 < -2 && line.y1 < -2 && !line.steep) {
+      var top = img2cv(v, { x: st.imgW / 2, y: 0 });
+      var chip = label + '  ⇡ ' + Math.round(-yMid) + ' px above the photo';
+      var cw2 = g.measureText(chip).width;
+      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillRect(top.x - cw2 / 2 - 7, Math.max(2, top.y + 4), cw2 + 14, 17);
+      g.fillStyle = col;
+      g.fillText(chip, top.x - cw2 / 2, Math.max(14, top.y + 16));
+      g.restore();
+      return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+    }
+    if (line.y0 > st.imgH + 2 && line.y1 > st.imgH + 2 && !line.steep) {
+      var bot = img2cv(v, { x: st.imgW / 2, y: st.imgH });
+      var chip2 = label + '  ⇣ ' + Math.round(yMid - st.imgH) + ' px below the photo';
+      var cw3 = g.measureText(chip2).width;
+      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillRect(bot.x - cw3 / 2 - 7, Math.min(h - 20, bot.y - 22), cw3 + 14, 17);
+      g.fillStyle = col;
+      g.fillText(chip2, bot.x - cw3 / 2, Math.min(h - 8, bot.y - 9));
+      g.restore();
+      return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+    }
+
     g.strokeStyle = col; g.lineWidth = 2.5; g.setLineDash(dash);
     g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
     g.setLineDash([]);
-    g.font = '600 12px ui-monospace, monospace';
     var tw = g.measureText(label).width;
     var ly = Math.max(14, Math.min(h - 6, a.y - 8));
     g.fillStyle = 'rgba(12,10,16,0.82)';
@@ -3054,7 +3217,7 @@ function paintTrace() {
   var calAng = null, gravAng = null;
   if (st.att) {
     var Rg = attMatrix(st.att);
-    var fg = (st.cal && st.cal.f) || EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+    var fg = (st.cal && st.cal.f) || stationF(st);
     var Hg = EE.homographyFromPose(Rg, 1, fg, st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
     gravAng = drawHorizon(EE.horizonLine(Hg, st.imgW, st.imgH),
       'rgba(110,210,154,0.85)', 'horizon · gravity', [4, 5]);
@@ -3745,17 +3908,22 @@ function handle(el, e) {
     case 'toggle-snap': db.settings.cornerSnap = !db.settings.cornerSnap; save(); return render();
     case 'trim-pitch': {
       var dtp = parseFloat(el.dataset.d) * 0.2;
-      db.settings.pitchTrim = Math.max(-6, Math.min(6, +(((db.settings.pitchTrim || 0) + dtp).toFixed(1))));
+      var beforeP = db.settings.pitchTrim || 0;
+      db.settings.pitchTrim = Math.max(-10, Math.min(10, +((beforeP + dtp).toFixed(1))));
+      if (db.settings.pitchTrim === beforeP) {
+        toast('Trim is capped at ±10° — a horizon further off than that is not sensor bias. Run the sensor check under Check → the deck panel, and hold still at the shutter.');
+      }
       save(); return render();
     }
     case 'trim-roll': {
       var dtr = parseFloat(el.dataset.d) * 0.2;
-      db.settings.rollTrim = Math.max(-4, Math.min(4, +(((db.settings.rollTrim || 0) + dtr).toFixed(1))));
+      db.settings.rollTrim = Math.max(-6, Math.min(6, +(((db.settings.rollTrim || 0) + dtr).toFixed(1))));
       save(); return render();
     }
     case 'trim-reset': db.settings.pitchTrim = 0; db.settings.rollTrim = 0; save(); return render();
     case 'level-up': return startLevel(false);
     case 'level-down': return startLevel(true);
+    case 'level-check': return startLevel(true, true);
     case 'level-cancel': clearInterval(ui.levelTimer); ui.level = null; return render();
     case 'clear-deck': { p.deck = null; touchProject(p); save(); toast('Deck reading cleared'); return render(); }
     case 'del-survey': {
@@ -4077,10 +4245,20 @@ function shoot() {
   var st = {
     id: uid('s'), createdAt: Date.now(),
     imgW: W, imgH: H, screenAngle: screenAngle(),
-    att: ui.sensors.live ? {
-      alpha: ui.sensors.alpha, beta: ui.sensors.beta, gamma: ui.sensors.gamma,
-      heading: ui.sensors.heading, headingAcc: ui.sensors.headingAcc
-    } : null,
+    att: (function () {
+      if (!ui.sensors.live) return null;
+      var pre = preTapAttitude(performance.now());
+      if (pre && pre.wobble > 30) {
+        toast('Phone was moving ' + pre.wobble.toFixed(0) + '°/s at the shutter — attitude taken from just before the tap');
+      }
+      return {
+        alpha: pre ? pre.alpha : ui.sensors.alpha,
+        beta: pre ? pre.beta : ui.sensors.beta,
+        gamma: pre ? pre.gamma : ui.sensors.gamma,
+        heading: ui.sensors.heading, headingAcc: ui.sensors.headingAcc,
+        preTap: !!pre, wobble: pre ? +pre.wobble.toFixed(1) : null
+      };
+    })(),
     gps: ui.gps ? Object.assign({}, ui.gps) : null,
     cam: (ui.cap && ui.cap.cam) ? Object.assign({}, ui.cap.cam) : null,
     angleFix: 0,
@@ -4174,7 +4352,7 @@ function applyQuad() {
      calibrated on something big - which is everyone, on day one. */
   if (small && st.att) {
     var Rp = attMatrix(st.att);
-    var fp = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+    var fp = stationF(st);
     var unit = quad.map(function (qp) {
       return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fp, effAngle(st)),
         Rp, 1, 0, deckNormalOf(st));
@@ -4221,6 +4399,7 @@ function applyQuad() {
     db.settings.fov = cal.fovMeasured;
     db.settings.fovFrom = (st.cam && st.cam.label) || 'this camera';
     db.settings.fovAt = Date.now();
+    (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[st.imgW + 'x' + st.imgH] = cal.fovMeasured;
     save();
     msg += ' · lens measured at ' + cal.fovMeasured.toFixed(1) + '°';
   } else if (cal.fovMeasured) {
@@ -4296,7 +4475,7 @@ function applyBall() {
   }
   if (!(xR - xL > 6)) return toast('That circle is too small to measure — get closer');
 
-  var f = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+  var f = stationF(st);
   var R = attMatrix(st.att);
   var a = EE.rayForPixel(xL, cyRow, st.imgW, st.imgH, f, effAngle(st));
   var b = EE.rayForPixel(xR, cyRow, st.imgW, st.imgH, f, effAngle(st));
@@ -4363,7 +4542,7 @@ function applyRay() {
   var st = findStation(p, t.stationId);
   if (!st.att) return toast('This shot has no tilt recorded');
 
-  var f = EE.focalFromFov(db.settings.fov, Math.max(st.imgW, st.imgH));
+  var f = stationF(st);
   var R = attMatrix(st.att);
   var camH = EE.toM(parseFloat($('#cam-h').value), U());
 
