@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     307 assertions over geo.js — open it in a browser
+    ├── test-geo.html     349 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -420,14 +420,44 @@ lock fails (glare, low contrast) it says so and uses your circle as drawn.
 
 The solve uses the **horizontal** rim extremes deliberately: a sphere's silhouette is radially
 elongated off-axis and its bottom edge is where the contact shadow lives, so the left–right
-chord is both the geometrically correct measure and the cleanest one. The one systematic is
-exact: the rim sits one radius above the deck and layover makes the solve return precisely
-*h − r*, so 21.3 mm is handed back. Verified end to end: a 28 px ball with a painted contact
-shadow recovers the camera height to 0.8%, and a 0.5 m square then traces 0.500 × 0.500.
+chord is both the geometrically correct measure and the cleanest one. From those two tangent
+rays the ball's centre is **ranged outright** — distance = radius / sin(half the angle between
+them) — which is exact at any position in the frame. (The earlier route, treating the rim
+extremes as two ground points a diameter apart, was exact dead ahead but drifted quadratically
+off-axis: about −1% at 8° off the midline, −3.7% at 16°. Ranging replaced it everywhere.)
 
 The honest limit is pixels — ~26 px across at 1.5 m — so get close; the readout shows the
 implied scale error live. The card's long side is twice the ball, and a paver beats both.
 White balls also make excellent landmarks for tying shots together.
+
+### Two balls, three balls
+
+Because the diameter is known, every ball's silhouette gives a direction AND a distance — a
+full 3D point from the photo alone. That makes a bag of golf balls a surveying instrument:
+
+- **One ball** prices the scale and camera height. The plane still comes from the sensor.
+- **Two balls** also measure the deck's tilt **along the line between them**, independent of
+  the sensor, and give two heights that must agree. Put them as far apart as the frame allows.
+- **Three balls in a triangle** measure the **whole deck plane** from the photo, the sensor
+  only saying which way is up. Three in a row read no more than two — the app refuses the
+  degenerate triangle and says which way to move.
+
+After circling the first ball, **+ Add ball B** banks it and clears the selector; the banked
+balls wear their letters on the photo. With two or more in play a live **PHOTO vs SENSOR**
+panel shows what the balls can already see: the tilt along the pair (with the resolution the
+constellation actually supports), the per-ball heights, or the full plane-vs-sensor angle.
+
+The arbitration is honest in both directions. The photo's plane replaces the sensor's only
+when the disagreement exceeds what the ball geometry can resolve — correcting a good sensor by
+ranging noise would be adding noise — and when it does win, the plane is stored **in the
+device frame**, so the attitude error cancels exactly all the way through the homography.
+Verified: a sensor lying by 6° of pitch and 2° of roll, three synthetic balls, and a true
+0.5 m square traces **0.5000 × 0.5000** through the app's own measurement path; the same lie
+with one ball is ~22 cm of height error, which is the whole argument for carrying three.
+
+Different-coloured balls are a feature: each ball's detector projects the pixels onto the
+colour axis from *its own* outside to *its own* inside, so a dark-yellow ball on grey membrane
+— nearly invisible to plain brightness — locks as cleanly as a white one.
 
 **With a small reference, the plane always comes from gravity** (when the tilt sensor is on) —
 even before the lens has been measured. In that case the scale is marked **provisional**
@@ -506,7 +536,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 307 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 349 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

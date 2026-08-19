@@ -861,6 +861,168 @@ var EE = (function () {
     return knownDist / d;
   }
 
+  /* ================= multi-ball =================
+
+     A sphere of known diameter is a self-ranging landmark: its silhouette gives
+     a direction (where it sits in the frame) and a distance (how big it looks),
+     so every ball is a full 3D point measured by the photo alone. One ball pins
+     scale and camera height; two pin the deck's tilt ALONG the line between
+     them; three, spread into a triangle, pin the whole deck plane with no help
+     from the attitude sensor at all. Disagreement between that plane and the
+     sensor's is then a lie detector — the balls are ON the deck, so when the
+     two argue, the balls are right. */
+
+  /* Ball centre as a 3D point in the DEVICE frame, camera at the origin.
+
+     The two rays through the level rim extremes are tangent to the sphere, so
+     the distance to its centre is r / sin(half the angle between them), along
+     their bisector. Exact to O(sin²θ): for a golf ball past arm's length that
+     is sub-millimetre, far below pixel noise — and it reuses the same xL/xR the
+     single-ball height solve already measures. */
+  function sphereCenterDev(xL, xR, cyRow, imgW, imgH, f, screenAngle, dia) {
+    if (!(dia > 0) || !(xR - xL > 2)) return null;
+    var a = rayForPixel(xL, cyRow, imgW, imgH, f, screenAngle);
+    var b = rayForPixel(xR, cyRow, imgW, imgH, f, screenAngle);
+    var sinHalf = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) / 2;
+    /* A ball filling a 60° cone is not a photograph of a ball on a roof. */
+    if (!(sinHalf > 1e-7) || sinHalf >= 0.5) return null;
+    var dist = (dia / 2) / sinHalf;
+    var m = [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+    var mn = Math.hypot(m[0], m[1], m[2]);
+    if (mn < 1e-9) return null;
+    return { p: [m[0] / mn * dist, m[1] / mn * dist, m[2] / mn * dist], dist: dist };
+  }
+
+  /* What one, two or three ball centres say about the deck.
+
+     Everything in ONE frame — the app passes the device frame, so the verdict
+     cannot inherit an attitude error. `centers` are ball-centre points, `nPred`
+     the predicted deck up-normal in the same frame (gravity + the flip test),
+     `r` the ball radius, `relErrs` each ball's relative range error (spread of
+     the rim measurement over its width). Centres sit exactly r above the deck,
+     so the plane through them IS the deck plane translated — same normal.
+
+     The returned `use` is the arbitration: the photo's plane replaces the
+     sensor's only when the disagreement exceeds what the photo can actually
+     resolve — correcting a good sensor by ranging noise would be adding noise,
+     while a sensor lying beyond the gate loses to the balls, which are ground
+     truth by construction. */
+  function ballPlane(centers, nPred, r, relErrs) {
+    if (!centers || !centers.length) return null;
+    var dot = function (u, v) { return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; };
+    var sub = function (u, v) { return [u[0] - v[0], u[1] - v[1], u[2] - v[2]]; };
+    var unit = function (u) {
+      var m = Math.hypot(u[0], u[1], u[2]);
+      return m > 1e-12 ? [u[0] / m, u[1] / m, u[2] / m] : null;
+    };
+    var cross = function (u, v) {
+      return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    };
+    var clampd = function (v) { return v < -1 ? -1 : v > 1 ? 1 : v; };
+
+    var n = unit(nPred);
+    if (!n) return null;
+    var k = centers.length;
+    var hVs = function (nn) {
+      return centers.map(function (c) { return r - dot(c, nn); });
+    };
+    var mean = function (a) {
+      var s = 0; for (var i = 0; i < a.length; i++) s += a[i];
+      return s / a.length;
+    };
+    /* Per-ball height noise against a plane: range error projected onto the
+       normal — the component that can masquerade as tilt. */
+    var hSigma = function (nn) {
+      return centers.map(function (c, i) {
+        var d = Math.hypot(c[0], c[1], c[2]);
+        var rel = (relErrs && relErrs[i] > 0) ? relErrs[i] : 0.01;
+        return d * rel * Math.abs(dot(unit(c), nn));
+      });
+    };
+
+    var res = { mode: k, n: n, use: 'sensor', hs: hVs(n), sigmaDeg: null };
+    if (k === 1) { res.camH = res.hs[0]; return res; }
+
+    var sz = hSigma(n);
+    var gateOf = function (sigmaDeg) { return Math.max(1.2, 1.6 * sigmaDeg); };
+
+    if (k === 2) {
+      var d2 = sub(centers[1], centers[0]);
+      var L = Math.hypot(d2[0], d2[1], d2[2]);
+      res.baselineM = L;
+      if (L < 0.05) {
+        res.degenerate = 'coincident';
+        res.camH = mean(res.hs);
+        return res;
+      }
+      var dh = unit(d2);
+      var s = clampd(dot(dh, n));
+      res.tiltAlongDeg = Math.asin(s) / DEG;
+      res.disagreeDeg = Math.abs(res.tiltAlongDeg);
+      res.sigmaDeg = Math.atan(Math.hypot(sz[0], sz[1]) / L) / DEG;
+      var nc = unit([n[0] - s * dh[0], n[1] - s * dh[1], n[2] - s * dh[2]]);
+      res.nPhoto = nc || n;
+      if (nc && L >= 0.15 && res.disagreeDeg > gateOf(res.sigmaDeg)) {
+        res.use = 'photo'; res.n = nc;
+      }
+      res.camH = mean(hVs(res.n));
+      return res;
+    }
+
+    /* Three (the app never passes more): the full plane. */
+    var u3 = sub(centers[1], centers[0]);
+    var v3 = sub(centers[2], centers[0]);
+    var w3 = sub(centers[2], centers[1]);
+    var cr = cross(u3, v3);
+    var area2 = Math.hypot(cr[0], cr[1], cr[2]);
+    var Lmax = Math.max(Math.hypot(u3[0], u3[1], u3[2]),
+      Math.hypot(v3[0], v3[1], v3[2]), Math.hypot(w3[0], w3[1], w3[2]));
+    res.maxSideM = Lmax;
+    /* The triangle's smallest altitude is the lever arm for the cross-baseline
+       tilt — three balls nearly in a line know no more about that axis than two. */
+    res.minAltM = Lmax > 1e-9 ? area2 / Lmax : 0;
+    var nb = unit(cr);
+    if (!nb || res.minAltM < Math.max(0.10, 0.10 * Lmax)) {
+      res.degenerate = 'collinear';
+      res.camH = mean(res.hs);
+      return res;
+    }
+    if (dot(nb, n) < 0) nb = [-nb[0], -nb[1], -nb[2]];
+    res.nPhoto = nb;
+    res.disagreeDeg = Math.acos(clampd(dot(nb, n))) / DEG;
+    var szM = Math.max(sz[0], sz[1], sz[2]);
+    res.sigmaDeg = Math.atan(Math.SQRT2 * szM / Math.min(res.minAltM, Lmax)) / DEG;
+    if (res.disagreeDeg > gateOf(res.sigmaDeg)) { res.use = 'photo'; res.n = nb; }
+    res.camH = mean(hVs(res.n));
+    return res;
+  }
+
+  /* The best scalar channel for a given ball: the straight line in RGB space
+     from "outside the circle" to "inside it".
+
+     Luminance is one fixed projection and the field carries balls it is nearly
+     blind to — a dark-yellow ball on grey membrane has almost no luminance
+     contrast and a lot of colour contrast. Projecting every pixel onto the
+     inside-outside axis is within a whisker of optimal for ANY ball colour, is
+     computed per ball from the pixels themselves (no colour picker), and costs
+     one dot product per pixel. Null when there is nothing to project onto —
+     grey on grey, where luminance was already the best available try. */
+  function colorAxis(innerSamples, outerSamples) {
+    if (!innerSamples || !outerSamples || innerSamples.length < 4 || outerSamples.length < 4) return null;
+    var med = function (arr, ch) {
+      var v = [];
+      for (var i = 0; i < arr.length; i++) v.push(arr[i][ch]);
+      v.sort(function (a, b) { return a - b; });
+      return v[Math.floor(v.length / 2)];
+    };
+    var w = [med(innerSamples, 0) - med(outerSamples, 0),
+      med(innerSamples, 1) - med(outerSamples, 1),
+      med(innerSamples, 2) - med(outerSamples, 2)];
+    var m = Math.hypot(w[0], w[1], w[2]);
+    if (m < 6) return null;
+    return { w: [w[0] / m, w[1] / m, w[2] / m], sep: m };
+  }
+
   /* ================= corner snapping =================
 
      Tap error is the dominant error inside the trusted radius, and a finger is
@@ -1714,6 +1876,7 @@ var EE = (function () {
     quatSlerp: quatSlerp, quatAngleDeg: quatAngleDeg,
     rayForPixel: rayForPixel, groundPoint: groundPoint, projectToPixel: projectToPixel,
     heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
+    sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
     layoverFactor: layoverFactor, reliefDisplacement: reliefDisplacement,
     maxSafeObjectHeight: maxSafeObjectHeight,
     bearingSensitivity: bearingSensitivity, positionSigma: positionSigma,

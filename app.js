@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.15.0';
+var VERSION = '1.16.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -663,8 +663,19 @@ function paintLevelHud() {
   }
 }
 
-/* The normal a shot should be measured against. */
+/* The normal a shot should be measured against.
+
+   A multi-ball calibration stores the plane it measured in the DEVICE frame
+   (cal.deckDev) and it is converted to world coordinates here, freshly, through
+   the same attMatrix the homography build uses. That makes the attitude cancel
+   exactly: the plane-in-camera the geometry actually consumes is the one the
+   balls measured, however wrong the sensor was and however the trims change
+   later. Storing a world normal instead would freeze today's attitude error
+   into the plane. */
 function deckNormalOf(st) {
+  if (st && st.cal && st.cal.deckDev && st.att) {
+    return EE.applyM3(attMatrix(st.att), st.cal.deckDev);
+  }
   return (st && st.deckN) || null;
 }
 
@@ -1951,21 +1962,32 @@ function tplTraceCal(st, t) {
     }
     var bn = t.taps.length;
     var fitb = t.ballFit;
+    var committed = t.balls || [];
+    var set = ballSet(t);
+    var letter = function (i) { return String.fromCharCode(65 + i); };
     var seedR = bn >= 2 ? Math.hypot(t.taps[1].x - t.taps[0].x, t.taps[1].y - t.taps[0].y) : 0;
     var dh = fitb ? fitb.dh : seedR * 2;
     var errPx = fitb ? 0.6 : 3;
     var body;
 
     if (bn === 0) {
-      body = '<div class="hint">Put a golf ball <b>on the deck</b>, in frame. Press on its ' +
-        '<b>centre</b> — the loupe helps.</div>';
+      body = committed.length
+        ? '<div class="hint">Ball <b>' + letter(committed.length) + '</b>: press on its <b>centre</b>. ' +
+        (committed.length === 1
+          ? 'The further from ball A the better — their line is what reads the deck\'s tilt.'
+          : 'Out of line with A and B — a triangle reads the whole plane; a queue reads nothing new.') +
+        '</div>'
+        : '<div class="hint">Put a golf ball <b>on the deck</b>, in frame. Press on its ' +
+        '<b>centre</b> — the loupe helps. Different-coloured balls are fine: each is read ' +
+        'against its own background.</div>';
     } else if (bn === 1) {
       body = '<div class="hint">Now press on the centre again and <b>drag out to its edge</b> — ' +
         'a circle follows your finger. Let go on the rim.</div>';
     } else {
       var weak = fitb && fitb.n < 34;
       body = '<div class="panel ' + (fitb ? (weak ? '' : 'good') : 'warn') + '">' +
-        '<span class="p-tag">' + (fitb ? (weak ? 'RIM LOCKED — WEAKLY' : 'RIM LOCKED') : 'USING YOUR CIRCLE') + '</span>' +
+        '<span class="p-tag">' + (set.length > 1 || committed.length ? 'BALL ' + letter(committed.length) + ' — ' : '') +
+        (fitb ? (weak ? 'RIM LOCKED — WEAKLY' : 'RIM LOCKED') : 'USING YOUR CIRCLE') + '</span>' +
         (weak ? '<div class="p-body">Only ' + fitb.n + ' of 48 spokes agree — check the green circle actually hugs the ball before trusting it.</div>' : '') +
         (fitb
           ? '<div class="kv"><span>Rim found on</span><span>' + fitb.n + ' of 48 spokes, ±' +
@@ -1980,28 +2002,78 @@ function tplTraceCal(st, t) {
         '</div>';
     }
 
+    /* The committed roster. */
+    var roster = '';
+    if (committed.length) {
+      roster = '<div class="live-row" style="flex-wrap:wrap">' + committed.map(function (b, i) {
+        return '<span class="pill tiny' + (b.locked ? ' gold' : '') + '">' + letter(i) + ' · ' +
+          Math.round(b.dh) + ' px' + (b.locked ? '' : ' — unlocked') + '</span>';
+      }).join('') + '</div>';
+    }
+
+    /* The verdict, live: what the balls in play can already say about the
+       sensor's plane. The angles are diameter-free (every distance scales with
+       the diameter together), so the default ball is fine here even before the
+       diameter field below is read. */
+    var verdict = '';
+    if (set.length >= 2 && st.att) {
+      var Dv = EE.toM(parseFloat(t.ballDia) || 0, U()) || 0.04267;
+      var sv = ballSolve(st, t, Dv);
+      if (sv && sv.res && !sv.res.degenerate) {
+        var rv = sv.res;
+        var photo = rv.use === 'photo';
+        verdict = '<div class="panel ' + (photo ? 'warn' : 'good') + '">' +
+          '<span class="p-tag">PHOTO vs SENSOR</span>' +
+          (set.length === 2
+            ? '<div class="kv"><span>Tilt along the pair</span><span>' + fmtSigned(rv.tiltAlongDeg) +
+            '° (readable to ±' + rv.sigmaDeg.toFixed(1) + '°)</span></div>' +
+            '<div class="kv"><span>Balls apart</span><span>' + EE.fmtLen(rv.baselineM, U(), 2) + '</span></div>' +
+            '<div class="kv"><span>Heights say</span><span>' +
+            EE.fmtLen(rv.hs[0], U(), 2) + ' / ' + EE.fmtLen(rv.hs[1], U(), 2) + '</span></div>'
+            : '<div class="kv"><span>Plane vs sensor</span><span>' + rv.disagreeDeg.toFixed(1) +
+            '° apart (photo readable to ±' + rv.sigmaDeg.toFixed(1) + '°)</span></div>' +
+            '<div class="kv"><span>Triangle</span><span>' + EE.fmtLen(rv.maxSideM, U(), 2) + ' long, ' +
+            EE.fmtLen(rv.minAltM, U(), 2) + ' deep</span></div>') +
+          '<div class="p-body">' + (photo
+            ? 'The balls out-vote the sensor — calibrating will take the <b>photo\'s plane</b>.'
+            : 'Within the photo\'s own resolution the sensor holds up — its finer-grained plane is kept.') +
+          '</div></div>';
+      } else if (sv && sv.res && sv.res.degenerate === 'collinear') {
+        verdict = '<div class="panel warn"><span class="p-tag">NEARLY IN A LINE</span>' +
+          '<div class="p-body">Three balls in a row read no more than two. Move one a stride ' +
+          'sideways — the triangle needs depth (' + EE.fmtLen(sv.res.minAltM, U(), 2) + ' now).</div></div>';
+      } else if (sv && sv.res && sv.res.degenerate === 'coincident') {
+        verdict = '<div class="panel warn"><span class="p-tag">TOO CLOSE TOGETHER</span>' +
+          '<div class="p-body">Spread the balls — their line is the measuring stick.</div></div>';
+      }
+    }
+
     var offDeg = 0;
     if (bn >= 1) {
       var fOff = stationF(st);
       offDeg = Math.atan(Math.abs(t.taps[0].x - st.imgW / 2) / fOff) * 180 / Math.PI;
     }
+    var canAdd = bn >= 2 && set.length < 3;
     return modeSeg +
       '<div class="hint">Every ball is the same ball — <b>42.67 mm</b> is written into the rules. ' +
       'A slightly <b>oval</b> look away from the frame centre is expected (a sphere\'s silhouette ' +
       'stretches radially off-axis); only the <b>level width across</b> is measured, so keep the ' +
-      'ball near the vertical midline and the oval costs nothing.</div>' +
+      'ball near the vertical midline and the oval costs nothing. <b>Two balls</b> cross-check the ' +
+      'sensor\'s plane; <b>three in a triangle</b> read the deck plane from the photo alone.</div>' +
       (offDeg > 14 ? '<div class="panel warn"><span class="p-tag">BALL FAR OFF-CENTRE</span>' +
         '<div class="p-body">It sits ' + offDeg.toFixed(0) + '° off the vertical midline, where the ' +
         'sideways stretch starts leaking into the width. Recompose with the ball nearer the middle.</div></div>' : '') +
-      body +
-      (bn >= 2 ? '<div class="field"><label>BALL DIAMETER</label><div class="unit-suffix">' +
+      roster + body + verdict +
+      (set.length >= 1 ? '<div class="field"><label>BALL DIAMETER</label><div class="unit-suffix">' +
         '<input class="inp mono" id="ball-dia" inputmode="decimal" value="' +
         esc(t.ballDia || EE.fromM(0.04267, U()).toFixed(5)) + '"><span>' + U() + '</span></div></div>' : '') +
       (db.settings.fovAt ? '' : '<div class="hint">Lens not measured yet, so the scale will be ' +
         '<b>provisional</b> — one tape check afterwards trues every shot.</div>') +
       '<div class="btn-row">' +
-      (bn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
-      '<button class="btn primary sm" data-act="apply-ball"' + (bn >= 2 ? '' : ' disabled') + '>Calibrate</button>' +
+      (bn || committed.length ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
+      (canAdd ? '<button class="btn ghost sm" data-act="ball-add">+ Add ball ' + letter(set.length) + '</button>' : '') +
+      '<button class="btn primary sm" data-act="apply-ball"' + (set.length >= 1 ? '' : ' disabled') + '>Calibrate' +
+      (set.length > 1 ? ' · ' + set.length + ' balls' : '') + '</button>' +
       '</div>';
   }
 
@@ -2258,6 +2330,11 @@ function tplTraceDraw(p, st, t) {
       '<span class="pill tiny' + (db.settings.pitchTrim ? ' gold' : '') + '">horizon ' +
       fmtSigned(db.settings.pitchTrim || 0) + '°</span>' +
       '<button class="pill tiny" data-act="trim-pitch" data-d="1">▼</button>' : '') +
+    (st.cal && st.cal.ballCheck ? '<span class="pill tiny' +
+      (st.cal.ballCheck.use === 'photo' ? ' gold' : '') + '">' +
+      st.cal.ballCheck.balls + ' balls · ' + (st.cal.ballCheck.use === 'photo'
+        ? 'photo plane, sensor off ' + st.cal.ballCheck.disagreeDeg.toFixed(1) + '°'
+        : 'sensor confirmed ±' + st.cal.ballCheck.sigmaDeg.toFixed(1) + '°') + '</span>' : '') +
     '</div>' +
     (unreg ? '<div class="panel warn"><span class="p-tag">SHOT NOT PLACED</span>' +
       '<div class="p-body">Mark <b>two landmarks</b> that already exist in the survey (' +
@@ -3317,7 +3394,28 @@ function paintTrace() {
     g.fillText(String(i + 1), q.x, q.y + 3.5); g.textAlign = 'left';
   });
 
-  /* ball mode: the circle IS the interface. Live while dragging the radius out,
+  /* ball mode: banked balls first — green when locked, dashed gold when taken
+     on trust — each wearing its letter. */
+  if (t.step === 'cal' && t.calMode === 'ball' && (t.balls || []).length) {
+    t.balls.forEach(function (b, i) {
+      var cc = img2cv(v, { x: b.cx, y: b.cy });
+      var cr = b.r * v.s;
+      g.strokeStyle = b.locked ? '#6ED29A' : '#D4AF37';
+      g.lineWidth = 2;
+      if (!b.locked) g.setLineDash([6, 5]);
+      g.beginPath(); g.arc(cc.x, cc.y, cr, 0, Math.PI * 2); g.stroke();
+      g.setLineDash([]);
+      g.font = '700 12px ui-monospace, monospace';
+      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillRect(cc.x - 9, cc.y - 9, 18, 18);
+      g.fillStyle = b.locked ? '#6ED29A' : '#D4AF37';
+      g.textAlign = 'center';
+      g.fillText(String.fromCharCode(65 + i), cc.x, cc.y + 4);
+      g.textAlign = 'left';
+    });
+  }
+
+  /* the circle IS the interface. Live while dragging the radius out,
      gold for the circle as placed, green once the refiner has locked the rim. */
   if (t.step === 'cal' && t.calMode === 'ball' && t.taps.length >= 1) {
     var bc = img2cv(v, t.taps[0]);
@@ -3717,6 +3815,11 @@ function bindTrace() {
              centre onto a dimple or a logo, and the rim refiner does the real
              locking anyway. */
           var ballMode = t.step === 'cal' && t.calMode === 'ball';
+          if (ballMode && (t.balls || []).length >= 3) {
+            toast('Three balls is the full house — Undo removes the last one');
+            t.loupe = null; hideLoupe(); render();
+            return;
+          }
           var s = ballMode ? ip : snapTap(st, ip);
           if (s.snapped) buzz(15);
           t.lastSnap = s.snapped ? s.moved : null;
@@ -3815,7 +3918,7 @@ function handle(el, e) {
   if (el.dataset.open) { view.projectId = el.dataset.open; view.screen = 'project'; view.tab = 'plan'; ui.plan.fitted = false; ui.sel = null; return render(); }
   if (el.dataset.tab) { view.tab = el.dataset.tab; return render(); }
   if (el.dataset.tool) { ui.trace.tool = el.dataset.tool; ui.trace.taps = []; return render(); }
-  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; ui.trace.ballFit = null; return render(); }
+  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; ui.trace.ballFit = null; ui.trace.balls = []; return render(); }
   if (el.dataset.unit) { db.settings.unit = el.dataset.unit; save(); return render(); }
   if (el.dataset.nameunit) { db.settings.nameUnit = el.dataset.nameunit; save(); return render(); }
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
@@ -3980,10 +4083,22 @@ function handle(el, e) {
     case 'shoot': return shoot();
 
     case 'close-trace': ui.trace = null; view.screen = 'project'; ui.plan.fitted = false; return render();
-    case 'undo-tap': ui.trace.taps.pop(); ui.trace.ballFit = null; return render();
+    case 'undo-tap': {
+      var tu = ui.trace;
+      /* In ball mode, once the current selector is empty, Undo starts eating the
+         banked balls — last in, first out. */
+      if (tu.calMode === 'ball' && tu.step === 'cal' && !tu.taps.length && (tu.balls || []).length) {
+        tu.balls.pop();
+      } else {
+        tu.taps.pop();
+      }
+      tu.ballFit = tu.taps.length >= 2 ? tu.ballFit : null;
+      return render();
+    }
     case 'apply-quad': return applyQuad();
     case 'apply-map': return applyMap();
     case 'apply-ball': return applyBall();
+    case 'ball-add': return commitBall();
     case 'apply-ray': return applyRay();
     case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; ui.trace.view = null; return render();
     case 'commit-shape': return commitShape();
@@ -4309,6 +4424,7 @@ function openTrace(stationId) {
     lastSnap: null,
     knownLen: '',
     ballFit: null,
+    balls: [],
     ballDia: '',
     camH: EE.fromM(db.settings.camH, U()).toFixed(2)
   };
@@ -4437,9 +4553,35 @@ function refineBall(st) {
   g.drawImage(im, sx, sy, S, S, 0, 0, S, S);
   var d;
   try { d = g.getImageData(0, 0, S, S).data; } catch (e) { return null; }
+
+  /* The channel the detector reads is chosen per ball: pixels are projected
+     onto the RGB axis from "outside the seeded circle" to "inside it". A white
+     ball degenerates to roughly luminance; a dark-yellow ball on grey membrane
+     — nearly invisible to luminance — separates on colour instead. This is
+     what makes a mixed bag of ball colours a feature rather than a problem:
+     each one is read against its own background. */
+  var scx = c.x - sx, scy = c.y - sy;
+  var ringRGB = function (radii) {
+    var out = [];
+    for (var a2 = 0; a2 < 24; a2++) {
+      var th = a2 / 24 * 2 * Math.PI, ct = Math.cos(th), st2 = Math.sin(th);
+      for (var k2 = 0; k2 < radii.length; k2++) {
+        var px = Math.round(scx + ct * r0 * radii[k2]);
+        var py = Math.round(scy + st2 * r0 * radii[k2]);
+        if (px < 0 || py < 0 || px >= S || py >= S) continue;
+        var j = (py * S + px) * 4;
+        out.push([d[j], d[j + 1], d[j + 2]]);
+      }
+    }
+    return out;
+  };
+  var axis = EE.colorAxis(ringRGB([0.20, 0.42]), ringRGB([1.32, 1.55]));
+
   var gray = new Float32Array(S * S);
   for (var i = 0; i < S * S; i++) {
-    gray[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    gray[i] = axis
+      ? axis.w[0] * d[i * 4] + axis.w[1] * d[i * 4 + 1] + axis.w[2] * d[i * 4 + 2]
+      : 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
   }
 
   var f = EE.refineCircleEdge(gray, S, S, c.x - sx, c.y - sy, r0);
@@ -4451,55 +4593,166 @@ function refineBall(st) {
   };
 }
 
-/* The solve: rays through the left and right rim, tangent to the sphere, are the
-   two-points-a-known-distance-apart problem the app already knows how to do —
-   the tangent points sit one radius above the deck, 42.67 mm apart. The +r at
-   the end is exact, not a fudge: layover makes the solve return h − r. */
+/* Every ball in play: the committed ones plus the one currently being circled.
+   Each carries the level rim extremes the solves need, and whether the refiner
+   actually locked it or the drawn circle is being taken on trust. */
+function ballSet(t) {
+  var set = (t.balls || []).slice();
+  if (t.taps.length >= 2) {
+    var fb = t.ballFit, c = t.taps[0];
+    var r0 = Math.hypot(t.taps[1].x - c.x, t.taps[1].y - c.y);
+    set.push(fb
+      ? { cx: fb.cx, cy: fb.cy, r: fb.r, xL: fb.xL, xR: fb.xR, dh: fb.dh, n: fb.n, rms: fb.rms, locked: true }
+      : { cx: c.x, cy: c.y, r: r0, xL: c.x - r0, xR: c.x + r0, dh: 2 * r0, n: 0, rms: null, locked: false });
+  }
+  return set;
+}
+
+/* Bank the ball being circled and clear the selector for the next one. */
+function commitBall() {
+  var t = ui.trace;
+  var set = ballSet(t);
+  if (!set.length || t.taps.length < 2) return toast('Circle this ball first — centre, then drag to the rim');
+  if ((t.balls || []).length >= 3) return toast('Three balls is the full house');
+  (t.balls || (t.balls = [])).push(set[set.length - 1]);
+  t.taps = []; t.ballFit = null;
+  buzz(20);
+  render();
+}
+
+/* The multi-ball verdict, computed live for the panel and again at apply.
+   Everything runs in the DEVICE frame so the sensor's own error cannot leak
+   into the check: the predicted plane is rotated in through the same attitude
+   any correction will later be rotated out through. The prediction is always
+   the SENSOR's plane (st.deckN), never a previous ball calibration's — the
+   verdict is photo vs sensor, not photo vs itself. */
+function ballSolve(st, t, D) {
+  var set = ballSet(t);
+  if (!set.length || !st.att) return null;
+  var f = stationF(st), ang = effAngle(st);
+  var centers = [], relErrs = [], failed = null;
+  set.forEach(function (b, i) {
+    var sc = EE.sphereCenterDev(b.xL, b.xR, b.cy, st.imgW, st.imgH, f, ang, D);
+    if (!sc) { failed = failed == null ? i : failed; return; }
+    centers.push(sc.p);
+    /* Range error rides the rim measurement: each edge is good to about the
+       fit's own residual (floored — a synthetic-clean fit is still read by a
+       real sensor), an unlocked circle to a finger's honesty. */
+    var edgePx = b.locked ? Math.max(0.35, b.rms || 0.7) : 3;
+    relErrs.push(Math.SQRT2 * edgePx / Math.max(6, b.dh));
+  });
+  if (failed != null || centers.length !== set.length) {
+    return { set: set, failed: failed == null ? 0 : failed };
+  }
+  var R = attMatrix(st.att);
+  var nDev = EE.applyM3(EE.transpose3(R), st.deckN || [0, 0, 1]);
+  var res = EE.ballPlane(centers, nDev, D / 2, relErrs);
+  return { set: set, res: res, R: R, f: f };
+}
+
+function ballDiaM(t) {
+  var diaEl = $('#ball-dia');
+  if (diaEl) t.ballDia = diaEl.value;
+  return EE.toM(parseFloat(t.ballDia || EE.fromM(0.04267, U()).toFixed(5)), U());
+}
+
+/* Every count goes through sphere ranging now: the two tangent rays through
+   the level rim extremes put the ball's centre at r / sin(half-angle) along
+   their bisector, so each ball is a full 3D point. The earlier single-ball
+   route — treat the rim extremes as two ground points a diameter apart — was
+   exact dead ahead but picked up a quadratic off-axis bias, about −1% at 8°
+   off the midline and −3.7% at 16°; ranging has no such term, and the
+   synthetic tests hold it to 0.0% across the frame.
+
+   One ball prices the camera height. Two check the sensor's plane along their
+   baseline and average the height. Three measure the deck plane outright, the
+   sensor only saying which way is up; the measured plane is stored in the
+   DEVICE frame (cal.deckDev) so the attitude cancels exactly, and every
+   consumer picks it up through deckNormalOf. */
 function applyBall() {
   var p = currentProject(), t = ui.trace;
   var st = findStation(p, t.stationId);
   if (!st.att) return toast('The ball route needs the tilt sensor');
-  if (t.taps.length < 2) return toast('Mark the centre, then drag to the rim');
 
-  var diaEl = $('#ball-dia');
-  if (diaEl) t.ballDia = diaEl.value;
-  var D = EE.toM(parseFloat(t.ballDia || EE.fromM(0.04267, U()).toFixed(5)), U());
+  var D = ballDiaM(t);
   if (!(D > 0.02 && D < 0.31)) return toast('Enter the ball diameter');
 
-  var fitb = t.ballFit;
-  var cyRow, xL, xR;
-  if (fitb) { cyRow = fitb.cy; xL = fitb.xL; xR = fitb.xR; }
-  else {
-    var r0 = Math.hypot(t.taps[1].x - t.taps[0].x, t.taps[1].y - t.taps[0].y);
-    cyRow = t.taps[0].y; xL = t.taps[0].x - r0; xR = t.taps[0].x + r0;
+  var set = ballSet(t);
+  if (!set.length) return toast('Mark the centre, then drag to the rim');
+  if (set.some(function (b) { return !(b.xR - b.xL > 6); })) {
+    return toast('One of those circles is too small to measure — get closer');
   }
-  if (!(xR - xL > 6)) return toast('That circle is too small to measure — get closer');
 
-  var f = stationF(st);
-  var R = attMatrix(st.att);
-  var a = EE.rayForPixel(xL, cyRow, st.imgW, st.imgH, f, effAngle(st));
-  var b = EE.rayForPixel(xR, cyRow, st.imgW, st.imgH, f, effAngle(st));
-  var solved = EE.camHeightFromKnown(a, b, R, D, deckNormalOf(st));
-  if (!(solved > 0.2 && solved < 30)) {
-    return toast('Could not solve from that circle — is the whole ball visible, on the deck?');
-  }
-  solved += D / 2;
-
-  st.cal = {
-    mode: 'ray', camH: solved, f: f, ok: true, source: 'ball',
-    provisionalScale: !db.settings.fovAt
+  var done = function (cal, msg) {
+    st.cal = cal;
+    db.settings.camH = cal.camH;
+    touchProject(p); save();
+    coverageCache = { key: null, val: null };
+    if (cal.camH < 0.7 || cal.camH > 2.6) msg += ' — not a handheld height; were the balls on the deck?';
+    if (cal.provisionalScale) msg += '. Scale provisional until one tape check (Check → Correct the scale).';
+    toast(msg);
+    t.step = 'trace'; t.taps = []; t.view = null; t.ballFit = null; t.balls = [];
+    render();
   };
-  db.settings.camH = solved;
-  touchProject(p); save();
-  coverageCache = { key: null, val: null };
 
-  var msg = 'Ball read at ' + (xR - xL).toFixed(0) + ' px — camera height ' + EE.fmtLen(solved, U(), 2);
-  if (solved < 0.7 || solved > 2.6) msg += ' — not a handheld height; was the ball on the deck?';
-  if (st.cal.provisionalScale) msg += '. Scale provisional until one tape check (Check → Correct the scale).';
-  toast(msg);
+  var sol = ballSolve(st, t, D);
+  if (set.length === 1) {
+    if (!sol || !sol.res || !(sol.res.camH > 0.2 && sol.res.camH < 30)) {
+      return toast('Could not solve from that circle — is the whole ball visible, on the deck?');
+    }
+    return done({
+      mode: 'ray', camH: sol.res.camH, f: sol.f, ok: true, source: 'ball',
+      provisionalScale: !db.settings.fovAt
+    }, 'Ball read at ' + (set[0].xR - set[0].xL).toFixed(0) + ' px — camera height ' +
+      EE.fmtLen(sol.res.camH, U(), 2));
+  }
 
-  t.step = 'trace'; t.taps = []; t.view = null; t.ballFit = null;
-  render();
+  if (!sol || !sol.res) {
+    var which = sol && sol.failed != null ? String.fromCharCode(65 + sol.failed) : '?';
+    return toast('Ball ' + which + ' would not solve — is the whole ball in frame, on the deck?');
+  }
+  var res = sol.res;
+  if (res.degenerate === 'collinear') {
+    return toast('The three balls sit nearly in a line — the plane across that line is unreadable. ' +
+      'Move one ball a stride sideways and re-lock it.');
+  }
+  if (res.degenerate === 'coincident') {
+    return toast('Those balls are almost on top of each other — spread them apart.');
+  }
+  if (!(res.camH > 0.2 && res.camH < 30)) {
+    return toast('Could not solve from those circles — are the balls on the deck, fully in frame?');
+  }
+
+  var cal = {
+    mode: 'ray', camH: res.camH, f: sol.f, ok: true, source: 'ball' + set.length,
+    provisionalScale: !db.settings.fovAt,
+    ballCheck: {
+      balls: set.length,
+      disagreeDeg: res.disagreeDeg != null ? +res.disagreeDeg.toFixed(2) : null,
+      sigmaDeg: res.sigmaDeg != null ? +res.sigmaDeg.toFixed(2) : null,
+      use: res.use
+    }
+  };
+  if (res.use === 'photo') cal.deckDev = res.n;
+
+  var msg;
+  if (set.length === 2) {
+    var hd = Math.abs(res.hs[0] - res.hs[1]);
+    var hPct = (hd / Math.max(res.hs[0], res.hs[1], 0.01) * 100).toFixed(1);
+    msg = res.use === 'photo'
+      ? 'The balls disagree with the sensor by ' + res.disagreeDeg.toFixed(1) +
+      '° along their line — plane corrected from the photo. Camera height ' + EE.fmtLen(res.camH, U(), 2)
+      : 'Two balls agree — heights within ' + hPct + '%, tilt confirmed to ±' +
+      res.sigmaDeg.toFixed(1) + '°. Camera height ' + EE.fmtLen(res.camH, U(), 2);
+  } else {
+    msg = res.use === 'photo'
+      ? 'Plane taken from the three balls alone — the sensor is off by ' + res.disagreeDeg.toFixed(1) +
+      '°. Camera height ' + EE.fmtLen(res.camH, U(), 2) +
+      (res.disagreeDeg > 8 ? '. That is a lot — worth re-running Read + sensor check.' : '')
+      : 'Three balls confirm the sensor\'s plane within ±' + res.sigmaDeg.toFixed(1) +
+      '° — camera height ' + EE.fmtLen(res.camH, U(), 2);
+  }
+  return done(cal, msg);
 }
 
 function applyMap() {
