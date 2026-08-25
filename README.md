@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     357 assertions over geo.js — open it in a browser
+    ├── test-geo.html     399 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -78,6 +78,38 @@ survives conditions the other route does not. On a roof you are rarely short of 
 If the shot also recorded a tilt, Eagle Eye takes a free lens calibration from the same four
 corners and stores it — which is what makes the second route trustworthy afterwards.
 
+### The hexagonal panel
+
+A regular hexagon of known side — a 15 cm acoustic panel does perfectly — is the best
+portable reference the app knows: *Calibrate → Hex panel*, tap its six corners walking
+around it, type one number. No tape measure, no long-and-short side to keep straight.
+
+Six corners over-determine the homography, and that surplus is the point: four corners
+always fit exactly, so they cannot criticise themselves, while six agree only as well as
+the taps and the print are true — and the calibration **reports that residual** ("six
+corners agree to ±4 mm"). Get close enough for the panel to span a decent part of the
+frame and it also pins the vanishing line and **measures the lens**, after which the ball
+and tilt modes inherit the true focal length instead of a guess. The panel's few
+millimetres of thickness shift the measured plane parallel to the deck by the same amount
+— beneath notice. High-contrast colour (orange on grey roof) makes the corners easy to
+tap and easy to snap.
+
+### Lock to horizon (outdoors)
+
+On a roof the far horizon is in half your shots, and it is a gravity reference better
+than the tilt sensor: two taps on it (calibration screen → **⇱ Lock to horizon**) give two
+rays that both lie level, so their cross product IS the down direction in the camera's
+frame. The shot's pitch and roll are then taken from the photo — the sensor only keeps
+the compass — and the per-device trims stop applying to that shot. Tap the *true* horizon
+(open water, distant skyline), not a parapet or nearby ridge: anything close sits below
+level and tilts the plane. (The visible horizon dips ~0.03°·√height-in-metres below true
+level — 0.2° from a 30 m roof — smaller than a tap.)
+
+The capture screen also carries a fine **plumb readout** near dead vertical, iPhone-level
+style: hold within half a degree and it locks green with a click, so shots can be taken
+at a known, repeatable attitude — and a chip that reads plumb when the phone visibly is
+not is the sensor bias advertising itself.
+
 ### Tilt + height
 
 Uses the attitude recorded at the shutter, the lens field of view, and your camera height
@@ -122,6 +154,16 @@ the most honest accuracy figure the app can produce.
 
 It also reports a **scale check**. If two shots disagree about size by 8%, one of the
 calibrations is wrong, and the number says so rather than quietly splitting the difference.
+
+**With three or more tied shots the survey is adjusted globally** — every pose and every
+landmark solved together, rather than each shot inheriting the errors of the one it tied
+to. The idea is global bundle adjustment's, scaled to a pocket: in 2D the similarity
+version of the problem is exactly linear (poses as complex numbers), so it solves in one
+step with no initial guess and no local minima, then tightens to rigid. It runs by itself
+as ties land, and from **Check → Adjust the survey** by hand; the toast reports landmark
+agreement before → after, names the worst landmark (usually one tapped on different
+features in different shots), and flags any shot whose scale wants to differ from the
+rest. Manually-placed shots and the origin stay put.
 
 Failing landmarks, place a shot by hand from the plan (rotation and offset).
 
@@ -554,7 +596,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 357 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 399 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

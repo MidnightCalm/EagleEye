@@ -1529,6 +1529,225 @@ function near(name, a, b, tol) {
   near('…width within 1.5 px', lk ? lk.dh : 0, 2 * rr, 1.5);
 })();
 
+/* ---- the hexagonal panel: an N-point planar reference ---- */
+(function () {
+  var W = 1512, HH = 2016, f = 1600, h = 1.55;
+  var Rtrue = EE.rotFromOrientation(12, 52, -4);
+  var side = 0.15;
+
+  /* A hexagon lying on the deck, rotated and offset, projected exactly. */
+  var rot = 23 * Math.PI / 180, ox = 0.35, oy = 1.7;
+  var world = EE.hexCorners(side).map(function (c) {
+    return { x: ox + c.x * Math.cos(rot) - c.y * Math.sin(rot),
+             y: oy + c.x * Math.sin(rot) + c.y * Math.cos(rot) };
+  });
+  var pix = world.map(function (pt) {
+    return EE.projectToPixel(pt, Rtrue, h, W, HH, f, 0, 0, [0, 0, 1]);
+  });
+  ok('hexagon projects into frame', pix.every(Boolean));
+
+  var span = 0;
+  pix.forEach(function (a) { pix.forEach(function (b) {
+    span = Math.max(span, Math.hypot(a.x - b.x, a.y - b.y)); }); });
+  ok('…spanning enough pixels to matter (' + span.toFixed(0) + ' px)', span > 180, span);
+
+  var H = EE.homographyFromPoints(pix, EE.hexCorners(side));
+  ok('six-point homography solves', !!H, 'null');
+  var res = EE.homographyResidual(H, pix, EE.hexCorners(side));
+  ok('…with a residual of essentially zero', res && res.rms < 1e-6, res && res.rms);
+
+  /* Lengths through the fitted map: a 0.5 m square elsewhere on the deck. */
+  var sq = [{ x: 0.0, y: 1.6 }, { x: 0.5, y: 1.6 }, { x: 0.5, y: 2.1 }, { x: 0.0, y: 2.1 }];
+  var sqPix = sq.map(function (pt) { return EE.projectToPixel(pt, Rtrue, h, W, HH, f, 0, 0, [0, 0, 1]); });
+  var g2 = sqPix.map(function (q) { return EE.applyH(H, q); });
+  ok('square survives the hexagon homography', g2.every(Boolean));
+  var side2 = function (i, j) { return Math.hypot(g2[i].x - g2[j].x, g2[i].y - g2[j].y); };
+  near('hexagon-calibrated square, side 1', side2(0, 1), 0.5, 0.002);
+  near('hexagon-calibrated square, side 2', side2(1, 2), 0.5, 0.002);
+
+  /* The lens, free of charge, from the same six corners. */
+  var foc = EE.focalFromHomography(H, W, HH);
+  ok('lens recovered from the hexagon', !!foc && Math.abs(foc.f - f) / f < 0.02,
+     foc && foc.f.toFixed(0) + ' vs ' + f);
+
+  /* Winding: a clockwise tap order, put through the app's fix (reverse keeping
+     the first), lands the same lengths. */
+  var cw = [pix[0]].concat(pix.slice(1).reverse());
+  ok('reversed taps have opposite winding', EE.signedArea(cw) * EE.signedArea(pix) < 0);
+  var fixed = EE.signedArea(cw) > 0 ? [cw[0]].concat(cw.slice(1).reverse()) : cw;
+  var H2 = EE.homographyFromPoints(fixed, EE.hexCorners(side));
+  var g3 = sqPix.map(function (q) { return EE.applyH(H2, q); });
+  ok('winding-fixed clockwise taps measure identically',
+     g3.every(Boolean) && Math.abs(Math.hypot(g3[0].x - g3[1].x, g3[0].y - g3[1].y) - 0.5) < 0.002);
+
+  /* Noisy taps: half-pixel noise on six corners stays a few millimetres. */
+  var noisy = pix.map(function (q, i) {
+    return { x: q.x + ((i * 37) % 7 - 3) * 0.18, y: q.y + ((i * 53) % 7 - 3) * 0.18 };
+  });
+  var Hn = EE.homographyFromPoints(noisy, EE.hexCorners(side));
+  var rn = EE.homographyResidual(Hn, noisy, EE.hexCorners(side));
+  ok('noisy taps: the residual reports the noise', rn && rn.rms > 1e-5 && rn.rms < 0.004, rn && rn.rms);
+  var g4 = sqPix.map(function (q) { return EE.applyH(Hn, q); });
+  ok('…and a square beside the panel is still true to a centimetre',
+     g4.every(Boolean) && Math.abs(Math.hypot(g4[0].x - g4[1].x, g4[0].y - g4[1].y) - 0.5) < 0.01,
+     Math.hypot(g4[0].x - g4[1].x, g4[0].y - g4[1].y).toFixed(4));
+
+  /* Model sanity: hexCorners edges and the 0-1-3-4 rectangle. */
+  var hc = EE.hexCorners(side);
+  var e01 = Math.hypot(hc[1].x - hc[0].x, hc[1].y - hc[0].y);
+  near('hexagon edge equals the side', e01, side, 1e-12);
+  var r01 = Math.hypot(hc[1].x - hc[0].x, hc[1].y - hc[0].y);
+  var r14 = Math.hypot(hc[3].x - hc[1].x, hc[3].y - hc[1].y);
+  near('corners 0-1-3-4 form a side × side·√3 rectangle', r14 / r01, Math.sqrt(3), 1e-9);
+})();
+
+/* ---- the horizon as an instrument ---- */
+(function () {
+  var W = 1512, HH = 2016, f = 1600, h = 1.55;
+  var nrm3 = function (a) { return Math.hypot(a[0], a[1], a[2]); };
+  var angDeg = function (a, b) {
+    var c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (nrm3(a) * nrm3(b));
+    return Math.acos(Math.min(1, Math.max(-1, c))) * 180 / Math.PI;
+  };
+  var pxOfDev = function (P) {
+    var d = [P[0] / nrm3(P), P[1] / nrm3(P), P[2] / nrm3(P)];
+    return { x: -f * d[0] / d[2] + W / 2, y: f * d[1] / d[2] + HH / 2 };
+  };
+  var Rtrue = EE.rotFromOrientation(12, 52, -4);
+  var toDev = function (R, v) { return EE.applyM3(EE.transpose3(R), v); };
+
+  /* Two pixels ON the true horizon: world-horizontal directions, in frame. */
+  var hpx = [100, 260].map(function (azOff) {
+    var az = (90 + 12 - azOff / 10) * Math.PI / 180;   /* near the camera's facing */
+    return pxOfDev(toDev(Rtrue, [Math.cos(az), Math.sin(az), 0]));
+  });
+  var gTrue = toDev(Rtrue, [0, 0, -1]);
+  var g = EE.gravityFromHorizon(hpx[0], hpx[1], W, HH, f, 0, gTrue);
+  ok('horizon taps yield gravity', !!g, 'null');
+  ok('…to a twentieth of a degree', angDeg(g, gTrue) < 0.05, angDeg(g, gTrue).toFixed(4) + '°');
+
+  /* A sensor lying 6°+2° is straightened by the photo. */
+  var Rlie = EE.rotFromOrientation(12, 58, -2);
+  var out = EE.alignToGravity(Rlie, g);
+  ok('the lie is measured (~6.3°)', out.movedDeg > 5.5 && out.movedDeg < 7.2, out.movedDeg);
+  ok('corrected attitude puts down where the photo says',
+     angDeg(toDev(out.R, [0, 0, -1]), gTrue) < 0.05,
+     angDeg(toDev(out.R, [0, 0, -1]), gTrue).toFixed(4));
+
+  /* Euler round trip, including through the corrected matrix. */
+  var e = EE.orientationFromRot(out.R);
+  var Rback = EE.rotFromOrientation(e.alpha, e.beta, e.gamma);
+  var err = 0;
+  for (var i = 0; i < 9; i++) err = Math.max(err, Math.abs(Rback[i] - out.R[i]));
+  near('orientationFromRot inverts rotFromOrientation', err, 0, 1e-9);
+  [[0, 52, -4], [123, -37, 12], [301, 88, 44], [45, -88, -160]].forEach(function (abg) {
+    var R0 = EE.rotFromOrientation(abg[0], abg[1], abg[2]);
+    var e0 = EE.orientationFromRot(R0);
+    var R1 = EE.rotFromOrientation(e0.alpha, e0.beta, e0.gamma);
+    var d0 = 0;
+    for (var j = 0; j < 9; j++) d0 = Math.max(d0, Math.abs(R0[j] - R1[j]));
+    near('euler round trip [' + abg.join(',') + ']', d0, 0, 1e-9);
+  });
+
+  /* THE OUTDOOR MONEY SHOT: lying sensor, two horizon taps, and a true square
+     through the ray pipeline — the exact route a locked shot takes. */
+  var sq = [{ x: 0.3, y: 1.9 }, { x: 0.8, y: 1.9 }, { x: 0.8, y: 2.4 }, { x: 0.3, y: 2.4 }];
+  var pixT = sq.map(function (pt) { return EE.projectToPixel(pt, Rtrue, h, W, HH, f, 0, 0, [0, 0, 1]); });
+  var Hlock = EE.homographyFromPose(out.R, h, f, W, HH, 0, [0, 0, 1]);
+  var gnd = pixT.map(function (q) { return EE.applyH(Hlock, q); });
+  ok('locked-attitude homography maps the square', gnd.every(Boolean));
+  var sd = function (i2, j2) { return Math.hypot(gnd[i2].x - gnd[j2].x, gnd[i2].y - gnd[j2].y); };
+  near('horizon-locked square, side 1', sd(0, 1), 0.5, 0.003);
+  near('horizon-locked square, side 2', sd(1, 2), 0.5, 0.003);
+  near('horizon-locked square, side 3', sd(2, 3), 0.5, 0.003);
+
+  /* Refusals: taps too close together, or nothing to cross. */
+  ok('a 30 px horizon line is refused', EE.gravityFromHorizon(
+    { x: 700, y: 900 }, { x: 725, y: 903 }, W, HH, f, 0, gTrue) === null);
+})();
+
+/* ---- the principal colour axis ---- */
+(function () {
+  var ORANGE = [235, 120, 40], GREY = [128, 126, 124];
+  var mixed = [];
+  for (var i = 0; i < 30; i++) {
+    var base = i % 2 ? ORANGE : GREY;
+    mixed.push([base[0] + (i % 5) - 2, base[1] + (i % 3) - 1, base[2] + (i % 7) - 3]);
+  }
+  var pa = EE.principalAxis(mixed);
+  ok('a two-material patch yields its axis', !!pa, 'null');
+  var diff = [ORANGE[0] - GREY[0], ORANGE[1] - GREY[1], ORANGE[2] - GREY[2]];
+  var m = Math.hypot(diff[0], diff[1], diff[2]);
+  var alignment = Math.abs(pa.w[0] * diff[0] / m + pa.w[1] * diff[1] / m + pa.w[2] * diff[2] / m);
+  ok('…aligned with the material difference', alignment > 0.98, alignment.toFixed(3));
+  var flat = [];
+  for (i = 0; i < 30; i++) flat.push([128 + (i % 3) - 1, 128, 128]);
+  ok('a flat patch yields nothing', EE.principalAxis(flat) === null);
+})();
+
+/* ---- adjusting the whole survey at once ---- */
+(function () {
+  /* Truth: five landmarks; three stations see overlapping subsets from their
+     own frames. Station A is the origin. */
+  var LM = { a: { x: 0, y: 0 }, b: { x: 4, y: 0.5 }, c: { x: 7.5, y: 2 }, d: { x: 11, y: 1 }, e: { x: 3, y: 5 } };
+  var poseTruth = {
+    A: { theta: 0, tx: 0, ty: 0 },
+    B: { theta: 0.35, tx: 5, ty: -1 },
+    C: { theta: -0.55, tx: 9.5, ty: 3 }
+  };
+  /* observation = inverse-transform of the world landmark into the station frame */
+  var obs = function (P, pt) {
+    var c = Math.cos(-P.theta), s = Math.sin(-P.theta);
+    var x = pt.x - P.tx, y = pt.y - P.ty;
+    return { x: c * x - s * y, y: s * x + c * y };
+  };
+  var sees = { A: ['a', 'b', 'e'], B: ['b', 'c', 'd', 'e'], C: ['c', 'd'] };
+  var mk = function (noise) {
+    var k = 0;
+    return ['A', 'B', 'C'].map(function (id) {
+      return {
+        id: id, fixed: id === 'A',
+        pts: sees[id].map(function (nm) {
+          var o = obs(poseTruth[id], LM[nm]);
+          k++;
+          return { name: nm, x: o.x + (noise ? ((k * 37) % 5 - 2) * 0.01 : 0),
+                   y: o.y + (noise ? ((k * 53) % 5 - 2) * 0.01 : 0) };
+        })
+      };
+    });
+  };
+
+  var exact = EE.adjust2D(mk(false));
+  ok('global adjustment solves', !!exact, 'null');
+  near('…station B rotation exact', exact.poses.B.theta, 0.35, 1e-9);
+  near('…station C rotation exact', exact.poses.C.theta, -0.55, 1e-9);
+  near('…station C x exact', exact.poses.C.tx, 9.5, 1e-8);
+  near('…zero residual on perfect data', exact.rms, 0, 1e-9);
+  near('…landmark d recovered', Math.hypot(exact.landmarks.d.x - 11, exact.landmarks.d.y - 1), 0, 1e-8);
+  near('…linear stage found unit scale', exact.poses.B.scaleLin, 1, 1e-6);
+
+  var noisy = EE.adjust2D(mk(true));
+  ok('with 2 cm of tap noise: poses within 4 cm',
+     Math.hypot(noisy.poses.C.tx - 9.5, noisy.poses.C.ty - 3) < 0.04,
+     Math.hypot(noisy.poses.C.tx - 9.5, noisy.poses.C.ty - 3).toFixed(3));
+  ok('…and the residual reports the noise honestly', noisy.rms > 0.001 && noisy.rms < 0.03, noisy.rms);
+
+  /* One station whose calibration is 6% large: the linear stage reads it. */
+  var scaled = mk(false);
+  scaled[1].pts = scaled[1].pts.map(function (o) { return { name: o.name, x: o.x * 1.06, y: o.y * 1.06 }; });
+  var sc = EE.adjust2D(scaled);
+  ok('a 6% scale disagreement is measured by the linear stage',
+     sc && Math.abs(sc.poses.B.scaleLin - 1 / 1.06) < 0.01,
+     sc && sc.poses.B.scaleLin.toFixed(4));
+
+  /* Degenerate: only one shared landmark in total. */
+  var thin = [
+    { id: 'A', fixed: true, pts: [{ name: 'a', x: 0, y: 0 }] },
+    { id: 'B', fixed: false, pts: [{ name: 'a', x: 1, y: 1 }] }
+  ];
+  ok('one shared landmark is refused', EE.adjust2D(thin) === null);
+})();
+
 document.getElementById('out').innerHTML = lines.join('');
 document.getElementById('sum').innerHTML = fail === 0
   ? '<span class="ok">ALL ' + pass + ' CHECKS PASSED</span>'

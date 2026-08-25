@@ -1068,6 +1068,325 @@ var EE = (function () {
     return res;
   }
 
+  /* ================= planar references with more than four corners =================
+
+     A regular reference with N corners over-determines the homography, and the
+     surplus is the value: four points always fit exactly and so say nothing
+     about their own quality, while a fifth and sixth disagree by exactly the
+     amount the taps and the print are wrong. Solved as a normalised linear
+     least-squares (Hartley's normalisation — centre both point sets and scale
+     to mean distance √2 — which turns a numerically vile system into a tame
+     one; the standard prescription for DLT). */
+  function homographyFromPoints(imgPts, refPts) {
+    if (!imgPts || !refPts || imgPts.length < 4 || imgPts.length !== refPts.length) return null;
+    var n = imgPts.length;
+
+    var normalise = function (pts) {
+      var cx = 0, cy = 0, i;
+      for (i = 0; i < n; i++) { cx += pts[i].x; cy += pts[i].y; }
+      cx /= n; cy /= n;
+      var d = 0;
+      for (i = 0; i < n; i++) d += Math.hypot(pts[i].x - cx, pts[i].y - cy);
+      d /= n;
+      var s = d > 1e-12 ? Math.SQRT2 / d : 1;
+      return {
+        s: s, cx: cx, cy: cy,
+        pts: pts.map(function (p) { return { x: (p.x - cx) * s, y: (p.y - cy) * s }; })
+      };
+    };
+    var A = normalise(imgPts), B = normalise(refPts);
+
+    /* 2n equations in the 8 unknowns of H (h8 = 1), assembled straight into the
+       normal equations. */
+    var M = [], v = [], r, c;
+    for (r = 0; r < 8; r++) { M.push([0, 0, 0, 0, 0, 0, 0, 0]); v.push(0); }
+    var addRow = function (row, rhs) {
+      for (r = 0; r < 8; r++) {
+        for (c = 0; c < 8; c++) M[r][c] += row[r] * row[c];
+        v[r] += row[r] * rhs;
+      }
+    };
+    for (var i = 0; i < n; i++) {
+      var x = A.pts[i].x, y = A.pts[i].y, X = B.pts[i].x, Y = B.pts[i].y;
+      addRow([x, y, 1, 0, 0, 0, -x * X, -y * X], X);
+      addRow([0, 0, 0, x, y, 1, -x * Y, -y * Y], Y);
+    }
+    var h = solveLinear(M, v);
+    if (!h) return null;
+    var Hn = [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+
+    /* Denormalise: H = Tref^-1 · Hn · Timg. */
+    var Timg = [A.s, 0, -A.s * A.cx, 0, A.s, -A.s * A.cy, 0, 0, 1];
+    var TrefInv = [1 / B.s, 0, B.cx, 0, 1 / B.s, B.cy, 0, 0, 1];
+    var H = mul3(TrefInv, mul3(Hn, Timg));
+    if (!H.every(isFinite)) return null;
+
+    /* Same sign convention as every other H in the app. */
+    var mid = { x: 0, y: 0 };
+    for (i = 0; i < n; i++) { mid.x += imgPts[i].x / n; mid.y += imgPts[i].y / n; }
+    return orientH(H, mid);
+  }
+
+  /* Corners of a regular hexagon of the given side, anticlockwise, centred on
+     the origin. The circumradius of a regular hexagon IS its side. */
+  function hexCorners(side) {
+    var out = [];
+    for (var k = 0; k < 6; k++) {
+      var a = k * 60 * DEG;
+      out.push({ x: side * Math.cos(a), y: side * Math.sin(a) });
+    }
+    return out;
+  }
+
+  /* Shoelace, signed. In image coordinates (y down) a polygon walked clockwise
+     on screen comes out positive — the sign is what the winding fix reads. */
+  function signedArea(pts) {
+    var s = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var a = pts[i], b = pts[(i + 1) % pts.length];
+      s += a.x * b.y - b.x * a.y;
+    }
+    return s / 2;
+  }
+
+  /* ================= the horizon as an instrument =================
+
+     Outdoors the true horizon is a gravity reference better than any MEMS
+     sensor: two pixels on it give two rays that BOTH lie in the horizontal
+     plane through the camera, so their cross product is vertical — the full
+     gravity direction in the device frame, read from the photo. (The visible
+     horizon dips below true horizontal by ~0.03° per √metre of height above
+     the surrounding terrain — 0.2° from a 30 m roof — which is smaller than a
+     tap and is noted rather than modelled.) */
+  function gravityFromHorizon(p1, p2, imgW, imgH, f, screenAngle, gHintDev) {
+    if (!p1 || !p2) return null;
+    if (Math.hypot(p2.x - p1.x, p2.y - p1.y) < 40) return null;   /* too short to aim */
+    var a = rayForPixel(p1.x, p1.y, imgW, imgH, f, screenAngle);
+    var b = rayForPixel(p2.x, p2.y, imgW, imgH, f, screenAngle);
+    var g = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    var m = Math.hypot(g[0], g[1], g[2]);
+    if (m < 1e-9) return null;
+    g = [g[0] / m, g[1] / m, g[2] / m];
+    /* Two signs describe the same line; the sensor — however biased — is never
+       wrong about which way is DOWN. Without a hint, screen-top-up is assumed. */
+    var hint = gHintDev || [0, -1, 0];
+    if (g[0] * hint[0] + g[1] * hint[1] + g[2] * hint[2] < 0) g = [-g[0], -g[1], -g[2]];
+    return g;
+  }
+
+  /* Euler angles back out of a rotation matrix — the exact inverse of
+     rotFromOrientation (Z-X'-Y'' order). Near beta = ±90° the alpha/gamma pair
+     degenerates; the fallback pins gamma and puts the whole yaw in alpha. */
+  function orientationFromRot(R) {
+    var sB = Math.max(-1, Math.min(1, R[7]));
+    var beta = Math.asin(sB);
+    var cB = Math.cos(beta);
+    if (Math.abs(cB) < 1e-6) {
+      return { alpha: Math.atan2(R[2], R[0]) / DEG, beta: beta / DEG, gamma: 0 };
+    }
+    return {
+      alpha: Math.atan2(-R[1], R[4]) / DEG,
+      beta: beta / DEG,
+      gamma: Math.atan2(-R[6], R[8]) / DEG
+    };
+  }
+
+  /* Rotation about a unit axis (Rodrigues). */
+  function rotAxisAngle(axis, ang) {
+    var c = Math.cos(ang), s = Math.sin(ang), t = 1 - c;
+    var x = axis[0], y = axis[1], z = axis[2];
+    return [
+      t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+      t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+      t * x * z - s * y, t * y * z + s * x, t * z * z + c
+    ];
+  }
+
+  /* Correct an attitude so that device-frame down matches a measured direction
+     (from the tapped horizon), disturbing the yaw as little as possible: the
+     minimal rotation taking the measured down onto the sensor's down, composed
+     on the device side. */
+  function alignToGravity(Rsensor, gDevMeasured) {
+    var d = [0, 0, -1];
+    var gS = applyM3(transpose3(Rsensor), d);
+    var gT = gDevMeasured;
+    var dot = gT[0] * gS[0] + gT[1] * gS[1] + gT[2] * gS[2];
+    dot = Math.max(-1, Math.min(1, dot));
+    var ax = [gT[1] * gS[2] - gT[2] * gS[1], gT[2] * gS[0] - gT[0] * gS[2], gT[0] * gS[1] - gT[1] * gS[0]];
+    var m = Math.hypot(ax[0], ax[1], ax[2]);
+    if (m < 1e-9) return { R: Rsensor, movedDeg: 0 };
+    var Q = rotAxisAngle([ax[0] / m, ax[1] / m, ax[2] / m], Math.acos(dot));
+    return { R: mul3(Rsensor, Q), movedDeg: Math.acos(dot) / DEG };
+  }
+
+  /* The dominant colour axis of a patch — the direction RGB actually varies
+     along, found by power iteration on the 3×3 covariance. For a two-material
+     patch (panel corner against deck) this IS the material boundary's axis,
+     whatever the colours are; projecting onto it concentrates the boundary's
+     contrast into one channel the way luminance only manages by luck. */
+  function principalAxis(rgbSamples) {
+    if (!rgbSamples || rgbSamples.length < 8) return null;
+    var n = rgbSamples.length, mean = [0, 0, 0], i, k;
+    for (i = 0; i < n; i++) for (k = 0; k < 3; k++) mean[k] += rgbSamples[i][k] / n;
+    var C = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (i = 0; i < n; i++) {
+      var d = [rgbSamples[i][0] - mean[0], rgbSamples[i][1] - mean[1], rgbSamples[i][2] - mean[2]];
+      for (var r2 = 0; r2 < 3; r2++) for (var c2 = 0; c2 < 3; c2++) C[r2 * 3 + c2] += d[r2] * d[c2] / n;
+    }
+    var w = [1, 1, 1];
+    for (i = 0; i < 24; i++) {
+      w = applyM3(C, w);
+      var m2 = Math.hypot(w[0], w[1], w[2]);
+      if (m2 < 1e-9) return null;
+      w = [w[0] / m2, w[1] / m2, w[2] / m2];
+    }
+    var lambda = Math.hypot.apply(null, applyM3(C, w));
+    if (lambda < 25) return null;              /* flat patch — nothing varies */
+    return { w: w, strength: Math.sqrt(lambda) };
+  }
+
+  /* ================= adjusting the whole survey at once =================
+
+     Shots are placed pairwise as they arrive, so tie error compounds along the
+     chain. The fix — borrowed in spirit from global bundle adjustment — is to
+     solve every pose and every landmark TOGETHER. In 2D the problem is kinder
+     than the 3D original: writing each pose as a complex number z = s·e^{iθ}
+     plus a translation makes "landmark k seen from station i" EXACTLY linear,
+     so one least-squares solve lands the global optimum of the similarity
+     version with no initial guess at all. A few closed-form alternation sweeps
+     then tighten it to rigid (unit scale), which is the app's convention —
+     the per-station |z| from the linear stage is reported as a scale check
+     rather than silently applied.
+
+     `stations`: [{ id, fixed, pts: [{name, x, y}] }] in each station's own
+     frame; the first FIXED station defines the gauge. Returns per-station
+     poses, fused landmarks, and residuals. */
+  function adjust2D(stations) {
+    if (!stations || stations.length < 2) return null;
+
+    /* landmarks seen from at least two stations */
+    var count = {}, i, j, k;
+    stations.forEach(function (s) {
+      s.pts.forEach(function (o) { count[o.name] = (count[o.name] || 0) + 1; });
+    });
+    var names = Object.keys(count).filter(function (nm) { return count[nm] >= 2; });
+    if (names.length < 2) return null;
+    var lmIdx = {};
+    names.forEach(function (nm, ii) { lmIdx[nm] = ii; });
+
+    var free = [], freeIdx = {};
+    stations.forEach(function (s) {
+      s.use = s.pts.filter(function (o) { return lmIdx[o.name] != null; });
+      if (!s.fixed && s.use.length >= 2) { freeIdx[s.id] = free.length; free.push(s); }
+    });
+    var anyFixed = stations.some(function (s) { return s.fixed && s.use.length >= 1; });
+    if (!anyFixed || !free.length) return null;
+
+    /* unknowns: [a,b,tx,ty] per free station, then [px,py] per landmark */
+    var NF = free.length, M = names.length, dim = 4 * NF + 2 * M;
+    var A = [], b = [];
+    for (i = 0; i < dim; i++) {
+      var row0 = [];
+      for (j = 0; j < dim; j++) row0.push(0);
+      A.push(row0); b.push(0);
+    }
+    var addEq = function (idx, coef, rhs) {
+      for (var r2 = 0; r2 < idx.length; r2++) {
+        for (var c2 = 0; c2 < idx.length; c2++) A[idx[r2]][idx[c2]] += coef[r2] * coef[c2];
+        b[idx[r2]] += coef[r2] * rhs;
+      }
+    };
+    stations.forEach(function (s) {
+      if (s.fixed) {
+        s.use.forEach(function (o) {
+          var L = 4 * NF + 2 * lmIdx[o.name];
+          addEq([L], [1], o.x);          /* px = x (identity pose) */
+          addEq([L + 1], [1], o.y);
+        });
+      } else if (freeIdx[s.id] != null) {
+        var base = 4 * freeIdx[s.id];
+        s.use.forEach(function (o) {
+          var L = 4 * NF + 2 * lmIdx[o.name];
+          /* a·x − b·y + tx − px = 0 ; b·x + a·y + ty − py = 0 */
+          addEq([base, base + 1, base + 2, L], [o.x, -o.y, 1, -1], 0);
+          addEq([base, base + 1, base + 3, L + 1], [o.y, o.x, 1, -1], 0);
+        });
+      }
+    });
+    var sol = solveLinear(A, b);
+    if (!sol) return null;
+
+    var poses = {};
+    stations.forEach(function (s) {
+      if (s.fixed) { poses[s.id] = { theta: 0, tx: 0, ty: 0, scaleLin: 1, fixed: true }; return; }
+      var fi = freeIdx[s.id];
+      if (fi == null) return;
+      var a2 = sol[4 * fi], b2 = sol[4 * fi + 1];
+      poses[s.id] = {
+        theta: Math.atan2(b2, a2),
+        tx: sol[4 * fi + 2], ty: sol[4 * fi + 3],
+        scaleLin: Math.hypot(a2, b2)
+      };
+    });
+    var lms = {};
+    names.forEach(function (nm) {
+      var L = 4 * NF + 2 * lmIdx[nm];
+      lms[nm] = { x: sol[L], y: sol[L + 1] };
+    });
+
+    /* Tighten to rigid: landmarks from means, poses from rigid2D, thrice. */
+    var xf = function (P, o) {
+      var c = Math.cos(P.theta), s2 = Math.sin(P.theta);
+      return { x: c * o.x - s2 * o.y + P.tx, y: s2 * o.x + c * o.y + P.ty };
+    };
+    for (var sweep = 0; sweep < 3; sweep++) {
+      names.forEach(function (nm) {
+        var sx = 0, sy = 0, n2 = 0;
+        stations.forEach(function (s) {
+          var P = poses[s.id]; if (!P) return;
+          s.use.forEach(function (o) {
+            if (o.name !== nm) return;
+            var q = xf(P, o); sx += q.x; sy += q.y; n2++;
+          });
+        });
+        if (n2) lms[nm] = { x: sx / n2, y: sy / n2 };
+      });
+      free.forEach(function (s) {
+        var src = [], dst = [];
+        s.use.forEach(function (o) {
+          src.push({ x: o.x, y: o.y });
+          dst.push(lms[o.name]);
+        });
+        var fit = rigid2D(src, dst);
+        if (fit) poses[s.id] = { theta: fit.theta, tx: fit.tx, ty: fit.ty, scaleLin: poses[s.id].scaleLin };
+      });
+    }
+
+    /* residuals */
+    var total = 0, nObs = 0, worst = null;
+    names.forEach(function (nm) {
+      var seen = [];
+      stations.forEach(function (s) {
+        var P = poses[s.id]; if (!P) return;
+        s.use.forEach(function (o) { if (o.name === nm) seen.push(xf(P, o)); });
+      });
+      if (seen.length < 2) return;
+      var mx = 0, my = 0;
+      seen.forEach(function (q) { mx += q.x / seen.length; my += q.y / seen.length; });
+      var spread = 0;
+      seen.forEach(function (q) { spread = Math.max(spread, Math.hypot(q.x - mx, q.y - my)); });
+      lms[nm] = { x: mx, y: my, spread: spread, n: seen.length };
+      seen.forEach(function (q) { total += (q.x - mx) * (q.x - mx) + (q.y - my) * (q.y - my); nObs++; });
+      if (!worst || spread > worst.spread) worst = { name: nm, spread: spread };
+    });
+
+    return {
+      poses: poses, landmarks: lms,
+      rms: nObs ? Math.sqrt(total / nObs) : 0,
+      worst: worst, nLandmarks: names.length, nStations: NF
+    };
+  }
+
   /* The best scalar channel for a given ball: the straight line in RGB space
      from "outside the circle" to "inside it".
 
@@ -1948,6 +2267,10 @@ var EE = (function () {
     rayForPixel: rayForPixel, groundPoint: groundPoint, projectToPixel: projectToPixel,
     heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
     sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
+    homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
+    gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
+    rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,
+    principalAxis: principalAxis, adjust2D: adjust2D,
     layoverFactor: layoverFactor, reliefDisplacement: reliefDisplacement,
     maxSafeObjectHeight: maxSafeObjectHeight,
     bearingSensitivity: bearingSensitivity, positionSigma: positionSigma,

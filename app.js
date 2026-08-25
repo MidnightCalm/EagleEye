@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.16.1';
+var VERSION = '1.17.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -265,6 +265,91 @@ function ensureOrigin(p) {
   if (!placed) p.stations[0].reg = { theta: 0, tx: 0, ty: 0, rms: 0, n: 0, method: 'origin' };
 }
 
+/* How far apart the copies of each named landmark currently sit — the honest
+   "before" number for the global adjustment. */
+function landmarkSpread(p) {
+  var groups = {};
+  tiePoints(p).forEach(function (k) {
+    (groups[k.name] || (groups[k.name] = [])).push(k.pt);
+  });
+  var total = 0, n = 0;
+  Object.keys(groups).forEach(function (nm) {
+    var g = groups[nm];
+    if (g.length < 2) return;
+    var mx = 0, my = 0;
+    g.forEach(function (q) { mx += q.x / g.length; my += q.y / g.length; });
+    g.forEach(function (q) { total += (q.x - mx) * (q.x - mx) + (q.y - my) * (q.y - my); n++; });
+  });
+  return n ? Math.sqrt(total / n) : null;
+}
+
+/* Every pose and every landmark, solved TOGETHER.
+
+   Shots are placed pairwise as they arrive, so each new tie inherits the error
+   of the shot it tied to and the chain drifts. The global adjustment — the
+   idea, if not the machinery, of global bundle adjustment — re-solves all the
+   tied shots against all the shared landmarks at once. In 2D the similarity
+   version is exactly linear (complex-number poses), so it needs no initial
+   guess and cannot land in a local minimum; a few closed-form sweeps then
+   tighten it to the app's rigid convention. Manually-placed shots and the
+   origin stay put; only tie-placed shots move. */
+function runAdjust(p, verbose) {
+  var sts = [];
+  p.stations.forEach(function (st) {
+    if (!st.reg) return;
+    var pts = objectsOf(p, st.id)
+      .filter(function (o) { return o.kind === 'point' && o.name && o.pts && o.pts[0]; })
+      .map(function (o) { return { name: o.name.trim().toLowerCase(), x: o.pts[0].x, y: o.pts[0].y }; });
+    sts.push({ id: st.id, fixed: st.reg.method !== 'tie', pts: pts });
+  });
+
+  var before = landmarkSpread(p);
+  var res = EE.adjust2D(sts);
+  if (!res) {
+    if (verbose) toast('Nothing to adjust yet — it needs two or more shots sharing named landmarks.');
+    return null;
+  }
+
+  var moved = 0, scaleWorst = 0;
+  p.stations.forEach(function (st) {
+    var P = res.poses[st.id];
+    if (!P || P.fixed || !st.reg || st.reg.method !== 'tie') return;
+    st.reg.theta = P.theta; st.reg.tx = P.tx; st.reg.ty = P.ty;
+    st.reg.adjusted = true;
+    moved++;
+    if (P.scaleLin) scaleWorst = Math.max(scaleWorst, Math.abs(P.scaleLin - 1));
+  });
+  if (!moved) { if (verbose) toast('Only one tied shot — nothing to redistribute yet.'); return null; }
+
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+  ui.plan.fitted = false;
+
+  if (verbose || (before != null && before - res.rms > 0.01)) {
+    var msg = 'Survey adjusted globally — ' + moved + ' shot' + (moved === 1 ? '' : 's') +
+      ' and ' + res.nLandmarks + ' landmarks solved together. Landmark agreement ' +
+      (before != null ? '±' + (before * 100).toFixed(0) + ' cm → ' : '') +
+      '±' + (res.rms * 100).toFixed(0) + ' cm' +
+      (res.worst && res.worst.spread > 0.25
+        ? '. Worst is "' + esc(res.worst.name) + '" at ±' + (res.worst.spread * 100).toFixed(0) +
+        ' cm — that landmark was likely tapped on different features in different shots'
+        : '');
+    if (scaleWorst > 0.05) {
+      msg += '. One shot wants to be ' + (scaleWorst * 100).toFixed(0) +
+        '% bigger than the rest — a calibration disagrees; see the scale check.';
+    }
+    toast(msg);
+  }
+  return res;
+}
+
+/* Worth running silently once three or more shots are tied together. */
+function maybeAutoAdjust(p) {
+  var tied = p.stations.filter(function (s) { return s.reg && s.reg.method === 'tie'; }).length;
+  var placed = p.stations.filter(function (s) { return !!s.reg; }).length;
+  if (tied >= 2 && placed >= 3) runAdjust(p, false);
+}
+
 /* ================= calibration ================= */
 
 /* One interface over the two mapping engines, so every caller — the grid
@@ -387,6 +472,59 @@ function calibrateQuad(st, quadPix, refW, refL) {
     }
   }
   return cal;
+}
+
+/* An N-cornered planar reference — the hexagon path. Same contract as
+   calibrateQuad, plus the thing four corners can never give: a residual. Four
+   points always fit a homography exactly, so they cannot criticise themselves;
+   a fifth and sixth disagree by exactly what the taps and the print are wrong,
+   and that number is reported instead of hidden. */
+function calibratePlanar(st, imgPts, refPts, refW, refL) {
+  var H = EE.homographyFromPoints(imgPts, refPts);
+  if (!H) return { ok: false, err: 'Those corners do not form a usable shape — retake them, spread apart.' };
+
+  var cal = { mode: 'quad', H: H, quadPix: imgPts.slice(), refW: refW, refL: refL, f: stationF(st), ok: true };
+  var res = EE.homographyResidual(H, imgPts, refPts);
+  if (res) cal.planarRms = res.rms;
+
+  cal.focal = EE.focalFromHomography(H, st.imgW, st.imgH);
+  if (cal.focal) {
+    cal.fovMeasured = EE.fovFromFocalLong(cal.focal.f, Math.max(st.imgW, st.imgH));
+    cal.f = cal.focal.f;
+  }
+
+  if (st.att) {
+    var R = attMatrix(st.att);
+    var unit2 = imgPts.map(function (q) {
+      return EE.groundPoint(EE.rayForPixel(q.x, q.y, st.imgW, st.imgH, cal.f, effAngle(st)), R, 1, 0, deckNormalOf(st));
+    });
+    if (unit2.every(Boolean)) {
+      var fit2 = EE.similarity2D(unit2, refPts);
+      if (fit2 && fit2.scale > 0.2 && fit2.scale < 30) {
+        cal.pose = fit2;
+        cal.camH = fit2.scale;
+        cal.poseRms = fit2.rms;
+      }
+    }
+  }
+  return cal;
+}
+
+/* Write a measured lens into settings — shared by every planar calibration.
+   Only from a reference big enough to mean it, and only when the two
+   independent focal estimates agree. */
+function adoptMeasuredLens(st, cal, q0) {
+  if (cal.fovMeasured && q0 && q0.minSpanPx >= SMALL_REF_PX &&
+    (cal.focal.disagree == null || cal.focal.disagree < 0.06)) {
+    db.settings.fov = cal.fovMeasured;
+    db.settings.fovFrom = (st.cam && st.cam.label) || 'this camera';
+    db.settings.fovAt = Date.now();
+    (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[st.imgW + 'x' + st.imgH] = cal.fovMeasured;
+    save();
+    return ' · lens measured at ' + cal.fovMeasured.toFixed(1) + '°';
+  }
+  if (cal.fovMeasured) return ' · lens reads ' + cal.fovMeasured.toFixed(1) + '°, reference too small to trust it';
+  return '';
 }
 
 /* Calibrate a shot straight from an aerial.
@@ -756,6 +894,9 @@ function stationF(st) {
 }
 
 function attMatrix(a) {
+  /* A horizon-locked shot carries an attitude measured from the photo itself;
+     the per-device trims are a fudge for the sensor and must not touch it. */
+  if (a.horizonLocked) return EE.rotFromOrientation(a.alpha, a.beta, a.gamma);
   return EE.rotFromOrientation(a.alpha,
     a.beta + (db.settings.pitchTrim || 0),
     a.gamma + (db.settings.rollTrim || 0));
@@ -1516,6 +1657,8 @@ function tplCheck(p) {
     '</div>' +
     '<button class="btn primary sm" data-act="rescale">Correct the scale</button>' +
     '<button class="btn ghost-gold sm" data-act="align">Align to the building</button>' +
+    (p.stations.filter(function (s2) { return s2.reg && s2.reg.method === 'tie'; }).length >= 1
+      ? '<button class="btn ghost-gold sm" data-act="adjust-survey">Adjust the survey</button>' : '') +
     (scaleSpread(p) ? '<button class="btn ghost-gold sm" data-act="scaleagree">Scale across shots</button>' : '') +
     '<button class="btn ghost-gold sm" data-act="howto">How to measure well</button></div>' +
     '<div class="panel"><span class="p-tag">TRUSTED RADIUS</span>' +
@@ -1662,6 +1805,7 @@ function tplCapture() {
         '⌂ Set the flat plane first</button>') +
       '<div class="tilt-bar"><div class="band" style="left:27.7%;width:44.4%"></div>' +
       '<div class="mark" id="tilt-mark" style="left:' + clamp(tiltDeg(), 0, 90) / 90 * 100 + '%"></div></div>' +
+      '<div class="pill tiny" id="plumb-chip" style="align-self:flex-start;display:none"></div>' +
       '<div class="hint" id="cap-hint">' + captureHint() + '</div>' +
       '<div class="shutter-row"><button class="shutter" data-act="shoot"' + (c.ready ? '' : ' disabled') + '><div></div></button></div>';
   }
@@ -1704,6 +1848,29 @@ function paintCaptureHud() {
   hint.innerHTML = captureHint();
   var mark = $('#tilt-mark');
   if (mark) mark.style.left = clamp(tiltDeg(), 0, 90) / 90 * 100 + '%';
+
+  /* The spirit-level readout, iPhone-camera style: fine pitch/roll against
+     dead vertical whenever you are close to it. Knowing a shot was taken
+     plumb makes its geometry human-checkable — and a chip that reads plumb
+     when the phone visibly is not is the sensor bias advertising itself. */
+  var plumb = $('#plumb-chip');
+  if (plumb) {
+    var dvP = Math.abs(tiltDeg()), dvR = Math.abs(ui.sensors.gamma || 0);
+    if (dvP < 4 && dvR < 4) {
+      var lockedP = dvP <= 0.5 && dvR <= 0.5;
+      plumb.style.display = '';
+      plumb.style.color = lockedP ? 'var(--green)' : '';
+      plumb.style.borderColor = lockedP ? 'rgba(110,210,154,.5)' : '';
+      plumb.textContent = lockedP
+        ? '▏PLUMB · ' + dvP.toFixed(1) + '° / ' + dvR.toFixed(1) + '°'
+        : '▏plumb in ' + dvP.toFixed(1) + '° · roll ' + dvR.toFixed(1) + '°';
+      if (lockedP && !ui.plumbWas) buzz(12);
+      ui.plumbWas = lockedP;
+    } else {
+      plumb.style.display = 'none';
+      ui.plumbWas = false;
+    }
+  }
 }
 
 /* ---------- live HUD ----------
@@ -1933,6 +2100,7 @@ function tplTraceCal(st, t) {
   };
 
   var modeSeg = '<div class="seg tight">' +
+    '<button class="' + (t.calMode === 'hex' ? 'active' : '') + '" data-calmode="hex">Hex panel</button>' +
     '<button class="' + (t.calMode === 'quad' ? 'active' : '') + '" data-calmode="quad">Rectangle</button>' +
     '<button class="' + (t.calMode === 'ball' ? 'active' : '') + '" data-calmode="ball">Golf ball</button>' +
     '<button class="' + (t.calMode === 'map' ? 'active' : '') + '" data-calmode="map">Map</button>' +
@@ -1950,6 +2118,45 @@ function tplTraceCal(st, t) {
       '<button class="pill tiny" data-act="trim-pitch" data-d="1">▼ horizon</button>' +
       ((db.settings.pitchTrim || db.settings.rollTrim)
         ? '<button class="pill tiny" data-act="trim-reset">reset</button>' : '') +
+      (st.att.horizonLocked
+        ? '<button class="pill tiny gold" data-act="horizon-unlock">⇱ horizon locked — unlock</button>'
+        : '<button class="pill tiny' + (t.horizonPick ? ' gold' : '') + '" data-act="horizon-pick">⇱ ' +
+        (t.horizonPick ? 'tap the horizon — ' + (2 - t.horizonPick.length) + ' to go' : 'Lock to horizon') +
+        '</button>') +
+      '</div>';
+    if (t.horizonPick) {
+      modeSeg += '<div class="hint">Tap <b>two points on the far horizon</b> — open water or the ' +
+        'distant skyline, as far apart in the frame as you can. Not the parapet, not a nearby ' +
+        'roofline: anything close is below the true horizon and will tilt the plane. The photo ' +
+        'then fixes this shot\'s pitch and roll exactly, whatever the sensor thinks.</div>';
+    }
+  }
+
+  if (t.calMode === 'hex') {
+    var hn = Math.min(t.taps.length, 6);
+    var hexBody;
+    if (hn < 6) {
+      hexBody = dots(hn, 6) +
+        '<div class="hint">Tap the <b>six corners</b> of the panel, walking around it — either ' +
+        'direction, any starting corner. Corner snap and the loupe both help. ' + (6 - hn) +
+        ' to go.</div>';
+    } else {
+      hexBody = dots(6, 6) +
+        '<div class="hint">Six corners placed. Check the side length below, then calibrate — ' +
+        'the six must agree with each other, and the readout will say how well they did.</div>';
+    }
+    return modeSeg +
+      '<div class="hint">A regular hexagon of known side is a <b>tape-free reference</b>: one ' +
+      'number covers all six corners, and with six the fit can check itself — four corners ' +
+      'never can. Lay the panel <b>flat on the deck</b>, fill a good part of the frame with it, ' +
+      'and its 9 mm of thickness is beneath notice.</div>' +
+      hexBody +
+      '<div class="field"><label>SIDE LENGTH (corner to corner along one edge)</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="hex-side" inputmode="decimal" value="' +
+      esc(t.hexSide || EE.fromM(0.15, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
+      '<div class="btn-row">' +
+      (hn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
+      '<button class="btn primary sm" data-act="apply-hex"' + (hn >= 6 ? '' : ' disabled') + '>Calibrate</button>' +
       '</div>';
   }
 
@@ -3414,6 +3621,7 @@ function paintTrace() {
     g.beginPath();
     pts.forEach(function (q, i) { i ? g.lineTo(q.x, q.y) : g.moveTo(q.x, q.y); });
     var closes = (t.step === 'cal' && t.calMode === 'quad' && pts.length === 4) ||
+      (t.step === 'cal' && t.calMode === 'hex' && pts.length === 6) ||
       (t.step === 'trace' && (t.tool === 'rect' || t.tool === 'cylinder' || t.tool === 'outline') && pts.length >= 3);
     if (closes) g.closePath();
     g.stroke();
@@ -3425,6 +3633,16 @@ function paintTrace() {
     g.fillStyle = '#D4AF37'; g.font = '10px ui-monospace, monospace'; g.textAlign = 'center';
     g.fillText(String(i + 1), q.x, q.y + 3.5); g.textAlign = 'left';
   });
+
+  /* horizon picking: mark the first tap so the second has something to aim with */
+  if (t.horizonPick && t.horizonPick.length === 1) {
+    var hp = img2cv(v, t.horizonPick[0]);
+    g.strokeStyle = '#D4AF37'; g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(hp.x - 12, hp.y); g.lineTo(hp.x + 12, hp.y);
+    g.moveTo(hp.x, hp.y - 12); g.lineTo(hp.x, hp.y + 12);
+    g.stroke();
+  }
 
   /* ball mode: banked balls first — green when locked, dashed gold when taken
      on trust — each wearing its letter. */
@@ -3846,6 +4064,15 @@ function bindTrace() {
           /* The ball selector wants the raw finger: a corner snap would drag the
              centre onto a dimple or a logo, and the rim refiner does the real
              locking anyway. */
+          /* Horizon picking outranks everything: two taps on the far horizon,
+             then the shot's attitude is corrected from the photo. */
+          if (t.horizonPick) {
+            t.horizonPick.push({ x: ip.x, y: ip.y });
+            t.loupe = null; hideLoupe();
+            if (t.horizonPick.length >= 2) applyHorizonLock(st);
+            else render();
+            return;
+          }
           var ballMode = t.step === 'cal' && t.calMode === 'ball';
           if (ballMode && (t.balls || []).length >= 3) {
             toast('Three balls is the full house — Undo removes the last one');
@@ -3935,7 +4162,7 @@ function snapTap(st, ip) {
 function addTap(ip) {
   var t = ui.trace;
   var lim = t.step === 'cal'
-    ? (t.calMode === 'quad' ? 4 : t.calMode === 'map' ? 5 : 2)
+    ? (t.calMode === 'quad' ? 4 : t.calMode === 'hex' ? 6 : t.calMode === 'map' ? 5 : 2)
     : (t.tool === 'point' ? 1 : (t.tool === 'height' ? 2 : 64));
   if (t.taps.length >= lim) t.taps.shift();
   t.taps.push(ip);
@@ -3950,7 +4177,7 @@ function handle(el, e) {
   if (el.dataset.open) { view.projectId = el.dataset.open; view.screen = 'project'; view.tab = 'plan'; ui.plan.fitted = false; ui.sel = null; return render(); }
   if (el.dataset.tab) { view.tab = el.dataset.tab; return render(); }
   if (el.dataset.tool) { ui.trace.tool = el.dataset.tool; ui.trace.taps = []; return render(); }
-  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; ui.trace.ballFit = null; ui.trace.balls = []; return render(); }
+  if (el.dataset.calmode) { ui.trace.calMode = el.dataset.calmode; ui.trace.taps = []; ui.trace.ballFit = null; ui.trace.balls = []; ui.trace.horizonPick = null; return render(); }
   if (el.dataset.unit) { db.settings.unit = el.dataset.unit; save(); return render(); }
   if (el.dataset.nameunit) { db.settings.nameUnit = el.dataset.nameunit; save(); return render(); }
   if (el.dataset.geomethod) { ui.sheet.method = el.dataset.geomethod; return render(); }
@@ -4128,9 +4355,26 @@ function handle(el, e) {
       return render();
     }
     case 'apply-quad': return applyQuad();
+    case 'apply-hex': return applyHex();
     case 'apply-map': return applyMap();
     case 'apply-ball': return applyBall();
     case 'ball-add': return commitBall();
+    case 'horizon-pick': {
+      ui.trace.horizonPick = ui.trace.horizonPick ? null : [];
+      return render();
+    }
+    case 'horizon-unlock': {
+      var sth = findStation(p, ui.trace.stationId);
+      if (sth && sth.att && sth.att.raw) {
+        sth.att.alpha = sth.att.raw.alpha; sth.att.beta = sth.att.raw.beta;
+        sth.att.gamma = sth.att.raw.gamma;
+        delete sth.att.horizonLocked; delete sth.att.raw;
+        touchProject(p); save();
+        toast('Horizon lock removed — back to the sensor\'s attitude');
+      }
+      return render();
+    }
+    case 'adjust-survey': return runAdjust(p, true);
     case 'apply-ray': return applyRay();
     case 'recal': ui.trace.step = 'cal'; ui.trace.taps = []; ui.trace.view = null; return render();
     case 'commit-shape': return commitShape();
@@ -4151,6 +4395,7 @@ function handle(el, e) {
       var stn = findStation(p, ui.sheet.id);
       stn.reg = null;
       var t = tryRegister(p, stn);
+      if (t) maybeAutoAdjust(p);
       save();
       toast(t ? 'Placed from ' + t.n + ' landmarks (±' + (t.rms * 100).toFixed(0) + ' cm)' : 'Still needs two matching landmark names');
       ui.sheet = null; ui.plan.fitted = false;
@@ -4458,6 +4703,8 @@ function openTrace(stationId) {
     ballFit: null,
     balls: [],
     ballDia: '',
+    hexSide: '',
+    horizonPick: null,
     camH: EE.fromM(db.settings.camH, U()).toFixed(2)
   };
   view.screen = 'trace';
@@ -4542,17 +4789,7 @@ function applyQuad() {
      spanning a dozen pixels produces a focal length as unreliable as its own
      vanishing line, and writing that into settings would poison every later
      tilt-and-height shot. */
-  if (cal.fovMeasured && q0 && q0.minSpanPx >= SMALL_REF_PX &&
-    (cal.focal.disagree == null || cal.focal.disagree < 0.06)) {
-    db.settings.fov = cal.fovMeasured;
-    db.settings.fovFrom = (st.cam && st.cam.label) || 'this camera';
-    db.settings.fovAt = Date.now();
-    (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[st.imgW + 'x' + st.imgH] = cal.fovMeasured;
-    save();
-    msg += ' · lens measured at ' + cal.fovMeasured.toFixed(1) + '°';
-  } else if (cal.fovMeasured) {
-    msg += ' · lens reads ' + cal.fovMeasured.toFixed(1) + '°, quad too small to trust it';
-  }
+  msg += adoptMeasuredLens(st, cal, q0);
   if (cal.poseRms != null && cal.poseRms > 0.3) {
     msg += ' · tilt looks off, heights may be unreliable';
   }
@@ -4560,6 +4797,138 @@ function applyQuad() {
   toast(msg);
 
   t.step = 'trace'; t.taps = []; t.view = null;
+  render();
+}
+
+/* The hexagonal panel: six tapped corners of a regular hexagon of known side.
+
+   Better than the rectangle it replaces in three ways. It carries no tape
+   measure — one number, printed on the panel, is the whole reference. Six
+   corners over-determine the homography, so the fit criticises itself (four
+   never can). And at 15 cm a side it spans ~2× a bank card, which is what lets
+   it pin the vanishing line AND measure the lens — after which every other
+   mode inherits the true focal length. The panel's 9 mm of thickness puts the
+   measured plane 9 mm above the deck: parallel, so nothing tilts, and the
+   height offset is far below tap noise. */
+function applyHex() {
+  var p = currentProject(), t = ui.trace;
+  var st = findStation(p, t.stationId);
+  var sideEl = $('#hex-side');
+  if (sideEl) t.hexSide = sideEl.value;
+  var side = EE.toM(parseFloat(t.hexSide || EE.fromM(0.15, U()).toFixed(3)), U());
+  if (!(side > 0.02 && side < 3)) return toast('Enter the hexagon\'s side length');
+  if (t.taps.length < 6) return toast('Tap all six corners, walking around the panel');
+
+  var taps = t.taps.slice(0, 6);
+  /* The model is anticlockwise; match the tap winding to it. In image
+     coordinates (y down) a clockwise-on-screen walk has positive shoelace —
+     the same convention the rectangle's near-left → far-left order encodes. */
+  if (EE.signedArea(taps) > 0) taps = [taps[0]].concat(taps.slice(1).reverse());
+  var ref = EE.hexCorners(side);
+
+  /* A hexagon's information lives in its full EXTENT — six corners across two
+     sides' worth of pixels — not in its shortest edge. Judging it by edge the
+     way a rectangle is judged calls a perfectly usable panel small: a 100 px
+     edge is a 200 px reference with six corners, which pins perspective at
+     least as well as a 200 px quad does. */
+  var extentPx = 0;
+  taps.forEach(function (a2) {
+    taps.forEach(function (b2) {
+      extentPx = Math.max(extentPx, Math.hypot(a2.x - b2.x, a2.y - b2.y));
+    });
+  });
+  var q0 = { minSpanPx: extentPx };
+  var small = extentPx < SMALL_REF_PX;
+
+  var cal;
+  if (small && st.att) {
+    /* Same rescue as a small rectangle: plane from gravity, panel for scale. */
+    var Rp = attMatrix(st.att);
+    var fp = stationF(st);
+    var unit = taps.map(function (qp) {
+      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fp, effAngle(st)),
+        Rp, 1, 0, deckNormalOf(st));
+    });
+    var fitP = unit.every(Boolean) ? EE.similarity2D(unit, ref) : null;
+    if (fitP && fitP.scale > 0.2 && fitP.scale < 30) {
+      cal = { mode: 'ray', camH: fitP.scale, f: fp, ok: true, source: 'gravity+scale',
+        provisionalScale: !db.settings.fovAt };
+      st.cal = cal;
+      touchProject(p); save();
+      coverageCache = { key: null, val: null };
+      toast('Panel too far away to pin perspective — plane from gravity, scale from the panel. ' +
+        'Camera height ' + EE.fmtLen(fitP.scale, U(), 2) + '. Get closer for the full calibration.');
+      t.step = 'trace'; t.taps = []; t.view = null;
+      return render();
+    }
+  }
+
+  cal = calibratePlanar(st, taps, ref, side * 2, side * 2);
+  if (!cal.ok) return toast(cal.err);
+  if (small) cal.suspect = st.att ? 'small-ref' : 'small-ref-no-tilt';
+  cal.source = 'hex';
+
+  st.cal = cal;
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+
+  var msg = 'Calibrated from the hexagon';
+  if (cal.planarRms != null) {
+    msg += ' — six corners agree to ±' + (cal.planarRms * 1000).toFixed(0) + ' mm';
+    /* Six correspondences that cannot agree are a mistap or a wrong side length. */
+    if (cal.planarRms > side * 0.12) {
+      msg += '. That is poor — check one corner was not mistapped and the side length is right';
+    }
+  }
+  msg += adoptMeasuredLens(st, cal, q0);
+  if (cal.poseRms != null && cal.poseRms > 0.3) msg += ' · tilt looks off, heights may be unreliable';
+  if (cal.suspect) msg += ' · perspective unreliable — panel too small in frame';
+  toast(msg);
+
+  t.step = 'trace'; t.taps = []; t.view = null;
+  render();
+}
+
+/* Two taps on the true horizon fix this shot's pitch and roll from the photo.
+
+   The two rays both lie in the horizontal plane through the camera, so their
+   cross product IS gravity in the device frame — a reference the sensor can
+   only approximate. The attitude is then rotated minimally so its down matches
+   the photo's, the yaw stays the sensor's, and the corrected Euler angles are
+   written back onto the shot so every consumer follows without knowing. Trims
+   stop applying to a locked shot — the photo outranks the per-device fudge. */
+function applyHorizonLock(st) {
+  var p = currentProject(), t = ui.trace;
+  var picks = t.horizonPick;
+  t.horizonPick = null;
+  if (!st.att) { toast('This shot has no attitude to correct'); return render(); }
+  if (!picks || picks.length < 2) return render();
+
+  var f = stationF(st);
+  var Rs = attMatrix(st.att);
+  var gHint = EE.applyM3(EE.transpose3(Rs), [0, 0, -1]);
+  var g = EE.gravityFromHorizon(picks[0], picks[1], st.imgW, st.imgH, f, effAngle(st), gHint);
+  if (!g) { toast('Those two points are too close together — pick them wide apart on the horizon'); return render(); }
+
+  var out = EE.alignToGravity(Rs, g);
+  if (out.movedDeg > 25) {
+    toast('That line is ' + out.movedDeg.toFixed(0) + '° from the sensor\'s horizon — more than ' +
+      'any sensor error. Was that the far horizon, not a parapet or ridge?');
+    return render();
+  }
+  var e = EE.orientationFromRot(out.R);
+  var raw = { alpha: st.att.alpha, beta: st.att.beta, gamma: st.att.gamma };
+  /* attMatrix adds the trims; the corrected matrix already contains them, so
+     the stored angles must be the matrix MINUS nothing — horizonLocked shots
+     skip trims entirely, so store the matrix's own angles. */
+  st.att.alpha = e.alpha; st.att.beta = e.beta; st.att.gamma = e.gamma;
+  st.att.horizonLocked = true;
+  st.att.raw = raw;
+  touchProject(p); save();
+  coverageCache = { key: null, val: null };
+  buzz([25, 40, 25]);
+  toast('Horizon locked from the photo — attitude moved ' + out.movedDeg.toFixed(1) +
+    '°. Pitch and roll for this shot now come from what the camera saw.');
   render();
 }
 
@@ -4972,6 +5341,7 @@ function commitShape() {
 
   if (t.tool === 'point') {
     var reg = tryRegister(p, st);
+    if (reg) maybeAutoAdjust(p);
     save();
     ui.sheet = { kind: 'object', id: o.id };
     if (reg) toast('Shot placed from ' + reg.n + ' landmarks · ±' + (reg.rms * 100).toFixed(0) + ' cm');
@@ -5012,6 +5382,7 @@ function saveObjectSheet() {
   /* A renamed landmark may be the second match a floating shot was waiting for. */
   if (o.kind === 'point') {
     p.stations.forEach(function (st) { if (!st.reg) tryRegister(p, st); });
+    maybeAutoAdjust(p);
   }
 
   touchProject(p); save();
