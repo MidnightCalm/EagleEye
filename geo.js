@@ -943,8 +943,73 @@ var EE = (function () {
     var res = { mode: k, n: n, use: 'sensor', hs: hVs(n), sigmaDeg: null };
     if (k === 1) { res.camH = res.hs[0]; return res; }
 
+    /* Range consistency, judged before any plane geometry: every ball prices
+       the same camera height against the sensor's plane, and however wrong
+       that plane is (bounded by what a sensor can be wrong by), the answers
+       agree to a few tens of centimetres. A ball whose height stands half a
+       metre from the others has a corrupt RANGE — a rim locked at the wrong
+       size — and it poisons the plane and the height mean alike, at any
+       spread. This is the check that catches it even when the constellation
+       is too bunched for the plane mathematics to notice anything. */
+    var hsSorted = res.hs.slice().sort(function (a, b) { return a - b; });
+    var hMed = hsSorted[Math.floor(hsSorted.length / 2)];
+    var hTol = Math.max(0.35, 0.25 * Math.abs(hMed));
+    if (k === 2) {
+      if (Math.abs(res.hs[0] - res.hs[1]) > hTol) res.rangeSuspect = -1;
+    } else {
+      var worstI = -1, worstDev = 0;
+      for (var qi = 0; qi < k; qi++) {
+        var dev = Math.abs(res.hs[qi] - hMed);
+        if (dev > worstDev) { worstDev = dev; worstI = qi; }
+      }
+      if (worstDev > hTol) {
+        /* One traitor, or everything? A single corrupt ball leaves the OTHERS
+           in tight agreement AT A BELIEVABLE HEIGHT; an attitude wrong enough
+           to spread the heights — the screen-rotation class — prices the
+           camera somewhere absurd (30° of tilt read the test scene at 0.33 m
+           and −0.17 m). The first names a ball; the second must not frame one. */
+        var others = [];
+        for (var qj = 0; qj < k; qj++) if (qj !== worstI) others.push(res.hs[qj]);
+        var spread2 = Math.abs(others[0] - others[1]);
+        var believable = hMed > 0.4 && hMed < 4;
+        if (believable && spread2 <= Math.max(0.2, 0.15 * Math.abs(hMed))) res.rangeSuspect = worstI;
+        else res.systemic = true;
+      }
+    }
+
     var sz = hSigma(n);
     var gateOf = function (sigmaDeg) { return Math.max(1.2, 1.6 * sigmaDeg); };
+    /* Adoption is gated THREE ways, because the failure the field produced was a
+       plane the photo had no business asserting:
+       1. disagree > gate: the photo must see more than its own noise. But with a
+          bunched constellation the disagreement IS the noise — a tail event
+          walks through a purely statistical gate and a 55° horizon gets drawn
+          with full confidence. Hence:
+       2. sigma <= PHOTO_CAP: the constellation must be capable in absolute
+          terms. A cluster of balls a hand-span apart resolves ±10° at best;
+          adopting anything from it trades a possibly-wrong sensor for a
+          certainly-noisy photo. When this trips, the answer is not arbitration,
+          it is "spread the balls". The cap sits at 4° because a metre-wide
+          triangle at working range lands at ±2.5-3° — squarely eligible —
+          while a cluster lands at ±8° and up; and adoption still requires
+          disagree > 1.6 sigma, so the trade is favourable whenever it happens.
+       3. disagree <= SANITY: after the flip test no phone sensor is 25° wrong.
+          A capable constellation reporting a wilder plane than that means one
+          ball's range is corrupt — locked on a shadow, or not on the deck — and
+          the right response is refusal naming the problem, not adoption. */
+    var PHOTO_CAP = 4, SANITY = 25;
+    var arbitrate = function (nc) {
+      /* A set with a corrupt range or a systemic inconsistency never adopts,
+         whatever its plane says — its height mean is as poisoned as its tilt. */
+      if (res.rangeSuspect != null || res.systemic) return;
+      /* Incapable next: when sigma is huge, any wild disagreement is the
+         photo's own noise and the actionable diagnosis is "spread the balls" —
+         which also unmasks a corrupt ball if one is hiding in the cluster. */
+      if (res.sigmaDeg > PHOTO_CAP) { res.whyNot = 'noise'; return; }
+      if (res.disagreeDeg > SANITY) { res.implausible = true; return; }
+      if (res.disagreeDeg <= gateOf(res.sigmaDeg)) return;
+      res.use = 'photo'; res.n = nc;
+    };
 
     if (k === 2) {
       var d2 = sub(centers[1], centers[0]);
@@ -962,9 +1027,7 @@ var EE = (function () {
       res.sigmaDeg = Math.atan(Math.hypot(sz[0], sz[1]) / L) / DEG;
       var nc = unit([n[0] - s * dh[0], n[1] - s * dh[1], n[2] - s * dh[2]]);
       res.nPhoto = nc || n;
-      if (nc && L >= 0.15 && res.disagreeDeg > gateOf(res.sigmaDeg)) {
-        res.use = 'photo'; res.n = nc;
-      }
+      if (nc && L >= 0.15) arbitrate(nc);
       res.camH = mean(hVs(res.n));
       return res;
     }
@@ -982,8 +1045,16 @@ var EE = (function () {
        tilt — three balls nearly in a line know no more about that axis than two. */
     res.minAltM = Lmax > 1e-9 ? area2 / Lmax : 0;
     var nb = unit(cr);
-    if (!nb || res.minAltM < Math.max(0.10, 0.10 * Lmax)) {
+    /* Two distinct ways to fail, with two distinct fixes: a FLAT triangle
+       (three balls nearly in a row — move one sideways) and a TINY one (a
+       hand-span cluster — spread everything out). */
+    if (!nb || res.minAltM < 0.12 * Lmax) {
       res.degenerate = 'collinear';
+      res.camH = mean(res.hs);
+      return res;
+    }
+    if (res.minAltM < 0.15) {
+      res.degenerate = 'tiny';
       res.camH = mean(res.hs);
       return res;
     }
@@ -992,7 +1063,7 @@ var EE = (function () {
     res.disagreeDeg = Math.acos(clampd(dot(nb, n))) / DEG;
     var szM = Math.max(sz[0], sz[1], sz[2]);
     res.sigmaDeg = Math.atan(Math.SQRT2 * szM / Math.min(res.minAltM, Lmax)) / DEG;
-    if (res.disagreeDeg > gateOf(res.sigmaDeg)) { res.use = 'photo'; res.n = nb; }
+    arbitrate(nb);
     res.camH = mean(hVs(res.n));
     return res;
   }

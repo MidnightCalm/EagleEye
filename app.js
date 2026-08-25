@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.16.0';
+var VERSION = '1.16.1';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1974,8 +1974,10 @@ function tplTraceCal(st, t) {
       body = committed.length
         ? '<div class="hint">Ball <b>' + letter(committed.length) + '</b>: press on its <b>centre</b>. ' +
         (committed.length === 1
-          ? 'The further from ball A the better — their line is what reads the deck\'s tilt.'
-          : 'Out of line with A and B — a triangle reads the whole plane; a queue reads nothing new.') +
+          ? '<b>A metre from ball A beats a hand-span</b> — their spacing is the tilt lever; ' +
+          'bunched balls read heights but not tilt.'
+          : 'Out of line with A and B, and <b>a metre out</b> — a wide triangle reads the whole ' +
+          'plane; a tight cluster or a queue reads nothing new.') +
         '</div>'
         : '<div class="hint">Put a golf ball <b>on the deck</b>, in frame. Press on its ' +
         '<b>centre</b> — the loupe helps. Different-coloured balls are fine: each is read ' +
@@ -2002,12 +2004,18 @@ function tplTraceCal(st, t) {
         '</div>';
     }
 
-    /* The committed roster. */
+    /* The committed roster — each ball's pixel width and the range it implies,
+       so a mislocked ball advertises itself (a ball "2.3 m away" sitting next
+       to one at 1.5 m is lying about something). */
     var roster = '';
     if (committed.length) {
+      var Dr = EE.toM(parseFloat(t.ballDia) || 0, U()) || 0.04267;
+      var fr2 = stationF(st);
       roster = '<div class="live-row" style="flex-wrap:wrap">' + committed.map(function (b, i) {
+        var rng = b.dh > 4 ? fr2 * Dr / b.dh : 0;
         return '<span class="pill tiny' + (b.locked ? ' gold' : '') + '">' + letter(i) + ' · ' +
-          Math.round(b.dh) + ' px' + (b.locked ? '' : ' — unlocked') + '</span>';
+          Math.round(b.dh) + ' px' + (rng ? ' · ' + EE.fmtLen(rng, U(), 1) : '') +
+          (b.locked ? '' : ' — unlocked') + '</span>';
       }).join('') + '</div>';
     }
 
@@ -2019,7 +2027,31 @@ function tplTraceCal(st, t) {
     if (set.length >= 2 && st.att) {
       var Dv = EE.toM(parseFloat(t.ballDia) || 0, U()) || 0.04267;
       var sv = ballSolve(st, t, Dv);
-      if (sv && sv.res && !sv.res.degenerate) {
+      if (sv && sv.res && sv.res.rangeSuspect != null) {
+        verdict = '<div class="panel warn"><span class="p-tag">' +
+          (sv.res.rangeSuspect < 0 ? 'THE BALLS DISAGREE' : 'BALL ' +
+            String.fromCharCode(65 + sv.res.rangeSuspect) + ' DISAGREES') + '</span>' +
+          '<div class="kv"><span>Heights say</span><span>' +
+          sv.res.hs.map(function (hv) { return EE.fmtLen(hv, U(), 2); }).join(' / ') + '</span></div>' +
+          '<div class="p-body">Every ball prices the same camera height; one of these does not. ' +
+          'Its rim lock is off — check the green circle hugs the ball — or it is not on the deck.</div></div>';
+      } else if (sv && sv.res && sv.res.implausible) {
+        verdict = '<div class="panel warn"><span class="p-tag">ONE BALL IS LYING</span>' +
+          '<div class="p-body">The plane these balls describe is ' + sv.res.disagreeDeg.toFixed(0) +
+          '° off the sensor — wilder than any sensor error. One range is corrupt: a rim locked ' +
+          'on a shadow, or a ball not on the deck. Re-circle the weakest lock.</div></div>';
+      } else if (sv && sv.res && (sv.res.degenerate === 'tiny' || sv.res.whyNot === 'noise')) {
+        var rvb = sv.res;
+        var spread = rvb.mode === 2 ? rvb.baselineM : rvb.minAltM;
+        verdict = '<div class="panel warn"><span class="p-tag">TOO BUNCHED TO READ TILT</span>' +
+          '<div class="kv"><span>Spread now</span><span>' +
+          (spread > 0 ? EE.fmtLen(spread, U(), 2) : '—') + '</span></div>' +
+          (rvb.sigmaDeg != null ? '<div class="kv"><span>Tilt readable to</span><span>±' +
+            rvb.sigmaDeg.toFixed(1) + '° only</span></div>' : '') +
+          '<div class="p-body">The tilt lever is the distance <i>between</i> balls against a ' +
+          'ranging error of a few centimetres. <b>A metre apart beats a hand-span</b> — spread ' +
+          'them out; heights still average fine, and calibrating now keeps the sensor\'s plane.</div></div>';
+      } else if (sv && sv.res && !sv.res.degenerate) {
         var rv = sv.res;
         var photo = rv.use === 'photo';
         verdict = '<div class="panel ' + (photo ? 'warn' : 'good') + '">' +
@@ -4712,12 +4744,51 @@ function applyBall() {
     return toast('Ball ' + which + ' would not solve — is the whole ball in frame, on the deck?');
   }
   var res = sol.res;
+  /* One ball pricing a different camera height than the rest has a corrupt
+     range — this fires at any spread, before any plane logic. */
+  if (res.rangeSuspect != null) {
+    if (res.rangeSuspect < 0) {
+      return toast('The two balls disagree about your height (' +
+        EE.fmtLen(res.hs[0], U(), 2) + ' vs ' + EE.fmtLen(res.hs[1], U(), 2) +
+        ') — one rim lock is off, or a ball is not on the deck. Re-circle the weaker one.');
+    }
+    var sus = set[res.rangeSuspect];
+    var hMed = res.hs.slice().sort(function (a, b) { return a - b; })[Math.floor(res.hs.length / 2)];
+    return toast('Ball ' + String.fromCharCode(65 + res.rangeSuspect) +
+      ' disagrees with the others about your height (' + EE.fmtLen(res.hs[res.rangeSuspect], U(), 2) +
+      ' vs ' + EE.fmtLen(hMed, U(), 2) + ') — its rim lock is off (' +
+      (sus.locked ? sus.n + ' of 48 spokes' : 'never locked') +
+      '), or it is not on the deck. Re-circle it.');
+  }
   if (res.degenerate === 'collinear') {
     return toast('The three balls sit nearly in a line — the plane across that line is unreadable. ' +
       'Move one ball a stride sideways and re-lock it.');
   }
   if (res.degenerate === 'coincident') {
     return toast('Those balls are almost on top of each other — spread them apart.');
+  }
+  /* A capable constellation reporting a wilder plane than any sensor error can
+     be is one corrupt range — a rim locked on a shadow, or a ball not on the
+     deck. Refuse, and point at the weakest lock rather than guessing. */
+  if (res.systemic) {
+    return toast('The heights those balls price the camera at (' +
+      res.hs.map(function (hv) { return EE.fmtLen(hv, U(), 2); }).join(', ') +
+      ') are not a believable set — that is not a ball problem, it is the attitude itself. ' +
+      'Re-run Check → Read + sensor check; if it persists, the frame orientation is being ' +
+      'misread for this camera.');
+  }
+  if (res.implausible) {
+    var worst = 0;
+    set.forEach(function (b, i) {
+      var q = b.locked ? (b.n || 0) : -1;
+      var qw = set[worst].locked ? (set[worst].n || 0) : -1;
+      if (q < qw) worst = i;
+    });
+    return toast('The plane those balls describe is ' + res.disagreeDeg.toFixed(0) +
+      '° off the sensor — not physically plausible; one range must be corrupt. ' +
+      'Ball ' + String.fromCharCode(65 + worst) + ' has the weakest lock (' +
+      (set[worst].locked ? (set[worst].n + ' of 48 spokes') : 'never locked') +
+      ') — re-circle it and check the green circle hugs the ball.');
   }
   if (!(res.camH > 0.2 && res.camH < 30)) {
     return toast('Could not solve from those circles — are the balls on the deck, fully in frame?');
@@ -4735,8 +4806,18 @@ function applyBall() {
   };
   if (res.use === 'photo') cal.deckDev = res.n;
 
+  var spreadOf = res.mode === 2 ? res.baselineM : res.minAltM;
+  var bunched = res.degenerate === 'tiny' || res.whyNot === 'noise';
   var msg;
-  if (set.length === 2) {
+  if (bunched) {
+    /* Heights average fine from a cluster; tilt does not. Calibrate the scale,
+       keep the sensor's plane, and say exactly what to change. */
+    msg = 'Heights read from ' + set.length + ' balls — camera height ' + EE.fmtLen(res.camH, U(), 2) +
+      '. But at ' + (spreadOf > 0 ? EE.fmtLen(spreadOf, U(), 2) + ' of spread' : 'this spread') +
+      ' they cannot read tilt' +
+      (res.sigmaDeg != null ? ' (±' + res.sigmaDeg.toFixed(1) + '° at best)' : '') +
+      ', so the plane stays with the sensor. Spread them to about a metre apart to read it from the photo.';
+  } else if (set.length === 2) {
     var hd = Math.abs(res.hs[0] - res.hs[1]);
     var hPct = (hd / Math.max(res.hs[0], res.hs[1], 0.01) * 100).toFixed(1);
     msg = res.use === 'photo'

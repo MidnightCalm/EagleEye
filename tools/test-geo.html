@@ -1398,12 +1398,60 @@ function near(name, a, b, tol) {
   var ld = EE.ballPlane(centersFromPixels(lined).map(function (s) { return s.p; }), nPredHonest, r, tiny);
   ok('collinear balls are refused', ld.degenerate === 'collinear', ld.degenerate);
 
-  /* Noise gate: with realistic rim noise declared, a small disagreement is NOT
-     acted on — correcting a good sensor by ranging noise would add noise. */
+  /* Noise gate: with realistic rim noise declared, a bunched pair must never
+     out-vote the sensor — correcting a good sensor by ranging noise would add
+     noise, and with a cluster the disagreement IS the noise. */
   var near2 = mkBallsDev(Rtrue, LEVEL, h, [[-0.15, 2.2], [0.15, 2.3]]);
   var ng = EE.ballPlane(centersFromPixels(near2).map(function (s) { return s.p; }), nPredLie, r, [0.02, 0.02]);
   ok('short baseline + honest noise: sensor kept even when it lies', ng.use === 'sensor',
      ng.use + ' σ=' + (ng.sigmaDeg && ng.sigmaDeg.toFixed(1)));
+  ok('…and the diagnosis is the constellation, not agreement', ng.whyNot === 'noise', ng.whyNot);
+
+  /* THE FIELD CASE that shipped a 55° horizon: a hand-span cluster of three,
+     good triangle shape, real rim noise, and a wildly disagreeing "plane". The
+     photo must never be adopted from a constellation that cannot resolve tilt,
+     however large the disagreement it thinks it sees. */
+  var clusterXY = [[-0.15, 2.2], [0.15, 2.2], [0, 2.5]];
+  var cluster = mkBallsDev(Rtrue, LEVEL, h, clusterXY);
+  var cl = EE.ballPlane(centersFromPixels(cluster).map(function (s) { return s.p; }),
+    nPredLie2, r, [0.02, 0.02, 0.02]);
+  ok('hand-span cluster: photo never adopted', cl.use === 'sensor', cl.use);
+  ok('…flagged as incapable, with the resolution named', cl.whyNot === 'noise' && cl.sigmaDeg > 4,
+     cl.whyNot + ' σ=' + (cl.sigmaDeg && cl.sigmaDeg.toFixed(1)));
+  /* Heights from a cluster are as good as the plane they are measured against:
+     true under an honest sensor, and honestly wrong under a lying one — a
+     cluster cannot repair the plane, which is exactly why it must say so. */
+  var clH = EE.ballPlane(centersFromPixels(cluster).map(function (s) { return s.p; }),
+    nPredHonest, r, [0.02, 0.02, 0.02]);
+  near('…heights average true once the plane is honest', clH.camH, h, 0.01);
+
+  /* A truly tiny cluster is refused as geometry before noise even enters. */
+  var tinyC = mkBallsDev(Rtrue, LEVEL, h, [[-0.08, 2.2], [0.08, 2.2], [0, 2.33]]);
+  var tc = EE.ballPlane(centersFromPixels(tinyC).map(function (s) { return s.p; }), nPredHonest, r, tiny);
+  ok('a hand-span triangle is degenerate outright', tc.degenerate === 'tiny', tc.degenerate);
+
+  /* One corrupt range — a rim locked at half size ranges its ball at twice the
+     distance. Every ball prices the same camera height, so the traitor is
+     identified by name, at ANY spread, before any plane mathematics. */
+  var goodC = centersFromPixels(honest3).map(function (s) { return s.p; });
+  var corrupt = [goodC[0], goodC[1], [goodC[2][0] * 2, goodC[2][1] * 2, goodC[2][2] * 2]];
+  var imp = EE.ballPlane(corrupt, nPredHonest, r, tiny);
+  ok('corrupt range: the traitor ball is identified', imp.rangeSuspect === 2 && imp.use === 'sensor',
+     'rangeSuspect=' + imp.rangeSuspect);
+  var corrupt2 = [goodC[0], [goodC[1][0] * 1.6, goodC[1][1] * 1.6, goodC[1][2] * 1.6]];
+  var imp2 = EE.ballPlane(corrupt2, nPredHonest, r, [1e-4, 1e-4]);
+  ok('…a corrupt pair is flagged too, unattributed', imp2.rangeSuspect === -1, imp2.rangeSuspect);
+
+  /* The systemic backstop: an attitude wrong by 30° — the screen-rotation
+     class of failure — prices the camera at absurd, mutually inconsistent
+     heights (0.33 m and −0.17 m here). That must read as "the attitude is
+     broken", never as one framed ball, and never as an adoptable plane. */
+  var nPred30 = toDev(EE.rotFromOrientation(12, 82, -4), LEVEL);
+  var imp3 = EE.ballPlane(centersFromPixels(honest3).map(function (s) { return s.p; }), nPred30, r, tiny);
+  ok('a 30° attitude error reads as systemic, not as a bad ball',
+     imp3.systemic === true && imp3.rangeSuspect == null && imp3.use === 'sensor',
+     'systemic=' + imp3.systemic + ' suspect=' + imp3.rangeSuspect +
+     ' hs=' + imp3.hs.map(function (v) { return v.toFixed(2); }).join('/'));
 
   /* One ball, off the midline — the reason the single-ball solve moved onto
      sphere ranging. The old route (rim extremes as two ground points a diameter

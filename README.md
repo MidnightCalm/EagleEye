@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     349 assertions over geo.js — open it in a browser
+    ├── test-geo.html     357 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -447,6 +447,24 @@ balls wear their letters on the photo. With two or more in play a live **PHOTO v
 panel shows what the balls can already see: the tilt along the pair (with the resolution the
 constellation actually supports), the per-ball heights, or the full plane-vs-sensor angle.
 
+**Spacing is the instrument.** The tilt lever is the distance *between* balls against a
+ranging error of a few centimetres — **a metre apart beats a hand-span**, and a cluster reads
+heights but not tilt. The field taught this the hard way: a hand-span cluster once out-voted
+the sensor with a 55° horizon, because with a bunched constellation the disagreement IS the
+noise. Four safeguards now stand in the way:
+
+1. **Capability ceiling** — the photo's plane is only ever adopted when the constellation can
+   resolve tilt to ±4° or better; a bunched set calibrates heights, keeps the sensor's plane,
+   and says how far to spread.
+2. **Statistical gate** — adoption also requires the disagreement to exceed 1.6× the photo's
+   own resolution, so the trade is favourable whenever it happens.
+3. **Range consistency** — every ball prices the same camera height; a ball whose height
+   stands apart has a corrupt rim lock and is named by letter, at any spread, before any
+   plane mathematics. (The roster shows each ball's implied range for the same reason.)
+4. **Systemic detection** — heights that are absurd and mutually inconsistent point at the
+   attitude itself (the screen-rotation class of failure), and the app says so instead of
+   framing a ball.
+
 The arbitration is honest in both directions. The photo's plane replaces the sensor's only
 when the disagreement exceeds what the ball geometry can resolve — correcting a good sensor by
 ranging noise would be adding noise — and when it does win, the plane is stored **in the
@@ -536,7 +554,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 349 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 357 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.
