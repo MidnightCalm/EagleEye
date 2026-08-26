@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.18.0';
+var VERSION = '1.19.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1123,16 +1123,42 @@ function applyScaleCorrection(p, k, note) {
 
    Registration catches it, but only between shots that share two named landmarks.
    This checks every shot against every other, whether they are tied or not. */
+/* Whether a calibration's SCALE is pinned by a physical reference — a hexagon
+   of typed side, a regulation ball, a measured rectangle, a map — as opposed
+   to riding on a typed eye height or an assumed lens. The distinction is the
+   whole ballgame for cross-shot scale: an anchored shot's camera height is an
+   OUTPUT (crouch and it reads 0.7 m, stand and it reads 1.3 m, both correct),
+   and rescaling it to match someone's stance multiplies a physical object's
+   size. The field found this the hard way: two correct hexagon shots at two
+   real heights were read as an "80% disagreement" and one was force-scaled by
+   1.81×, panel and all. */
+function calAbsoluteScale(c) {
+  if (!c || !c.ok || c.provisionalScale) return false;
+  if (c.mode === 'quad') return true;
+  return /^(hex|ball|gravity)/.test(c.source || '');
+}
+
 function scaleSpread(p) {
-  var hs = [];
-  p.stations.forEach(function (st) {
-    if (st.cal && st.cal.ok && st.cal.camH > 0) hs.push({ id: st.id, h: st.cal.camH });
+  var anchored = [], assumed = [];
+  p.stations.forEach(function (st, i) {
+    if (!(st.cal && st.cal.ok && st.cal.camH > 0)) return;
+    (calAbsoluteScale(st.cal) ? anchored : assumed)
+      .push({ id: st.id, idx: i + 1, h: st.cal.camH, src: st.cal.source || st.cal.mode });
   });
-  if (hs.length < 2) return null;
-  var lo = hs[0].h, hi = hs[0].h;
-  hs.forEach(function (x) { if (x.h < lo) lo = x.h; if (x.h > hi) hi = x.h; });
-  var med = hs.map(function (x) { return x.h; }).sort(function (a, b) { return a - b; })[Math.floor(hs.length / 2)];
-  return { lo: lo, hi: hi, median: med, spread: hi / lo - 1, n: hs.length, heights: hs };
+  if (anchored.length + assumed.length < 2) return null;
+  var spreadOf = function (arr) {
+    if (arr.length < 2) return 0;
+    var lo = arr[0].h, hi = arr[0].h;
+    arr.forEach(function (x) { if (x.h < lo) lo = x.h; if (x.h > hi) hi = x.h; });
+    return hi / lo - 1;
+  };
+  var hsAll = anchored.concat(assumed).map(function (x) { return x.h; }).sort(function (a, b) { return a - b; });
+  return {
+    anchored: anchored, assumed: assumed,
+    n: anchored.length + assumed.length,
+    median: hsAll[Math.floor(hsAll.length / 2)],
+    assumedSpread: spreadOf(assumed)
+  };
 }
 
 /* Force one camera height on a shot, rescaling everything traced from it.
@@ -1164,11 +1190,16 @@ function rescaleStation(p, st, k) {
 }
 
 function unifyScale(p, targetH) {
-  var n = 0;
+  var n = 0, skipped = 0;
   p.stations.forEach(function (st) {
     if (!st.cal || !st.cal.ok || !(st.cal.camH > 0)) return;
+    /* Reference-pinned shots are never rescaled here: their height differences
+       are stances, not errors. Recalibrating the shot is the only way to
+       change what its own reference said. */
+    if (calAbsoluteScale(st.cal)) { skipped++; return; }
     if (rescaleStation(p, st, targetH / st.cal.camH)) n++;
   });
+  unifyScale.lastSkipped = skipped;
   ensureOrigin(p);
   p.stations.forEach(function (st) { if (!st.reg) tryRegister(p, st); });
   touchProject(p); save();
@@ -1250,13 +1281,23 @@ function buildChecklist(p) {
     add('warn', 'Scale disagrees with the map by ' + fmtSigned(p.anchorMeta.scaleError * 100) + '%',
       'The survey and the aerial do not agree on distance. One of them is wrong.', 'geo');
 
+  /* Different camera heights across shots are NOT a defect — a crouched shot
+     and a standing shot are both correct. Only two things are worth flagging:
+     assumed-scale shots drifting from each other, and hard tie evidence that
+     two reference-pinned shots disagree about a shared object's size. */
   var sp = scaleSpread(p);
-  if (sp && sp.spread > 0.03) {
-    add(sp.spread > 0.10 ? 'block' : 'warn',
-      'Shots disagree about size by ' + (sp.spread * 100).toFixed(0) + '%',
-      'Camera height is scale, and these ' + sp.n + ' shots were calibrated to heights from ' +
-      EE.fmtLen(sp.lo, U(), 2) + ' to ' + EE.fmtLen(sp.hi, U(), 2) + '. The plan will look right ' +
-      'and the dimensions will not.', 'scaleagree');
+  if (sp && sp.assumedSpread > 0.08) {
+    add('warn', 'Assumed-scale shots disagree by ' + (sp.assumedSpread * 100).toFixed(0) + '%',
+      sp.assumed.length + ' shots ride on a typed height or an assumed lens, and they do not ' +
+      'agree with each other. Tie them to a reference-pinned shot, or match their heights by hand.',
+      'scaleagree');
+  }
+  if (p.scaleClash) {
+    add('block', 'Two shots disagree about the panel\'s size by ' +
+      (p.scaleClash.pct * 100).toFixed(0) + '%',
+      'The hexagon tie between shots ' + p.scaleClash.a + ' and ' + p.scaleClash.b +
+      ' found the same physical panel at two sizes — one shot\'s entered side length is wrong. ' +
+      'Recalibrate that shot; heights are not the issue.', null);
   }
 
   var prov = p.stations.filter(function (s2) { return s2.cal && s2.cal.provisionalScale; }).length;
@@ -1774,7 +1815,7 @@ function tplExport(p) {
     '<div class="btn-row">' +
     '<button class="btn ghost-gold" data-act="export-csv">Schedule CSV</button>' +
     '<button class="btn ghost" data-act="export-json">Backup JSON</button>' +
-    '<button class="btn ghost" data-act="export-debug">Debug bundle</button></div>' +
+    '<button class="btn ghost" data-act="export-debug-full">Debug bundle + photos</button></div>' +
     '<div class="hint">The vector KML opens in Google Earth as solid blocks at their real heights — ' +
     'worth a look before anything goes near a layout.</div>' +
     '<div class="foot-spacer"></div></div>';
@@ -2869,31 +2910,46 @@ function sheetScaleAgree(s) {
       '<button class="close-btn" data-act="close-sheet">×</button></div>' +
       '<div class="p-body">Fewer than two calibrated shots — nothing to compare yet.</div>';
   }
-  var pick = s.target != null ? s.target : sp.median;
-  var rows = sp.heights.map(function (x, i) {
-    var d = x.h / pick - 1;
-    return '<div class="kv ' + (Math.abs(d) < 0.01 ? 'good' : Math.abs(d) > 0.05 ? 'warn' : '') + '">' +
-      '<span>Shot ' + (p.stations.findIndex(function (q) { return q.id === x.id; }) + 1) + '</span>' +
-      '<span>' + EE.fmtLen(x.h, U(), 2) + '  ' + fmtSigned(d * 100) + '%</span></div>';
+  var srcName = function (src) {
+    return /^hex/.test(src) ? 'hexagon' : /^ball/.test(src) ? 'golf ball'
+      : src === 'map' ? 'map' : /^gravity/.test(src) ? 'reference' : 'rectangle';
+  };
+  var shotNo = function (id) {
+    return p.stations.findIndex(function (q) { return q.id === id; }) + 1;
+  };
+  var rows = sp.anchored.map(function (x) {
+    return '<div class="kv good"><span>Shot ' + shotNo(x.id) + ' · pinned by its ' + srcName(x.src) +
+      '</span><span>' + EE.fmtLen(x.h, U(), 2) + '</span></div>';
+  }).join('') + sp.assumed.map(function (x) {
+    return '<div class="kv warn"><span>Shot ' + shotNo(x.id) + ' · assumed</span><span>' +
+      EE.fmtLen(x.h, U(), 2) + '</span></div>';
   }).join('');
+
+  var pick = s.target != null ? s.target
+    : (sp.anchored.length ? sp.anchored[sp.anchored.length - 1].h : sp.median);
+
+  var action = sp.assumed.length
+    ? '<div class="field"><label>SET THE ASSUMED SHOTS’ CAMERA HEIGHT</label><div class="unit-suffix">' +
+    '<input class="inp mono" id="sa-h" inputmode="decimal" value="' + EE.fromM(pick, U()).toFixed(3) +
+    '"><span>' + U() + '</span></div></div>' +
+    '<div class="hint">This rescales <b>only the assumed shots</b> — the ones whose scale rides ' +
+    'on a typed height or an assumed lens. Reference-pinned shots are never touched here; ' +
+    'recalibrating a shot is the only way to change what its own reference said.</div>' +
+    '<div class="btn-row"><button class="btn primary" data-act="apply-unify">Rescale ' +
+    sp.assumed.length + ' assumed shot' + (sp.assumed.length === 1 ? '' : 's') + '</button></div>'
+    : '<div class="hint">Nothing to do here: every shot’s scale is pinned by a physical ' +
+    'reference. If two of them truly disagree about size, a hexagon tie or the survey ' +
+    'adjustment will say so — and the fix is recalibrating the wrong one, never rescaling.</div>';
 
   return '<div class="sheet-head"><span class="sh-title">Scale across shots</span>' +
     '<button class="close-btn" data-act="close-sheet">×</button></div>' +
-    '<div class="p-body">Camera height <b>is</b> scale. Every shot carries its own, so shots ' +
-    'calibrated from different references can disagree about size — and a plan built from them ' +
-    'looks perfectly sensible while every dimension is wrong.</div>' +
-    '<div class="panel ' + (sp.spread > 0.03 ? 'warn' : 'good') + '">' +
-    '<span class="p-tag">' + (sp.spread > 0.03 ? 'THEY DISAGREE' : 'THEY AGREE') + '</span>' +
-    '<div class="kv"><span>Spread</span><span>' + (sp.spread * 100).toFixed(1) + '%</span></div>' +
-    rows + '</div>' +
-    '<div class="field"><label>USE ONE HEIGHT FOR EVERY SHOT</label><div class="unit-suffix">' +
-    '<input class="inp mono" id="sa-h" inputmode="decimal" value="' + EE.fromM(pick, U()).toFixed(3) +
-    '"><span>' + U() + '</span></div></div>' +
-    '<div class="hint">Everything traced from a shot is rescaled with it, and any landmark tie is ' +
-    're-solved afterwards. If you know your real height, type it — otherwise the median is a ' +
-    'reasonable guess, and <b>Correct the scale</b> can fix all of them together later.</div>' +
-    '<div class="btn-row"><button class="btn primary" data-act="apply-unify">Apply to all ' +
-    sp.n + ' shots</button></div>';
+    '<div class="p-body"><b>Different heights are normal.</b> Camera height is a per-shot fact — ' +
+    'crouch for one shot and stand for the next and both are right. For a shot calibrated on a ' +
+    'reference (hexagon, ball, rectangle, map) the height is an <b>output</b> of the calibration, ' +
+    'not a knob; only shots with <b>assumed</b> scale have anything to reconcile.</div>' +
+    '<div class="panel"><span class="p-tag">' + sp.anchored.length + ' PINNED · ' +
+    sp.assumed.length + ' ASSUMED</span>' + rows + '</div>' +
+    action;
 }
 
 function sheetHowTo() {
@@ -4263,7 +4319,10 @@ function handle(el, e) {
       if (!(th > 0.2 && th < 30)) return toast('Enter a plausible camera height');
       var n = unifyScale(p, th);
       ui.sheet = null;
-      toast('All ' + n + ' shots now at ' + EE.fmtLen(th, U(), 2));
+      toast(n + (n === 1 ? ' assumed-scale shot' : ' assumed-scale shots') + ' now at ' +
+        EE.fmtLen(th, U(), 2) +
+        (unifyScale.lastSkipped ? ' — ' + unifyScale.lastSkipped +
+          ' reference-pinned shot' + (unifyScale.lastSkipped === 1 ? '' : 's') + ' left untouched' : ''));
       return render();
     }
     case 'toggle-diag': ui.trace.showDiag = !ui.trace.showDiag; return render();
@@ -4434,6 +4493,7 @@ function handle(el, e) {
     case 'export-csv': return exportCsv();
     case 'export-json': return exportJson();
     case 'export-debug': return exportDebug();
+    case 'export-debug-full': return exportDebugFull();
   }
 }
 
@@ -4963,10 +5023,16 @@ function tryHexTie(p, st) {
   var tie = EE.hexTie(projCorners, st.cal.hexGround, expTheta);
   if (!tie) return null;
   if (Math.abs(tie.scale - 1) > 0.06) {
+    p.scaleClash = {
+      a: p.stations.indexOf(anchor) + 1, b: p.stations.indexOf(st) + 1,
+      pct: Math.abs(tie.scale - 1)
+    };
+    save();
     toast('The two shots disagree about the panel\'s size by ' +
       (Math.abs(tie.scale - 1) * 100).toFixed(0) + '% — check both entered the same side length.');
     return null;
   }
+  p.scaleClash = null;
   st.reg = { theta: tie.theta, tx: tie.tx, ty: tie.ty, rms: tie.rms, n: 6, method: 'hex' };
   touchProject(p); save();
   ui.plan.fitted = false;
@@ -5906,8 +5972,68 @@ function exportJson() {
    the project file never carried (lens, trims, measured bias), and per-shot
    DERIVED numbers — the homography actually in force, its horizon, the frame's
    focal length — computed at export time exactly as the app would use them. */
-function exportDebug() {
-  var p = currentProject();
+/* A store-only ZIP: local headers, central directory, CRC-32. Sixty lines
+   beat a dependency, JPEGs are already compressed so stored-not-deflated
+   costs nothing, and the result opens everywhere. */
+var _crcTable = null;
+function crc32(bytes) {
+  if (!_crcTable) {
+    _crcTable = [];
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      _crcTable[n] = c >>> 0;
+    }
+  }
+  var crc = 0xFFFFFFFF;
+  for (var i = 0; i < bytes.length; i++) crc = _crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+function strToUtf8(str) {
+  var out = [];
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) { out.push(0xC0 | (c >> 6), 0x80 | (c & 63)); }
+    else { out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63)); }
+  }
+  return new Uint8Array(out);
+}
+function zipStore(entries) {
+  var chunks = [], central = [], offset = 0;
+  var u16 = function (v) { return [v & 255, (v >> 8) & 255]; };
+  var u32 = function (v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255]; };
+  entries.forEach(function (e) {
+    var name = strToUtf8(e.name);
+    var data = typeof e.data === 'string' ? strToUtf8(e.data) : e.data;
+    var crc = crc32(data);
+    var head = [].concat(
+      u32(0x04034b50), u16(20), u16(0), u16(0), u16(0), u16(0x5021),
+      u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0));
+    chunks.push(new Uint8Array(head), name, data);
+    central.push({ name: name, crc: crc, size: data.length, offset: offset });
+    offset += head.length + name.length + data.length;
+  });
+  var cdStart = offset, cdLen = 0;
+  central.forEach(function (c) {
+    var rec = [].concat(
+      u32(0x02014b50), u16(20), u16(20), u16(0), u16(0), u16(0), u16(0x5021),
+      u32(c.crc), u32(c.size), u32(c.size), u16(c.name.length), u16(0), u16(0),
+      u16(0), u16(0), u32(0), u32(c.offset));
+    chunks.push(new Uint8Array(rec), c.name);
+    cdLen += rec.length + c.name.length;
+  });
+  chunks.push(new Uint8Array([].concat(
+    u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length),
+    u32(cdLen), u32(cdStart), u16(0))));
+  var total = 0;
+  chunks.forEach(function (c) { total += c.length; });
+  var out = new Uint8Array(total), pos = 0;
+  chunks.forEach(function (c) { out.set(c, pos); pos += c.length; });
+  return out;
+}
+
+function buildDebugPayload(p) {
   var diag = p.stations.map(function (st) {
     var H = null, hor = null;
     try { H = stationH(st); hor = H && EE.horizonLine(H, st.imgW, st.imgH); } catch (e2) { }
@@ -5921,16 +6047,53 @@ function exportDebug() {
     } catch (e3) { }
     return {
       id: st.id, effAngle: effAngle(st), stationF: stationF(st),
+      absoluteScale: calAbsoluteScale(st.cal),
       deckNormalInForce: deckNormalOf(st),
       stationH: H, horizonOfCal: hor, horizonOfGravity: gravHor,
       trustedRadius: st.cal && st.cal.camH ? trustedRadius(st.cal.camH) : null
     };
   });
-  deliver(slug(p.name) + '-debug.json', JSON.stringify({
+  return JSON.stringify({
     app: 'eagle-eye', version: VERSION, exportedAt: new Date().toISOString(),
     settings: db.settings, project: p, derived: diag
-  }, null, 1), 'application/json');
+  }, null, 1);
 }
+
+/* The complete case file: data plus every photo, one ZIP. Photos come out of
+   IndexedDB one at a time; a shot whose photo has gone missing still ships,
+   listed in the manifest as absent. */
+function exportDebugFull() {
+  var p = currentProject();
+  var entries = [{ name: 'data.json', data: buildDebugPayload(p) }];
+  var ids = p.stations.map(function (st) { return st.id; });
+  var missing = [];
+  var finish = function () {
+    if (missing.length) entries.push({ name: 'missing-photos.txt', data: missing.join('\n') });
+    try {
+      deliverBlob(slug(p.name) + '-debug.zip', new Blob([zipStore(entries)], { type: 'application/zip' }));
+    } catch (e4) {
+      toast('ZIP failed (' + e4 + ') — exporting the data alone');
+      deliver(slug(p.name) + '-debug.json', buildDebugPayload(p), 'application/json');
+    }
+  };
+  var next = function (i) {
+    if (i >= ids.length) return finish();
+    IDB.get(photoKey(ids[i])).then(function (blob) {
+      if (!blob || !blob.arrayBuffer) { missing.push(ids[i]); return next(i + 1); }
+      blob.arrayBuffer().then(function (buf) {
+        entries.push({ name: 'photos/' + ids[i] + '.jpg', data: new Uint8Array(buf) });
+        next(i + 1);
+      }, function () { missing.push(ids[i]); next(i + 1); });
+    }, function () { missing.push(ids[i]); next(i + 1); });
+  };
+  next(0);
+}
+
+function exportDebug() {
+  var p = currentProject();
+  deliver(slug(p.name) + '-debug.json', buildDebugPayload(p), 'application/json');
+}
+
 
 /* ================= boot ================= */
 

@@ -230,11 +230,23 @@ HelioScope to scale it by. That is the entire reason the KMZ exists — the same
 `LatLonBox` saying where its corners belong. **Use the KMZ.** A bare PNG is only worth having
 as a movable fallback when the georeferencing itself is suspect.
 
-A **Debug bundle** (Export tab) writes one JSON with the project, the device settings the
+**Different camera heights across shots are normal.** Crouch for one shot and stand for
+the next and both are right — for any shot calibrated on a reference (hexagon, ball,
+rectangle, map) the camera height is an *output* of the calibration, not a knob. The
+scale tools honour that now: **Scale across shots** labels every shot as
+*reference-pinned* or *assumed*, and only ever rescales the assumed ones; a pinned shot
+can only change by being recalibrated. (The old behaviour forced one height onto every
+shot, which once multiplied a correct hexagon calibration — taken crouching — by 1.81×
+to match a standing one. Camera height is scale *within* a shot, never a law *across*
+shots.) A real cross-shot size disagreement is detected where the evidence actually is
+— the hexagon tie or the survey adjustment — and the checklist then names the shot to
+recalibrate.
+
+A **Debug bundle + photos**: the project, the device settings the
 plain backup never carried (lens, trims, measured sensor bias), and per-shot derived
 numbers — the homography actually in force, both horizons, the frame's focal length —
-computed exactly as the app would use them. When something looks wrong in the field, that
-file is the whole story.
+computed exactly as the app would use them — plus every shot's photo. When something
+looks wrong in the field, that one file is the whole story.
 
 **KMZ** *(Export tab, primary)* — one file, three layers:
 
