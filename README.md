@@ -126,6 +126,20 @@ visible, consistent ones); the typed thickness (default 9 mm) is subtracted so c
 height is measured to the deck, and the tie corners are computed on the top plane. No
 guessing where the corners “hit the ground”.
 
+**A certified lens is never re-litigated per shot.** Once the fused lens stands, each new
+panel shot fits AT that focal length instead of searching again — a re-search lets a tilted
+sensor masquerade as a different lens (the field measured f coming out 28% high at a 1 mm
+residual, the two errors cancelling into a lie). At the known lens, a poor residual points
+honestly at the tilt, and the toast says so: lock the horizon on that shot, or re-run the
+sensor check. For shots whose horizon IS locked, the lock is re-derived at every candidate
+focal length inside the solver, so the lock and the lens can no longer conspire.
+
+**Locks and calibrations stay consistent by re-fitting.** A hexagon calibration is solved
+under one attitude; locking or unlocking the horizon changes the attitude, so the shot is
+automatically re-fitted from its stored corner pixels — everything traced rescales with it.
+(The field found this the hard way: unlocking after calibrating left a stale calibration
+that drew the panel 22% small.)
+
 **The same panel must be entered the same everywhere** — it is one physical object, and
 a shot calibrated with a different side length lives in a different-sized world. The app
 warns when two shots' entered sides disagree.
@@ -178,6 +192,11 @@ only honest check available on site, and it takes a second.
 | **Outline** | walk the parapet | Roof polygon (area, and the KML boundary) |
 | **Landmark** | 1 | A named point that ties shots together and georeferences the survey |
 | **Height** | base, then top | Measures height optically instead of typing it |
+
+Naming is tap-friendly: a landmark's sheet offers **every name already used in other
+shots as one-tap chips** — ties live and die on exact name matches, so nobody should type
+one twice — and auto-named objects show their suggestion as a placeholder you can type
+straight over, with a × to clear any field.
 
 Press and drag: a **loupe** follows your thumb so you can place a corner precisely instead of
 somewhere near it. Two fingers pan and zoom.

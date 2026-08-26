@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.20.0';
+var VERSION = '1.21.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -2686,8 +2686,27 @@ function sheetObject(s) {
 
   return '<div class="sheet-head"><span class="sh-title">' + (o.kind === 'point' ? 'Landmark' : o.kind === 'outline' ? 'Outline' : o.kind === 'cylinder' ? 'Cylinder' : 'Box') + '</span>' +
     '<button class="close-btn" data-act="close-sheet">×</button></div>' +
-    '<div class="field"><label>NAME</label><input class="inp" id="so-name" value="' + esc(o.name || '') + '" placeholder="' +
-    (o.kind === 'point' ? 'NE corner' : 'RTU-1') + '" autocomplete="off"></div>' +
+    '<div class="field"><label>NAME</label><div class="unit-suffix">' +
+    '<input class="inp" id="so-name" value="' + esc(o.autoName ? '' : (o.name || '')) + '" placeholder="' +
+    esc(o.autoName ? o.name : (o.kind === 'point' ? 'NE corner' : 'RTU-1')) + '" autocomplete="off">' +
+    '<button class="icon-btn" data-act="clear-name" style="flex:0 0 auto">×</button></div></div>' +
+    (o.kind === 'point' ? (function () {
+      /* Ties live and die on names matching EXACTLY, so typing one twice is a
+         trap — offer every landmark name already in the survey as one tap. */
+      var seen = {};
+      p.objects.forEach(function (q) {
+        if (q.kind === 'point' && q.id !== o.id && q.name && q.stationId !== o.stationId) {
+          seen[q.name.trim()] = true;
+        }
+      });
+      var names = Object.keys(seen);
+      return names.length
+        ? '<div class="live-row" style="flex-wrap:wrap">' + names.slice(0, 8).map(function (nm) {
+          return '<button class="pill tiny gold" data-namepick="' + esc(nm) + '">' + esc(nm) + '</button>';
+        }).join('') + '</div>' +
+        '<div class="hint">Tap a name to tie this landmark to the matching one in another shot.</div>'
+        : '';
+    })() : '') +
     dims +
     ((o.kind === 'point' || o.kind === 'outline') ? '' :
       '<div class="field"><label>HEIGHT</label><div class="unit-suffix"><input class="inp mono" id="so-h" inputmode="decimal" value="' + EE.fromM(o.h || 0, U()).toFixed(2) + '"><span>' + U() + '</span></div></div>' + chips) +
@@ -3907,7 +3926,7 @@ function bind() {
        silently inert — the delegated listener never sees it. */
     var el = e.target.closest('[data-act],[data-open],[data-tab],[data-tool],[data-calmode],' +
       '[data-unit],[data-nameunit],[data-geomethod],[data-srmethod],[data-menu],[data-object],' +
-      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset],[data-anglefix],[data-swipe],[data-knownlen]');
+      '[data-station],[data-setheight],[data-chk],[data-rsmode],[data-refpreset],[data-anglefix],[data-swipe],[data-knownlen],[data-namepick]');
     if (!el) return;
     handle(el, e);
   };
@@ -4242,6 +4261,11 @@ function handle(el, e) {
   var p = currentProject();
   var act = el.dataset.act;
 
+  if (el.dataset.namepick != null) {
+    var np = $('#so-name');
+    if (np) np.value = el.dataset.namepick;
+    return;
+  }
   if (el.dataset.open) { view.projectId = el.dataset.open; view.screen = 'project'; view.tab = 'plan'; ui.plan.fitted = false; ui.sel = null; return render(); }
   if (el.dataset.tab) { view.tab = el.dataset.tab; return render(); }
   if (el.dataset.tool) { ui.trace.tool = el.dataset.tool; ui.trace.taps = []; return render(); }
@@ -4440,8 +4464,14 @@ function handle(el, e) {
         sth.att.alpha = sth.att.raw.alpha; sth.att.beta = sth.att.raw.beta;
         sth.att.gamma = sth.att.raw.gamma;
         delete sth.att.horizonLocked; delete sth.att.raw;
+        /* The calibration was solved UNDER the lock; without a re-fit it lies
+           by exactly the lock's angle — the field measured 22%. */
+        var refitU = sth.cal && sth.cal.hexPix && refitHexStation(p, sth);
         touchProject(p); save();
-        toast('Horizon lock removed — back to the sensor\'s attitude');
+        coverageCache = { key: null, val: null };
+        ui.plan.fitted = false;
+        toast('Horizon lock removed — back to the sensor\'s attitude' +
+          (refitU ? '; the hexagon calibration re-fitted to match' : ''));
       }
       return render();
     }
@@ -4452,6 +4482,11 @@ function handle(el, e) {
 
     case 'edit-object': ui.sheet = { kind: 'object', id: el.dataset.id || ui.sel }; return render();
     case 'save-object': return saveObjectSheet();
+    case 'clear-name': {
+      var cn = $('#so-name');
+      if (cn) { cn.value = ''; cn.focus && cn.focus(); }
+      return;
+    }
     case 'delete-object': return deleteObject();
     case 'del-object-row': {
       var oid = el.dataset.id;
@@ -4953,10 +4988,28 @@ function applyHex() {
   if (!(thick >= 0 && thick < 0.06)) thick = 0.009;
 
   var cal, msg;
-  var hyb = st.att
-    ? EE.fitPlanarByF(taps, ref, attMatrix(st.att), deckNormalOf(st),
-      st.imgW, st.imgH, effAngle(st))
-    : null;
+  var hyb = null;
+  if (st.att) {
+    var fCert = certifiedF(st);
+    if (fCert) {
+      /* A certified lens is not re-litigated per shot: searching f again lets
+         a sensor error masquerade as a lens (the field saw f come out 28%
+         high at a 1 mm residual). Fit at the known lens; a poor residual then
+         points honestly at the attitude, and says so. */
+      var Rc = attMatrix(st.att);
+      var unitC = taps.map(function (qp) {
+        return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fCert, effAngle(st)),
+          Rc, 1, 0, deckNormalOf(st));
+      });
+      var fitC = unitC.every(Boolean) ? EE.similarity2D(unitC, ref) : null;
+      if (fitC && fitC.scale > 0.2 && fitC.scale < 30) {
+        hyb = { f: fCert, fit: fitC, rms: fitC.rms, fixed: true };
+      }
+    } else {
+      hyb = EE.fitPlanarByF(taps, ref, attMatrix(st.att), deckNormalOf(st),
+        st.imgW, st.imgH, effAngle(st), lockRofFor(st));
+    }
+  }
 
   if (!planeCapable && hyb) {
     /* Solved against the top FACE of the panel; the deck sits `thick` below,
@@ -4980,6 +5033,10 @@ function applyHex() {
 
     msg = 'Plane from gravity, panel for shape and scale — six corners agree to ±' +
       (hyb.rms * 1000).toFixed(0) + ' mm. Camera height ' + EE.fmtLen(cal.camH, U(), 2);
+    if (hyb.fixed && hyb.rms > Math.max(0.008, side * 0.05)) {
+      msg += ' · at the known lens that residual points at the TILT — lock the horizon on this ' +
+        'shot, or re-run Read + sensor check';
+    }
     if (full.ok && full.focal && full.focal.disagree > 0.10) {
       msg += ' · the panel alone could not pin perspective (focal split ' +
         (full.focal.disagree * 100).toFixed(0) + '%), so gravity holds the plane';
@@ -5030,6 +5087,65 @@ function applyHex() {
   render();
 }
 
+/* The lens the app is CERTAIN of for this frame size, or null. */
+function certifiedF(st) {
+  if (!db.settings.fovAt) return null;
+  var m = db.settings.fovByFrame || {};
+  if (!m[st.imgW + 'x' + st.imgH]) return null;
+  return stationF(st);
+}
+
+/* For a horizon-locked shot, the attitude AS A FUNCTION of focal length:
+   re-derive the lock from the raw sensor and the stored horizon taps at each
+   candidate f. Null for unlocked shots. */
+function lockRofFor(st) {
+  var a = st.att;
+  if (!a || !a.horizonLocked || !a.raw || !a.horizonPx || a.horizonPx.length < 2) return null;
+  return function (f) {
+    var Rs = EE.rotFromOrientation(a.raw.alpha,
+      a.raw.beta + (db.settings.pitchTrim || 0),
+      a.raw.gamma + (db.settings.rollTrim || 0));
+    var gHint = EE.applyM3(EE.transpose3(Rs), [0, 0, -1]);
+    var g = EE.gravityFromHorizon(a.horizonPx[0], a.horizonPx[1], st.imgW, st.imgH, f, effAngle(st), gHint);
+    if (!g) return Rs;
+    var out = EE.alignToGravity(Rs, g);
+    return out.movedDeg > 25 ? Rs : out.R;
+  };
+}
+
+/* Re-fit a hexagon-calibrated shot from its stored corner pixels at the f the
+   app currently believes, under the shot's CURRENT attitude. This is the one
+   road through every attitude or lens change — lock, unlock, fused lens —
+   because a calibration solved under one attitude silently lies under
+   another: the field unlocked a shot after calibrating and its hexagon
+   quietly shrank 22%. Everything traced rescales with it; a dropped tie is
+   re-solved by the caller. */
+function refitHexStation(p, st) {
+  var c = st.cal;
+  if (!c || !c.ok || !c.hexPix || !st.att) return false;
+  var f = certifiedF(st) || c.f;
+  if (st.att.horizonLocked) relockHorizonAt(st, f);
+  var R = attMatrix(st.att);
+  var ref = EE.hexCorners(c.hexSide || 0.15);
+  var unit = c.hexPix.map(function (qp) {
+    return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, f, effAngle(st)),
+      R, 1, 0, deckNormalOf(st));
+  });
+  if (!unit.every(Boolean)) return false;
+  var fit = EE.similarity2D(unit, ref);
+  if (!fit || !(fit.scale > 0.2 && fit.scale < 30)) return false;
+  var newCamH = fit.scale + (c.hexThick || 0);
+  var k = newCamH / c.camH;
+  if (Math.abs(k - 1) > 1e-9) rescaleStation(p, st, k);
+  c.f = f; c.camH = newCamH; c.planarRms = fit.rms;
+  var hg = c.hexPix.map(function (qp) {
+    return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, f, effAngle(st)),
+      R, c.camH, c.hexThick || 0, deckNormalOf(st));
+  });
+  if (hg.every(Boolean)) c.hexGround = hg.map(function (g2) { return { x: g2.x, y: g2.y }; });
+  return true;
+}
+
 /* Attitude for lens work: a horizon-locked shot's stored angles were derived
    AT some focal length, so the lens solver must reach past them to the raw
    sensor reading (trims applied), or the lock's f bakes into the answer. */
@@ -5048,9 +5164,11 @@ function rawAttMatrix(st) {
    fused to a better value, every lock is recomputed from the raw sensor
    attitude so photo and numbers stay in agreement. */
 function relockHorizon(st) {
+  return relockHorizonAt(st, (st.cal && st.cal.f) || stationF(st));
+}
+function relockHorizonAt(st, f) {
   var a = st.att;
   if (!a || !a.horizonLocked || !a.raw || !a.horizonPx || a.horizonPx.length < 2) return false;
-  var f = (st.cal && st.cal.f) || stationF(st);
   var Rs = EE.rotFromOrientation(a.raw.alpha,
     a.raw.beta + (db.settings.pitchTrim || 0),
     a.raw.gamma + (db.settings.rollTrim || 0));
@@ -5076,7 +5194,8 @@ function refineLensJoint(p, imgW, imgH) {
     if (st.imgW !== imgW || st.imgH !== imgH) return;
     shots.push({
       imgPts: c.hexPix, refPts: EE.hexCorners(c.hexSide || 0.15),
-      R: rawAttMatrix(st), deckNormal: st.deckN || [0, 0, 1],
+      R: rawAttMatrix(st), Rof: lockRofFor(st),
+      deckNormal: st.deckN || [0, 0, 1],
       imgW: st.imgW, imgH: st.imgH, screenAngle: effAngle(st)
     });
     stations.push(st);
@@ -5104,30 +5223,8 @@ function refineLensJoint(p, imgW, imgH) {
   /* Walk it through the shots that were solved at other focal lengths. */
   var refit = 0;
   stations.forEach(function (st) {
-    var c = st.cal;
-    if (Math.abs(c.f / fuse.f - 1) < 0.015) return;
-    relockHorizon(st);
-    var R = attMatrix(st.att);
-    var unit = c.hexPix.map(function (qp) {
-      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fuse.f, effAngle(st)),
-        R, 1, 0, deckNormalOf(st));
-    });
-    if (!unit.every(Boolean)) return;
-    var fit = EE.similarity2D(unit, EE.hexCorners(c.hexSide || 0.15));
-    if (!fit || !(fit.scale > 0.2 && fit.scale < 30)) return;
-    var newCamH = fit.scale + (c.hexThick || 0);
-    var k = newCamH / c.camH;
-    if (Math.abs(k - 1) > 1e-6) rescaleStation(p, st, k);
-    c.f = fuse.f;
-    c.camH = newCamH;
-    c.planarRms = fit.rms;
-    c.provisionalScale = false;
-    var hg = c.hexPix.map(function (qp) {
-      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fuse.f, effAngle(st)),
-        R, c.camH, c.hexThick || 0, deckNormalOf(st));
-    });
-    if (hg.every(Boolean)) c.hexGround = hg.map(function (g2) { return { x: g2.x, y: g2.y }; });
-    refit++;
+    if (Math.abs(st.cal.f / fuse.f - 1) < 0.015) return;
+    if (refitHexStation(p, st)) refit++;
   });
   stations.forEach(function (st) { st.cal.provisionalScale = false; });
   ensureOrigin(p);
@@ -5217,11 +5314,15 @@ function applyHorizonLock(st) {
   st.att.horizonLocked = true;
   st.att.raw = raw;
   st.att.horizonPx = [{ x: picks[0].x, y: picks[0].y }, { x: picks[1].x, y: picks[1].y }];
+  var refitMsg = '';
+  if (st.cal && st.cal.hexPix && refitHexStation(p, st)) {
+    refitMsg = ' The hexagon calibration re-fitted to the locked attitude.';
+  }
   touchProject(p); save();
   coverageCache = { key: null, val: null };
   buzz([25, 40, 25]);
   toast('Horizon locked from the photo — attitude moved ' + out.movedDeg.toFixed(1) +
-    '°. Pitch and roll for this shot now come from what the camera saw.');
+    '°. Pitch and roll for this shot now come from what the camera saw.' + refitMsg);
   render();
 }
 
@@ -5625,6 +5726,7 @@ function commitShape() {
     o.pts = gpts.map(function (q) { return { x: q.x, y: q.y }; });
     o.h = 0;
     o.name = t.tool === 'outline' ? 'Roof outline' : '';
+    o.autoName = t.tool === 'outline';
   }
 
   p.objects.push(o);
@@ -5649,7 +5751,12 @@ function saveObjectSheet() {
   var o = p.objects.find(function (q) { return q.id === ui.sheet.id; });
   if (!o) return;
   var nameEl = $('#so-name');
-  if (nameEl) o.name = nameEl.value.trim();
+  if (nameEl) {
+    var typed = nameEl.value.trim();
+    /* An untouched auto-name keeps its suggestion; anything typed replaces it. */
+    if (typed) { o.name = typed; o.autoName = false; }
+    else if (!o.autoName) o.name = '';
+  }
   var hEl = $('#so-h');
   if (hEl) {
     var hv = parseFloat(hEl.value);

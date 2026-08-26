@@ -1176,13 +1176,23 @@ var EE = (function () {
     return { lo: half / Math.tan(55 * DEG), hi: half / Math.tan(17.5 * DEG) };
   }
 
-  function fitPlanarByF(imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle) {
+  function fitPlanarByF(imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle, Rof) {
     if (!imgPts || imgPts.length < 3) return null;
+    var useRof = typeof Rof === 'function';
     var evalAt = function (f) {
+      /* A horizon-locked attitude is itself a function of f: the lock is the
+         alignment of the raw sensor to two tapped rays, and those rays move
+         with the lens. Solving f while holding a lock computed at some OTHER
+         f is how the field got a 28%-high lens at a 1 mm residual — the
+         attitude error and the lens error cancelled each other into a lie.
+         With Rof the lock is re-derived at every candidate f, so the two can
+         no longer conspire. */
+      var Rf = useRof ? Rof(f) : R;
+      if (!Rf) return null;
       var unit = [];
       for (var i = 0; i < imgPts.length; i++) {
         var gp = groundPoint(rayForPixel(imgPts[i].x, imgPts[i].y, imgW, imgH, f, screenAngle),
-          R, 1, 0, deckNormal);
+          Rf, 1, 0, deckNormal);
         if (!gp) return null;
         unit.push(gp);
       }
@@ -1250,7 +1260,7 @@ var EE = (function () {
     var solos = [];
     for (var i = 0; i < shots.length; i++) {
       var s2 = shots[i];
-      var solo = fitPlanarByF(s2.imgPts, s2.refPts, s2.R, s2.deckNormal, s2.imgW, s2.imgH, s2.screenAngle);
+      var solo = fitPlanarByF(s2.imgPts, s2.refPts, s2.R, s2.deckNormal, s2.imgW, s2.imgH, s2.screenAngle, s2.Rof);
       if (solo) solos.push(solo);
     }
     if (!solos.length) return null;
@@ -1271,6 +1281,16 @@ var EE = (function () {
       if (r2 != null && (!best || r2 < best.rms)) best = { f: f2, rms: r2 };
     }
     if (!best) return null;
+    /* The grid is ~3% coarse; walk the minimum down, or the fused lens lands
+       a percent-and-a-half off and every fixed-f fit inherits it. */
+    var step = best.f * (Math.pow(br.hi / br.lo, 1 / 60) - 1);
+    for (i2 = 0; i2 < 20; i2++) {
+      var lr = joint(best.f - step), rr2 = joint(best.f + step);
+      if (lr != null && lr < best.rms) best = { f: best.f - step, rms: lr };
+      else if (rr2 != null && rr2 < best.rms) best = { f: best.f + step, rms: rr2 };
+      else step /= 2;
+      if (step < best.f * 1e-4) break;
+    }
     var lim = best.rms * 1.5 + 1e-5;
     var fLo = best.f, fHi = best.f, rq;
     for (i2 = 1; i2 <= 40; i2++) {
