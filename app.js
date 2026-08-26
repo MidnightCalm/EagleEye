@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.17.0';
+var VERSION = '1.18.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1773,7 +1773,8 @@ function tplExport(p) {
     '<div class="btn-row"><button class="btn ghost-gold" data-act="export-kml"' + (p.anchor ? '' : ' disabled') + '>Vector KML only</button></div>' +
     '<div class="btn-row">' +
     '<button class="btn ghost-gold" data-act="export-csv">Schedule CSV</button>' +
-    '<button class="btn ghost" data-act="export-json">Backup JSON</button></div>' +
+    '<button class="btn ghost" data-act="export-json">Backup JSON</button>' +
+    '<button class="btn ghost" data-act="export-debug">Debug bundle</button></div>' +
     '<div class="hint">The vector KML opens in Google Earth as solid blocks at their real heights — ' +
     'worth a look before anything goes near a layout.</div>' +
     '<div class="foot-spacer"></div></div>';
@@ -4432,6 +4433,7 @@ function handle(el, e) {
     }
     case 'export-csv': return exportCsv();
     case 'export-json': return exportJson();
+    case 'export-debug': return exportDebug();
   }
 }
 
@@ -4838,55 +4840,137 @@ function applyHex() {
     });
   });
   var q0 = { minSpanPx: extentPx };
-  var small = extentPx < SMALL_REF_PX;
 
-  var cal;
-  if (small && st.att) {
-    /* Same rescue as a small rectangle: plane from gravity, panel for scale. */
-    var Rp = attMatrix(st.att);
-    var fp = stationF(st);
-    var unit = taps.map(function (qp) {
-      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fp, effAngle(st)),
-        Rp, 1, 0, deckNormalOf(st));
+  /* The same physical panel cannot change size between shots. */
+  var otherSide = null;
+  p.stations.forEach(function (s2) {
+    if (s2.id !== st.id && s2.cal && s2.cal.hexSide > 0) otherSide = s2.cal.hexSide;
+  });
+  var sideWarn = (otherSide && Math.abs(otherSide / side - 1) > 0.02)
+    ? ' ⚠ Another shot used a side of ' + EE.fmtLen(otherSide, U(), 3) +
+    ' — the same panel must be entered the same in every shot, or their scales cannot agree.'
+    : '';
+
+  /* The full homography is always fitted — its residual and its own two focal
+     estimates are the diagnosis. But its PLANE is only trusted when the panel
+     could actually pin perspective: field data showed a 377 px hexagon whose
+     focal estimates disagreed by 26% putting its vanishing line 18° from
+     gravity's, and the app believing it. Below that bar the plane comes from
+     gravity, and the lens — which the weak homography could not measure — is
+     found instead by searching for the focal length that makes the projected
+     panel best match its true shape. A trusted attitude turns a modest panel
+     into a lens calibrator. */
+  var full = calibratePlanar(st, taps, ref, side * 2, side * 2);
+  var planeCapable = full.ok && full.focal && extentPx >= 420 &&
+    (full.focal.disagree != null && full.focal.disagree <= 0.10);
+
+  var cal, msg;
+  var hyb = st.att
+    ? EE.fitPlanarByF(taps, ref, attMatrix(st.att), deckNormalOf(st),
+      st.imgW, st.imgH, effAngle(st), stationF(st))
+    : null;
+
+  if (!planeCapable && hyb) {
+    cal = {
+      mode: 'ray', camH: hyb.fit.scale, f: hyb.f, ok: true, source: 'hex+gravity',
+      planarRms: hyb.rms, hexSide: side,
+      provisionalScale: hyb.identifiable ? false : !db.settings.fovAt
+    };
+    /* The panel's corners in this station's plan frame, for the panel tie. */
+    var Rh = attMatrix(st.att);
+    cal.hexGround = taps.map(function (qp) {
+      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, hyb.f, effAngle(st)),
+        Rh, cal.camH, 0, deckNormalOf(st));
     });
-    var fitP = unit.every(Boolean) ? EE.similarity2D(unit, ref) : null;
-    if (fitP && fitP.scale > 0.2 && fitP.scale < 30) {
-      cal = { mode: 'ray', camH: fitP.scale, f: fp, ok: true, source: 'gravity+scale',
-        provisionalScale: !db.settings.fovAt };
-      st.cal = cal;
-      touchProject(p); save();
-      coverageCache = { key: null, val: null };
-      toast('Panel too far away to pin perspective — plane from gravity, scale from the panel. ' +
-        'Camera height ' + EE.fmtLen(fitP.scale, U(), 2) + '. Get closer for the full calibration.');
-      t.step = 'trace'; t.taps = []; t.view = null;
-      return render();
-    }
-  }
+    if (!cal.hexGround.every(Boolean)) delete cal.hexGround;
+    else cal.hexGround = cal.hexGround.map(function (g2) { return { x: g2.x, y: g2.y }; });
+    cal.hexNorthOff = 0;               /* ray frames are world east/north */
 
-  cal = calibratePlanar(st, taps, ref, side * 2, side * 2);
-  if (!cal.ok) return toast(cal.err);
-  if (small) cal.suspect = st.att ? 'small-ref' : 'small-ref-no-tilt';
-  cal.source = 'hex';
+    msg = 'Plane from gravity, panel for shape and scale — six corners agree to ±' +
+      (hyb.rms * 1000).toFixed(0) + ' mm. Camera height ' + EE.fmtLen(cal.camH, U(), 2);
+    if (hyb.identifiable) {
+      var fovH = EE.fovFromFocalLong(hyb.f, Math.max(st.imgW, st.imgH));
+      db.settings.fov = fovH;
+      db.settings.fovFrom = ((st.cam && st.cam.label) || 'this camera') + ' (gravity-solved)';
+      db.settings.fovAt = Date.now();
+      (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[st.imgW + 'x' + st.imgH] = fovH;
+      msg += ' · lens solved against gravity: ' + fovH.toFixed(1) + '°';
+    } else {
+      msg += cal.provisionalScale
+        ? ' · lens not pinned from this angle — scale provisional until a tape check'
+        : '';
+    }
+    if (full.ok && full.focal && full.focal.disagree > 0.10) {
+      msg += ' · the panel alone could not pin perspective (focal split ' +
+        (full.focal.disagree * 100).toFixed(0) + '%), so gravity holds the plane';
+    }
+  } else if (full.ok) {
+    cal = full;
+    cal.source = 'hex';
+    cal.hexSide = side;
+    var gr = taps.map(function (qp) { return EE.applyH(cal.H, qp); });
+    if (gr.every(Boolean)) {
+      cal.hexGround = gr;
+      cal.hexNorthOff = cal.pose ? cal.pose.theta : null;
+    }
+    if (extentPx < SMALL_REF_PX) cal.suspect = st.att ? 'small-ref' : 'small-ref-no-tilt';
+    msg = 'Calibrated from the hexagon';
+    if (cal.planarRms != null) {
+      msg += ' — six corners agree to ±' + (cal.planarRms * 1000).toFixed(0) + ' mm';
+      if (cal.planarRms > side * 0.12) {
+        msg += '. That is poor — check one corner was not mistapped and the side length is right';
+      }
+    }
+    msg += adoptMeasuredLens(st, cal, q0);
+    if (cal.poseRms != null && cal.poseRms > 0.3) msg += ' · tilt looks off, heights may be unreliable';
+    if (cal.suspect) msg += ' · perspective unreliable — panel too small in frame';
+  } else {
+    return toast(full.err);
+  }
 
   st.cal = cal;
   touchProject(p); save();
   coverageCache = { key: null, val: null };
 
-  var msg = 'Calibrated from the hexagon';
-  if (cal.planarRms != null) {
-    msg += ' — six corners agree to ±' + (cal.planarRms * 1000).toFixed(0) + ' mm';
-    /* Six correspondences that cannot agree are a mistap or a wrong side length. */
-    if (cal.planarRms > side * 0.12) {
-      msg += '. That is poor — check one corner was not mistapped and the side length is right';
-    }
-  }
-  msg += adoptMeasuredLens(st, cal, q0);
-  if (cal.poseRms != null && cal.poseRms > 0.3) msg += ' · tilt looks off, heights may be unreliable';
-  if (cal.suspect) msg += ' · perspective unreliable — panel too small in frame';
-  toast(msg);
+  /* The panel that calibrated two shots also TIES them: same six corners,
+     correspondence picked by expected rotation, no landmarks to name. */
+  var tie = tryHexTie(p, st);
+  if (tie) msg += ' · placed from the panel, six corners to ±' + (tie.rms * 100).toFixed(0) + ' cm';
+
+  toast(msg + sideWarn);
 
   t.step = 'trace'; t.taps = []; t.view = null;
   render();
+}
+
+/* Register a station against an already-placed one via their shared hexagon.
+   Both must carry hexGround (the panel's corners in their own plan frames) and
+   a known plan-to-north offset so the six-fold correspondence is decidable. */
+function tryHexTie(p, st) {
+  if (!st || st.reg || !st.cal || !st.cal.hexGround || st.cal.hexNorthOff == null) return null;
+  var anchor = null;
+  p.stations.forEach(function (s2) {
+    if (s2.id === st.id || !s2.reg || !s2.cal || !s2.cal.hexGround || s2.cal.hexNorthOff == null) return;
+    if (Math.abs((s2.cal.hexSide || 0) / (st.cal.hexSide || 1) - 1) > 0.02) return;
+    if (!anchor || s2.createdAt > anchor.createdAt) anchor = s2;
+  });
+  if (!anchor) return null;
+
+  /* Anchor corners lifted into the project frame; expected rotation composes
+     the anchor's placement with both plan-to-north offsets. */
+  var projCorners = anchor.cal.hexGround.map(function (g2) { return EE.applyRigid(anchor.reg, g2); });
+  var expTheta = anchor.reg.theta + anchor.cal.hexNorthOff - st.cal.hexNorthOff;
+  var tie = EE.hexTie(projCorners, st.cal.hexGround, expTheta);
+  if (!tie) return null;
+  if (Math.abs(tie.scale - 1) > 0.06) {
+    toast('The two shots disagree about the panel\'s size by ' +
+      (Math.abs(tie.scale - 1) * 100).toFixed(0) + '% — check both entered the same side length.');
+    return null;
+  }
+  st.reg = { theta: tie.theta, tx: tie.tx, ty: tie.ty, rms: tie.rms, n: 6, method: 'hex' };
+  touchProject(p); save();
+  ui.plan.fitted = false;
+  return tie;
 }
 
 /* Two taps on the true horizon fix this shot's pitch and roll from the photo.
@@ -5816,6 +5900,36 @@ function exportKmz() {
 function exportJson() {
   var p = currentProject();
   deliver(slug(p.name) + '.json', JSON.stringify({ app: 'eagle-eye', version: VERSION, project: p }, null, 1), 'application/json');
+}
+
+/* Everything a diagnosis needs, in one file: the project, the device settings
+   the project file never carried (lens, trims, measured bias), and per-shot
+   DERIVED numbers — the homography actually in force, its horizon, the frame's
+   focal length — computed at export time exactly as the app would use them. */
+function exportDebug() {
+  var p = currentProject();
+  var diag = p.stations.map(function (st) {
+    var H = null, hor = null;
+    try { H = stationH(st); hor = H && EE.horizonLine(H, st.imgW, st.imgH); } catch (e2) { }
+    var gravHor = null;
+    try {
+      if (st.att) {
+        var Hg = EE.homographyFromPose(attMatrix(st.att), 1, stationF(st),
+          st.imgW, st.imgH, effAngle(st), deckNormalOf(st));
+        gravHor = Hg && EE.horizonLine(Hg, st.imgW, st.imgH);
+      }
+    } catch (e3) { }
+    return {
+      id: st.id, effAngle: effAngle(st), stationF: stationF(st),
+      deckNormalInForce: deckNormalOf(st),
+      stationH: H, horizonOfCal: hor, horizonOfGravity: gravHor,
+      trustedRadius: st.cal && st.cal.camH ? trustedRadius(st.cal.camH) : null
+    };
+  });
+  deliver(slug(p.name) + '-debug.json', JSON.stringify({
+    app: 'eagle-eye', version: VERSION, exportedAt: new Date().toISOString(),
+    settings: db.settings, project: p, derived: diag
+  }, null, 1), 'application/json');
 }
 
 /* ================= boot ================= */

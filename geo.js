@@ -1149,6 +1149,94 @@ var EE = (function () {
     return s / 2;
   }
 
+  /* Planar reference + trusted gravity, with the LENS as the unknown.
+
+     The field data showed why this exists: a hexagon spanning 200-380 px fits a
+     homography whose scale is fine but whose perspective terms are mush — its
+     own two focal estimates disagreed by 26-40%, and its vanishing line sat 18°
+     from gravity's. The cure is the same pairing that rescued the bank card,
+     upgraded: take the PLANE from gravity, and instead of assuming a lens to
+     project the taps onto it, SEARCH for the focal length that makes the
+     projected shape best match the known reference. A wrong f shears and
+     stretches the projected hexagon; the true f is where the similarity
+     residual bottoms out — so a modest panel plus a trusted attitude measures
+     the lens that the panel alone could not.
+
+     Near nadir f degenerates into pure scale and the curve goes flat; the
+     `identifiable` flag says whether the minimum was sharp enough to trust
+     (both 1.2× and 1/1.2× of the best f must at least double the residual). */
+  function fitPlanarByF(imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle, f0) {
+    if (!imgPts || imgPts.length < 3 || !(f0 > 0)) return null;
+    var evalAt = function (f) {
+      var unit = [];
+      for (var i = 0; i < imgPts.length; i++) {
+        var gp = groundPoint(rayForPixel(imgPts[i].x, imgPts[i].y, imgW, imgH, f, screenAngle),
+          R, 1, 0, deckNormal);
+        if (!gp) return null;
+        unit.push(gp);
+      }
+      var fit = similarity2D(unit, refPts);
+      if (!fit || !(fit.scale > 0.2 && fit.scale < 30)) return null;
+      return { f: f, fit: fit, rms: fit.rms };
+    };
+
+    /* Coarse log-spaced scan, then parabolic-ish refinement by thirds. */
+    var lo = f0 / 1.8, hi = f0 * 1.8;
+    var best = null, i2;
+    for (i2 = 0; i2 <= 24; i2++) {
+      var f2 = lo * Math.pow(hi / lo, i2 / 24);
+      var e2 = evalAt(f2);
+      if (e2 && (!best || e2.rms < best.rms)) best = e2;
+    }
+    if (!best) return null;
+    var step = best.f * (Math.pow(hi / lo, 1 / 24) - 1);
+    for (i2 = 0; i2 < 18; i2++) {
+      var l2 = evalAt(best.f - step), r2 = evalAt(best.f + step);
+      if (l2 && l2.rms < best.rms) best = l2;
+      else if (r2 && r2.rms < best.rms) best = r2;
+      else step /= 2;
+      if (step < best.f * 1e-4) break;
+    }
+
+    var up = evalAt(best.f * 1.2), dn = evalAt(best.f / 1.2);
+    var floor2 = Math.max(best.rms, 1e-5);
+    var identifiable = !!(up && dn && up.rms > 2 * floor2 && dn.rms > 2 * floor2);
+    return { f: best.f, fit: best.fit, rms: best.rms, identifiable: identifiable };
+  }
+
+  /* Tie two stations by the SAME physical hexagon they both calibrated on.
+
+     Six corners, but which is which? A regular hexagon offers six rotations of
+     correspondence; the expected frame-to-frame rotation (from each station's
+     known plan-to-north offset) picks the right one, since candidates differ by
+     60° and no compass or pose is that wrong. Returns the rigid placement of B
+     into A's frame, the residual, and the similarity scale — which must be 1,
+     because it is the same panel; a scale off by more than a few percent means
+     the two calibrations disagree about its size. */
+  function hexTie(groundA, groundB, expThetaRad) {
+    if (!groundA || !groundB || groundA.length !== 6 || groundB.length !== 6) return null;
+    var wrapPi = function (a) {
+      while (a > Math.PI) a -= 2 * Math.PI;
+      while (a < -Math.PI) a += 2 * Math.PI;
+      return a;
+    };
+    var best = null;
+    for (var k = 0; k < 6; k++) {
+      var dst = [];
+      for (var j = 0; j < 6; j++) dst.push(groundA[(j + k) % 6]);
+      var fit = rigid2D(groundB, dst);
+      if (!fit) continue;
+      var dTh = Math.abs(wrapPi(fit.theta - (expThetaRad || 0)));
+      if (!best || dTh < best.dTh) {
+        var sim = similarity2D(groundB, dst);
+        best = { reg: fit, k: k, dTh: dTh, scale: sim ? sim.scale : 1 };
+      }
+    }
+    if (!best || best.dTh > 35 * DEG) return null;
+    return { theta: best.reg.theta, tx: best.reg.tx, ty: best.reg.ty,
+      rms: best.reg.rms, k: best.k, dThetaDeg: best.dTh / DEG, scale: best.scale };
+  }
+
   /* ================= the horizon as an instrument =================
 
      Outdoors the true horizon is a gravity reference better than any MEMS
@@ -2268,6 +2356,7 @@ var EE = (function () {
     heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
     sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
     homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
+    fitPlanarByF: fitPlanarByF, hexTie: hexTie,
     gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
     rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,
     principalAxis: principalAxis, adjust2D: adjust2D,

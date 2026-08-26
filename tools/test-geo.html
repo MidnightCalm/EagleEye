@@ -1666,6 +1666,97 @@ function near(name, a, b, tol) {
     { x: 700, y: 900 }, { x: 725, y: 903 }, W, HH, f, 0, gTrue) === null);
 })();
 
+/* ---- gravity-constrained planar fit with the lens as the unknown ---- */
+(function () {
+  var W = 1512, HH = 2016, fTrue = 1600, h = 1.55, side = 0.15;
+  var Rtrue = EE.rotFromOrientation(12, 52, -4);
+  var rot = 0.4, ox = 0.3, oy = 1.9;
+  var ref = EE.hexCorners(side);
+  var world = ref.map(function (c) {
+    return { x: ox + c.x * Math.cos(rot) - c.y * Math.sin(rot),
+             y: oy + c.x * Math.sin(rot) + c.y * Math.cos(rot) };
+  });
+  /* Half a pixel of tap noise — identifiability only means anything relative
+     to the noise: noiseless synthetic corners would let even the feeblest
+     lever "find" the lens exactly. */
+  var jig = function (q, i) {
+    return { x: q.x + ((i * 37) % 7 - 3) * 0.15, y: q.y + ((i * 53) % 7 - 3) * 0.15 };
+  };
+  var pix = world.map(function (pt, i) {
+    return jig(EE.projectToPixel(pt, Rtrue, h, W, HH, fTrue, 0, 0, [0, 0, 1]), i);
+  });
+  ok('lens-search scene projects', pix.every(Boolean));
+
+  /* Start from a WRONG assumed lens — the app's exact predicament: the true
+     focal was ~1600 and the assumed default ~1250. */
+  var out = EE.fitPlanarByF(pix, ref, Rtrue, [0, 0, 1], W, HH, 0, 1250);
+  ok('gravity + panel solves the lens', !!out, 'null');
+  ok('…to 3% through half-pixel noise', Math.abs(out.f - fTrue) / fTrue < 0.03,
+     out.f.toFixed(0) + ' vs ' + fTrue);
+  ok('…and calls itself identifiable', out.identifiable === true);
+  near('…camera height lands true', out.fit.scale, h, 0.01);
+  ok('…with a residual at the noise level', out.rms < 0.004, out.rms);
+
+  /* Near nadir the focal length degenerates into pure scale: the search must
+     SAY it could not pin the lens rather than pretend. */
+  var Rnadir = EE.rotFromOrientation(0, 3, 0);
+  var worldN = ref.map(function (c) { return { x: c.x + 0.05, y: c.y + 0.35 }; });
+  var pixN = worldN.map(function (pt, i) {
+    var q = EE.projectToPixel(pt, Rnadir, h, W, HH, fTrue, 0, 0, [0, 0, 1]);
+    return q && jig(q, i);
+  });
+  var outN = pixN.every(Boolean)
+    ? EE.fitPlanarByF(pixN, ref, Rnadir, [0, 0, 1], W, HH, 0, 1250) : null;
+  ok('near-nadir: lens declared unidentifiable', !!outN && outN.identifiable === false,
+     outN && (outN.identifiable + ' f=' + outN.f.toFixed(0)));
+})();
+
+/* ---- tying two shots by their shared hexagon ---- */
+(function () {
+  var side = 0.15;
+  var rot = 0.5, cx2 = 2.0, cy2 = 3.0;
+  var cornersW = EE.hexCorners(side).map(function (c) {
+    return { x: cx2 + c.x * Math.cos(rot) - c.y * Math.sin(rot),
+             y: cy2 + c.x * Math.sin(rot) + c.y * Math.cos(rot) };
+  });
+
+  /* Two ray-frame stations: same world axes, different camera origins. */
+  var camB = { x: 0.9, y: 0.2 };
+  var inB = cornersW.map(function (q) { return { x: q.x - camB.x, y: q.y - camB.y }; });
+  var t1 = EE.hexTie(cornersW, inB, 0);
+  ok('panel tie solves', !!t1, 'null');
+  near('…rotation zero between world-aligned frames', t1.theta, 0, 1e-9);
+  near('…recovers the camera offset x', t1.tx, camB.x, 1e-9);
+  near('…recovers the camera offset y', t1.ty, camB.y, 1e-9);
+  near('…same panel, same size', t1.scale, 1, 1e-9);
+
+  /* The second surveyor started their walk at a different corner: the six-fold
+     correspondence must absorb it. */
+  var m = 2;
+  var inB2 = [];
+  for (var j = 0; j < 6; j++) inB2.push(inB[(j + m) % 6]);
+  var t2 = EE.hexTie(cornersW, inB2, 0);
+  ok('a different starting corner is absorbed', !!t2 &&
+     Math.abs(t2.tx - camB.x) < 1e-9 && Math.abs(t2.theta) < 1e-9, t2 && (t2.k + ' θ=' + t2.theta));
+
+  /* A rotated plan frame (the full-homography path): expected rotation decides
+     among the 60° candidates. */
+  var phi = 0.7, cph = Math.cos(-phi), sph = Math.sin(-phi);
+  var inB3 = cornersW.map(function (q) {
+    return { x: cph * (q.x - camB.x) - sph * (q.y - camB.y),
+             y: sph * (q.x - camB.x) + cph * (q.y - camB.y) };
+  });
+  var t3 = EE.hexTie(cornersW, inB3, phi);
+  ok('a rotated frame ties at the expected rotation', !!t3 && Math.abs(t3.theta - phi) < 1e-9,
+     t3 && t3.theta);
+
+  /* Same panel entered at a different size: the tie must expose it. */
+  var inBBig = inB.map(function (q) { return { x: q.x * 1.5, y: q.y * 1.5 }; });
+  var t4 = EE.hexTie(cornersW, inBBig, 0);
+  ok('a size disagreement shows in the tie scale', !!t4 && Math.abs(t4.scale - 1 / 1.5) < 0.01,
+     t4 && t4.scale.toFixed(3));
+})();
+
 /* ---- the principal colour axis ---- */
 (function () {
   var ORANGE = [235, 120, 40], GREY = [128, 126, 124];

@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     399 assertions over geo.js — open it in a browser
+    ├── test-geo.html     414 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -93,6 +93,30 @@ and tilt modes inherit the true focal length instead of a guess. The panel's few
 millimetres of thickness shift the measured plane parallel to the deck by the same amount
 — beneath notice. High-contrast colour (orange on grey roof) makes the corners easy to
 tap and easy to snap.
+
+**How its plane is decided.** Field data taught a hard lesson: a hexagon spanning a few
+hundred pixels fits a homography whose scale is excellent but whose perspective terms are
+noise — its own two focal estimates disagreed by 26–40% and its vanishing line sat 18°
+from gravity's, and the app believed it anyway. Now the panel's full homography is only
+trusted with the plane when it demonstrably pinned perspective (large in frame, focal
+estimates agreeing); otherwise the **plane comes from gravity** and the panel supplies
+shape and scale — and, better, the app **searches for the focal length** that makes the
+gravity-projected panel best match its true shape. A wrong lens shears the projection;
+the true lens is where the residual bottoms out. So a modest panel plus a trusted
+attitude measures the lens that the panel alone could not — the toast says "lens solved
+against gravity" when the minimum was sharp enough to store, and every other mode
+inherits it. Near nadir the lens degenerates into pure scale, and the app says so
+instead of pretending.
+
+**The same panel must be entered the same everywhere** — it is one physical object, and
+a shot calibrated with a different side length lives in a different-sized world. The app
+warns when two shots' entered sides disagree.
+
+**The panel also TIES shots.** Two shots calibrated on the same hexagon share six
+corners; the app matches them automatically (the six-fold symmetry is resolved by each
+shot's known orientation) and places the new shot with no landmarks named at all —
+"placed from the panel, six corners to ±N cm". A tie whose implied scale is off says the
+two shots disagree about the panel's size, and refuses rather than absorbing it.
 
 ### Lock to horizon (outdoors)
 
@@ -205,6 +229,12 @@ crisp outlines, and a scale bar to check against.
 HelioScope to scale it by. That is the entire reason the KMZ exists — the same image plus a
 `LatLonBox` saying where its corners belong. **Use the KMZ.** A bare PNG is only worth having
 as a movable fallback when the georeferencing itself is suspect.
+
+A **Debug bundle** (Export tab) writes one JSON with the project, the device settings the
+plain backup never carried (lens, trims, measured sensor bias), and per-shot derived
+numbers — the homography actually in force, both horizons, the frame's focal length —
+computed exactly as the app would use them. When something looks wrong in the field, that
+file is the whole story.
 
 **KMZ** *(Export tab, primary)* — one file, three layers:
 
@@ -596,7 +626,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 399 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 414 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.
