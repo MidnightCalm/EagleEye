@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.19.0';
+var VERSION = '1.20.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1185,7 +1185,7 @@ function rescaleStation(p, st, k) {
     else if (o.pts) o.pts = o.pts.map(function (q) { return { x: q.x * k, y: q.y * k }; });
     if (o.hSrc !== 'typed' && o.h) o.h *= k;
   });
-  if (st.reg && st.reg.method === 'tie') st.reg = null;
+  if (st.reg && (st.reg.method === 'tie' || st.reg.method === 'hex')) st.reg = null;
   return true;
 }
 
@@ -1748,6 +1748,8 @@ function tplObjects(p) {
       '<div class="obj-main"><span class="obj-name">' + esc(o.name || '(unnamed)') + '</span>' +
       '<span class="obj-dims">' + dims + '</span></div>' +
       (o.kind === 'point' || o.kind === 'outline' ? '' : '<span class="obj-h">' + EE.fmtLen(o.h || 0, U(), U() === 'ft' ? 1 : 2) + '</span>') +
+      '<button class="icon-btn" data-act="del-object-row" data-id="' + o.id + '" ' +
+      'style="flex:0 0 auto;color:var(--red,#E0897D)">\u00d7</button>' +
       '</div>';
   }).join('');
 
@@ -2196,6 +2198,9 @@ function tplTraceCal(st, t) {
       '<div class="field"><label>SIDE LENGTH (corner to corner along one edge)</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-side" inputmode="decimal" value="' +
       esc(t.hexSide || EE.fromM(0.15, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
+      '<div class="field"><label>PANEL THICKNESS \u2014 tap the TOP corners; this is subtracted</label><div class="unit-suffix">' +
+      '<input class="inp mono" id="hex-thick" inputmode="decimal" value="' +
+      esc(t.hexThick || EE.fromM(0.009, U()).toFixed(4)) + '"><span>' + U() + '</span></div></div>' +
       '<div class="btn-row">' +
       (hn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
       '<button class="btn primary sm" data-act="apply-hex"' + (hn >= 6 ? '' : ' disabled') + '>Calibrate</button>' +
@@ -4210,9 +4215,15 @@ function snapTap(st, ip) {
   /* bestCorner picks the right pixel; this finds where inside it the corner
      really is. Roughly a tenth of a pixel, against about three for a finger. */
   var r = EE.refineCorner(gray, N, N, c.x, c.y, 5, 8);
+  var moved = Math.hypot(sx + r.x - ip.x, sy + r.y - ip.y);
+  /* A snap is a REFINEMENT of the finger, not a second opinion. The loupe puts
+     a tap within ~3 px; a "corner" nine or more pixels away is a different
+     feature \u2014 a neighbouring panel corner, a carpet seam \u2014 and jumping to it
+     is how points land where nobody put them. */
+  if (moved > 9) return ip;
   return {
     x: sx + r.x, y: sy + r.y, snapped: true,
-    moved: Math.hypot(sx + r.x - ip.x, sy + r.y - ip.y)
+    moved: moved
   };
 }
 
@@ -4442,6 +4453,18 @@ function handle(el, e) {
     case 'edit-object': ui.sheet = { kind: 'object', id: el.dataset.id || ui.sel }; return render();
     case 'save-object': return saveObjectSheet();
     case 'delete-object': return deleteObject();
+    case 'del-object-row': {
+      var oid = el.dataset.id;
+      var oDel = p.objects.find(function (q) { return q.id === oid; });
+      if (!oDel) return;
+      if (!confirm('Delete "' + (oDel.name || oDel.kind) + '"?')) return;
+      p.objects = p.objects.filter(function (q) { return q.id !== oid; });
+      if (ui.sel === oid) ui.sel = null;
+      touchProject(p); save();
+      ui.plan.fitted = false;
+      toast('Deleted');
+      return render();
+    }
     case 'snap-dims': return snapDims();
 
     case 'geo-sheet': ui.sheet = { kind: 'geo', method: 'two' }; startGps(); return render();
@@ -4924,23 +4947,32 @@ function applyHex() {
   var planeCapable = full.ok && full.focal && extentPx >= 420 &&
     (full.focal.disagree != null && full.focal.disagree <= 0.10);
 
+  var thickEl = $('#hex-thick');
+  if (thickEl) t.hexThick = thickEl.value;
+  var thick = EE.toM(parseFloat(t.hexThick || EE.fromM(0.009, U()).toFixed(4)), U());
+  if (!(thick >= 0 && thick < 0.06)) thick = 0.009;
+
   var cal, msg;
   var hyb = st.att
     ? EE.fitPlanarByF(taps, ref, attMatrix(st.att), deckNormalOf(st),
-      st.imgW, st.imgH, effAngle(st), stationF(st))
+      st.imgW, st.imgH, effAngle(st))
     : null;
 
   if (!planeCapable && hyb) {
+    /* Solved against the top FACE of the panel; the deck sits `thick` below,
+       parallel. Storing camH measured to the DECK makes every deck-level tap
+       exact, and the tap-the-top-corners habit is the right one: consistent,
+       visible, and corrected here rather than guessed at per corner. */
     cal = {
-      mode: 'ray', camH: hyb.fit.scale, f: hyb.f, ok: true, source: 'hex+gravity',
-      planarRms: hyb.rms, hexSide: side,
-      provisionalScale: hyb.identifiable ? false : !db.settings.fovAt
+      mode: 'ray', camH: hyb.fit.scale + thick, f: hyb.f, ok: true, source: 'hex+gravity',
+      planarRms: hyb.rms, hexSide: side, hexThick: thick,
+      hexPix: taps.map(function (qp) { return { x: qp.x, y: qp.y }; }),
+      provisionalScale: !db.settings.fovAt
     };
-    /* The panel's corners in this station's plan frame, for the panel tie. */
     var Rh = attMatrix(st.att);
     cal.hexGround = taps.map(function (qp) {
       return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, hyb.f, effAngle(st)),
-        Rh, cal.camH, 0, deckNormalOf(st));
+        Rh, cal.camH, thick, deckNormalOf(st));
     });
     if (!cal.hexGround.every(Boolean)) delete cal.hexGround;
     else cal.hexGround = cal.hexGround.map(function (g2) { return { x: g2.x, y: g2.y }; });
@@ -4948,18 +4980,6 @@ function applyHex() {
 
     msg = 'Plane from gravity, panel for shape and scale — six corners agree to ±' +
       (hyb.rms * 1000).toFixed(0) + ' mm. Camera height ' + EE.fmtLen(cal.camH, U(), 2);
-    if (hyb.identifiable) {
-      var fovH = EE.fovFromFocalLong(hyb.f, Math.max(st.imgW, st.imgH));
-      db.settings.fov = fovH;
-      db.settings.fovFrom = ((st.cam && st.cam.label) || 'this camera') + ' (gravity-solved)';
-      db.settings.fovAt = Date.now();
-      (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[st.imgW + 'x' + st.imgH] = fovH;
-      msg += ' · lens solved against gravity: ' + fovH.toFixed(1) + '°';
-    } else {
-      msg += cal.provisionalScale
-        ? ' · lens not pinned from this angle — scale provisional until a tape check'
-        : '';
-    }
     if (full.ok && full.focal && full.focal.disagree > 0.10) {
       msg += ' · the panel alone could not pin perspective (focal split ' +
         (full.focal.disagree * 100).toFixed(0) + '%), so gravity holds the plane';
@@ -4997,10 +5017,128 @@ function applyHex() {
   var tie = tryHexTie(p, st);
   if (tie) msg += ' · placed from the panel, six corners to ±' + (tie.rms * 100).toFixed(0) + ' cm';
 
+  /* One camera took every shot, so every panel shot constrains one lens.
+     Single-shot valleys at ordinary angles are ±20-40% wide — the field
+     proved a lone solve cannot be trusted — but the shots' curves fuse, and
+     two pitches pin what one cannot. */
+  var fuse = refineLensJoint(p, st.imgW, st.imgH);
+  if (fuse) msg += ' · ' + fuse;
+
   toast(msg + sideWarn);
 
   t.step = 'trace'; t.taps = []; t.view = null;
   render();
+}
+
+/* Attitude for lens work: a horizon-locked shot's stored angles were derived
+   AT some focal length, so the lens solver must reach past them to the raw
+   sensor reading (trims applied), or the lock's f bakes into the answer. */
+function rawAttMatrix(st) {
+  var a = st.att;
+  if (a.horizonLocked && a.raw) {
+    return EE.rotFromOrientation(a.raw.alpha,
+      a.raw.beta + (db.settings.pitchTrim || 0),
+      a.raw.gamma + (db.settings.rollTrim || 0));
+  }
+  return attMatrix(a);
+}
+
+/* Re-derive a horizon lock from its stored taps at the CURRENT focal length.
+   The lock is exact only at the f it was computed with; when the lens gets
+   fused to a better value, every lock is recomputed from the raw sensor
+   attitude so photo and numbers stay in agreement. */
+function relockHorizon(st) {
+  var a = st.att;
+  if (!a || !a.horizonLocked || !a.raw || !a.horizonPx || a.horizonPx.length < 2) return false;
+  var f = (st.cal && st.cal.f) || stationF(st);
+  var Rs = EE.rotFromOrientation(a.raw.alpha,
+    a.raw.beta + (db.settings.pitchTrim || 0),
+    a.raw.gamma + (db.settings.rollTrim || 0));
+  var gHint = EE.applyM3(EE.transpose3(Rs), [0, 0, -1]);
+  var g = EE.gravityFromHorizon(a.horizonPx[0], a.horizonPx[1], st.imgW, st.imgH, f, effAngle(st), gHint);
+  if (!g) return false;
+  var out = EE.alignToGravity(Rs, g);
+  if (out.movedDeg > 25) return false;
+  var e = EE.orientationFromRot(out.R);
+  a.alpha = e.alpha; a.beta = e.beta; a.gamma = e.gamma;
+  return true;
+}
+
+/* Fuse the lens across every hexagon shot of this frame size, adopt it when
+   the joint valley is narrow, and walk the consequences through: horizon
+   locks re-derived, each hex station re-fitted at the fused f (its world
+   rescaled with it), ties re-solved. Returns a toast fragment or null. */
+function refineLensJoint(p, imgW, imgH) {
+  var shots = [], stations = [];
+  p.stations.forEach(function (st) {
+    var c = st.cal;
+    if (!c || !c.ok || !c.hexPix || !st.att) return;
+    if (st.imgW !== imgW || st.imgH !== imgH) return;
+    shots.push({
+      imgPts: c.hexPix, refPts: EE.hexCorners(c.hexSide || 0.15),
+      R: rawAttMatrix(st), deckNormal: st.deckN || [0, 0, 1],
+      imgW: st.imgW, imgH: st.imgH, screenAngle: effAngle(st)
+    });
+    stations.push(st);
+  });
+  if (!shots.length) return null;
+
+  var fuse = EE.fuseLens(shots);
+  if (!fuse) return null;
+  var fov = EE.fovFromFocalLong(fuse.f, Math.max(imgW, imgH));
+  if (!fuse.identifiable) {
+    return shots.length < 2
+      ? 'lens not yet pinned \u2014 a second panel shot at a different tilt will fuse with this one'
+      : 'lens still \u00b1' + Math.round((fuse.fHi - fuse.fLo) / 2 / fuse.f * 100) +
+      '% over ' + shots.length + ' shots \u2014 add a steeper panel shot';
+  }
+  if (!(fov > 40 && fov < 100)) return null;   /* no phone main camera lives out there */
+
+  var key = imgW + 'x' + imgH;
+  var prev = (db.settings.fovByFrame || {})[key];
+  db.settings.fov = fov;
+  db.settings.fovFrom = 'fused over ' + shots.length + ' panel shot' + (shots.length === 1 ? '' : 's');
+  db.settings.fovAt = Date.now();
+  (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[key] = fov;
+
+  /* Walk it through the shots that were solved at other focal lengths. */
+  var refit = 0;
+  stations.forEach(function (st) {
+    var c = st.cal;
+    if (Math.abs(c.f / fuse.f - 1) < 0.015) return;
+    relockHorizon(st);
+    var R = attMatrix(st.att);
+    var unit = c.hexPix.map(function (qp) {
+      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fuse.f, effAngle(st)),
+        R, 1, 0, deckNormalOf(st));
+    });
+    if (!unit.every(Boolean)) return;
+    var fit = EE.similarity2D(unit, EE.hexCorners(c.hexSide || 0.15));
+    if (!fit || !(fit.scale > 0.2 && fit.scale < 30)) return;
+    var newCamH = fit.scale + (c.hexThick || 0);
+    var k = newCamH / c.camH;
+    if (Math.abs(k - 1) > 1e-6) rescaleStation(p, st, k);
+    c.f = fuse.f;
+    c.camH = newCamH;
+    c.planarRms = fit.rms;
+    c.provisionalScale = false;
+    var hg = c.hexPix.map(function (qp) {
+      return EE.groundPoint(EE.rayForPixel(qp.x, qp.y, st.imgW, st.imgH, fuse.f, effAngle(st)),
+        R, c.camH, c.hexThick || 0, deckNormalOf(st));
+    });
+    if (hg.every(Boolean)) c.hexGround = hg.map(function (g2) { return { x: g2.x, y: g2.y }; });
+    refit++;
+  });
+  stations.forEach(function (st) { st.cal.provisionalScale = false; });
+  ensureOrigin(p);
+  stations.forEach(function (st) { if (!st.reg) { tryHexTie(p, st); } });
+  p.stations.forEach(function (st) { if (!st.reg) tryRegister(p, st); });
+  save();
+  coverageCache = { key: null, val: null };
+  ui.plan.fitted = false;
+
+  return 'lens fused over ' + shots.length + ' shot' + (shots.length === 1 ? '' : 's') + ': ' +
+    fov.toFixed(1) + '\u00b0' + (refit ? ' (' + refit + ' shot' + (refit === 1 ? '' : 's') + ' re-fitted)' : '');
 }
 
 /* Register a station against an already-placed one via their shared hexagon.
@@ -5054,7 +5192,11 @@ function applyHorizonLock(st) {
   if (!st.att) { toast('This shot has no attitude to correct'); return render(); }
   if (!picks || picks.length < 2) return render();
 
-  var f = stationF(st);
+  /* The shot's OWN focal length, never the settings default: the horizon the
+     app draws uses cal.f, and a lock computed at a different f lands the line
+     hundreds of pixels from the tapped points \u2014 the field screenshot showed
+     exactly that, 199 px above the frame. */
+  var f = (st.cal && st.cal.f) || stationF(st);
   var Rs = attMatrix(st.att);
   var gHint = EE.applyM3(EE.transpose3(Rs), [0, 0, -1]);
   var g = EE.gravityFromHorizon(picks[0], picks[1], st.imgW, st.imgH, f, effAngle(st), gHint);
@@ -5074,6 +5216,7 @@ function applyHorizonLock(st) {
   st.att.alpha = e.alpha; st.att.beta = e.beta; st.att.gamma = e.gamma;
   st.att.horizonLocked = true;
   st.att.raw = raw;
+  st.att.horizonPx = [{ x: picks[0].x, y: picks[0].y }, { x: picks[1].x, y: picks[1].y }];
   touchProject(p); save();
   coverageCache = { key: null, val: null };
   buzz([25, 40, 25]);
@@ -6101,6 +6244,21 @@ window.addEventListener('resize', function () { paint(); });
 if (screen.orientation && screen.orientation.addEventListener) {
   screen.orientation.addEventListener('change', function () { setTimeout(paint, 120); });
 }
+
+/* A stored lens outside anything a phone's main camera delivers is a past
+   solve gone wrong (the field once wrote 100\u00b0), and it poisons every solve
+   after it. Drop it; the fused solver will re-measure honestly. */
+(function () {
+  var m = db.settings.fovByFrame || {};
+  var dropped = false;
+  Object.keys(m).forEach(function (k) {
+    if (!(m[k] > 40 && m[k] < 100)) { delete m[k]; dropped = true; }
+  });
+  if (!(db.settings.fov > 40 && db.settings.fov < 100)) {
+    db.settings.fov = 68; db.settings.fovAt = 0; db.settings.fovFrom = null; dropped = true;
+  }
+  if (dropped) save();
+})();
 
 /* Sensors need no prompt on desktop and on Android, so attach immediately;
    iOS gets a button in the capture screen. */

@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     414 assertions over geo.js — open it in a browser
+    ├── test-geo.html     421 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -108,6 +108,24 @@ against gravity" when the minimum was sharp enough to store, and every other mod
 inherits it. Near nadir the lens degenerates into pure scale, and the app says so
 instead of pretending.
 
+**The lens is fused across shots, never trusted from one.** Debug photos from the field
+settled it: a single panel shot at ordinary look-down angles has a residual valley
+±20–40% wide in focal length — it will happily solve to a minimum, and the minimum is
+not to be trusted (one such solve once wrote a 100° lens into settings and poisoned every
+solve after it, including clamping the next search to its own neighbourhood). Every
+panel shot now records its corners, and the app minimises ONE focal length over ALL of
+them jointly — the same two field shots whose single valleys spanned ±25–40% put their
+joint minimum within 5% of the camera's spec sheet. The lens is only adopted when the
+joint valley is certifiably narrow, must land inside 40–100°, and a stored value outside
+that band is dropped at startup. Until it certifies, the toast coaches: add a second
+panel shot at a different tilt. When it lands, every hex shot is re-fitted at the fused
+lens (its world rescaled with it), horizon locks are re-derived, and ties re-solved.
+
+**Panel thickness is handled exactly** — tap the TOP corners, always (they are the
+visible, consistent ones); the typed thickness (default 9 mm) is subtracted so camera
+height is measured to the deck, and the tie corners are computed on the top plane. No
+guessing where the corners “hit the ground”.
+
 **The same panel must be entered the same everywhere** — it is one physical object, and
 a shot calibrated with a different side length lives in a different-sized world. The app
 warns when two shots' entered sides disagree.
@@ -126,7 +144,10 @@ rays that both lie level, so their cross product IS the down direction in the ca
 frame. The shot's pitch and roll are then taken from the photo — the sensor only keeps
 the compass — and the per-device trims stop applying to that shot. Tap the *true* horizon
 (open water, distant skyline), not a parapet or nearby ridge: anything close sits below
-level and tilts the plane. (The visible horizon dips ~0.03°·√height-in-metres below true
+level and tilts the plane. The lock runs at the shot's own calibrated focal length and
+remembers the tapped pixels, so when the fused lens later improves, the lock is
+re-derived to match — the drawn horizon and the tapped points stay in agreement. (The
+visible horizon dips ~0.03°·√height-in-metres below true
 level — 0.2° from a 30 m roof — smaller than a tap.)
 
 The capture screen also carries a fine **plumb readout** near dead vertical, iPhone-level
@@ -638,7 +659,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 414 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 421 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

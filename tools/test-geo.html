@@ -1711,6 +1711,47 @@ function near(name, a, b, tol) {
      outN && (outN.identifiable + ' f=' + outN.f.toFixed(0)));
 })();
 
+/* ---- one lens, several shots ---- */
+(function () {
+  var W = 1512, HH = 2016, fTrue = 1600, side = 0.15;
+  var ref = EE.hexCorners(side);
+  /* Field-strength corner noise: real taps, blur and edge softness land
+     around a pixel and a half, not the clean half-pixel of a friendly test. */
+  var jig = function (q, i, k) {
+    return { x: q.x + (((i + k) * 37) % 7 - 3) * 0.45, y: q.y + (((i + k) * 53) % 7 - 3) * 0.45 };
+  };
+  var mkShot = function (beta, h, oy, k) {
+    var R = EE.rotFromOrientation(10, beta, -2);
+    var pts = ref.map(function (c, i) {
+      var q = EE.projectToPixel({ x: 0.25 + c.x, y: oy + c.y }, R, h, W, HH, fTrue, 0, 0, [0, 0, 1]);
+      return q && jig(q, i, k);
+    });
+    return pts.every(Boolean)
+      ? { imgPts: pts, refPts: ref, R: R, deckNormal: [0, 0, 1], imgW: W, imgH: HH, screenAngle: 0 }
+      : null;
+  };
+
+  /* A single shot at a gentle look-down: solvable, NOT trustable — the field
+     curves showed ±25-40% valleys, and this is the guard that stops one shot
+     writing the lens for everyone. */
+  var flat = mkShot(62, 1.5, 2.6, 0);
+  ok('gentle single shot exists', !!flat);
+  var solo = EE.fitPlanarByF(flat.imgPts, flat.refPts, flat.R, flat.deckNormal, W, HH, 0);
+  ok('…solves to a minimum', !!solo, 'null');
+  ok('…but declines to certify itself', solo.identifiable === false,
+     solo && ('halfWidth ' + Math.round((solo.fHi - solo.fLo) / 2 / solo.f * 100) + '%'));
+
+  /* Two shots at different pitches: the joint valley pins what neither could. */
+  var steep = mkShot(40, 0.7, 1.0, 3);
+  ok('steep second shot exists', !!steep);
+  var fused = EE.fuseLens([flat, steep]);
+  ok('fusion solves', !!fused, 'null');
+  ok('…and certifies the joint answer', fused.identifiable === true,
+     'f=' + Math.round(fused.f) + ' [' + Math.round(fused.fLo) + '..' + Math.round(fused.fHi) + ']');
+  ok('…within 6% of the true lens through field-strength noise', Math.abs(fused.f - fTrue) / fTrue < 0.06,
+     Math.round(fused.f) + ' vs ' + fTrue);
+})();
+
 /* ---- tying two shots by their shared hexagon ---- */
 (function () {
   var side = 0.15;

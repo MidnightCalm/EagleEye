@@ -1165,8 +1165,19 @@ var EE = (function () {
      Near nadir f degenerates into pure scale and the curve goes flat; the
      `identifiable` flag says whether the minimum was sharp enough to trust
      (both 1.2× and 1/1.2× of the best f must at least double the residual). */
-  function fitPlanarByF(imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle, f0) {
-    if (!imgPts || imgPts.length < 3 || !(f0 > 0)) return null;
+  /* The search bracket is ABSOLUTE — every focal length a phone camera could
+     plausibly deliver, 35° to 110° of field of view across the long edge —
+     never a window around the currently-assumed lens. The field showed why: a
+     poisoned assumption (100° written by an earlier bad solve) clamped the
+     next solve to its own neighbourhood, and the wrong lens perpetuated
+     itself. */
+  function fBracket(imgW, imgH) {
+    var half = Math.max(imgW, imgH) / 2;
+    return { lo: half / Math.tan(55 * DEG), hi: half / Math.tan(17.5 * DEG) };
+  }
+
+  function fitPlanarByF(imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle) {
+    if (!imgPts || imgPts.length < 3) return null;
     var evalAt = function (f) {
       var unit = [];
       for (var i = 0; i < imgPts.length; i++) {
@@ -1180,17 +1191,17 @@ var EE = (function () {
       return { f: f, fit: fit, rms: fit.rms };
     };
 
-    /* Coarse log-spaced scan, then parabolic-ish refinement by thirds. */
-    var lo = f0 / 1.8, hi = f0 * 1.8;
+    var br = fBracket(imgW, imgH);
+    var lo = br.lo, hi = br.hi;
     var best = null, i2;
-    for (i2 = 0; i2 <= 24; i2++) {
-      var f2 = lo * Math.pow(hi / lo, i2 / 24);
+    for (i2 = 0; i2 <= 40; i2++) {
+      var f2 = lo * Math.pow(hi / lo, i2 / 40);
       var e2 = evalAt(f2);
       if (e2 && (!best || e2.rms < best.rms)) best = e2;
     }
     if (!best) return null;
-    var step = best.f * (Math.pow(hi / lo, 1 / 24) - 1);
-    for (i2 = 0; i2 < 18; i2++) {
+    var step = best.f * (Math.pow(hi / lo, 1 / 40) - 1);
+    for (i2 = 0; i2 < 20; i2++) {
       var l2 = evalAt(best.f - step), r2 = evalAt(best.f + step);
       if (l2 && l2.rms < best.rms) best = l2;
       else if (r2 && r2.rms < best.rms) best = r2;
@@ -1198,10 +1209,88 @@ var EE = (function () {
       if (step < best.f * 1e-4) break;
     }
 
-    var up = evalAt(best.f * 1.2), dn = evalAt(best.f / 1.2);
-    var floor2 = Math.max(best.rms, 1e-5);
-    var identifiable = !!(up && dn && up.rms > 2 * floor2 && dn.rms > 2 * floor2);
-    return { f: best.f, fit: best.fit, rms: best.rms, identifiable: identifiable };
+    /* Identifiability, the honest version: the interval of f whose residual
+       stays within 1.5× of the best. Field curves proved a single shot at
+       ordinary look-down angles has a valley ±20-40% wide — solving to a
+       minimum is easy, TRUSTING it is what needs the narrow valley. The
+       interval is returned either way so several shots can be fused: their
+       curves multiply, and two shots at different pitches pin what one
+       cannot. */
+    var lim = best.rms * 1.5 + 1e-5;
+    var fLo = best.f, fHi = best.f, e3;
+    for (i2 = 1; i2 <= 30; i2++) {
+      var fq = best.f * Math.pow(lo / best.f, i2 / 30);
+      e3 = evalAt(fq);
+      if (!e3 || e3.rms > lim) break;
+      fLo = fq;
+    }
+    for (i2 = 1; i2 <= 30; i2++) {
+      var fq2 = best.f * Math.pow(hi / best.f, i2 / 30);
+      e3 = evalAt(fq2);
+      if (!e3 || e3.rms > lim) break;
+      fHi = fq2;
+    }
+    var halfWidth = (fHi - fLo) / 2 / best.f;
+    var atEdge = fLo <= lo * 1.03 || fHi >= hi * 0.97;
+    return {
+      f: best.f, fit: best.fit, rms: best.rms,
+      fLo: fLo, fHi: fHi,
+      identifiable: !atEdge && halfWidth <= 0.15,
+      evalAt: evalAt
+    };
+  }
+
+  /* One lens, several shots: the same camera took them all, so their residual
+     curves share a minimum even when each alone is too shallow to trust. The
+     field proved it on real data — two shots whose single valleys spanned
+     ±25-40% put their JOINT minimum within 5% of the camera's spec sheet.
+     `shots`: [{imgPts, refPts, R, deckNormal, imgW, imgH, screenAngle}]. */
+  function fuseLens(shots) {
+    if (!shots || !shots.length) return null;
+    var solos = [];
+    for (var i = 0; i < shots.length; i++) {
+      var s2 = shots[i];
+      var solo = fitPlanarByF(s2.imgPts, s2.refPts, s2.R, s2.deckNormal, s2.imgW, s2.imgH, s2.screenAngle);
+      if (solo) solos.push(solo);
+    }
+    if (!solos.length) return null;
+    var br = fBracket(shots[0].imgW, shots[0].imgH);
+    var joint = function (f) {
+      var sum = 0, n = 0;
+      for (var j = 0; j < solos.length; j++) {
+        var e = solos[j].evalAt(f);
+        if (!e) return null;
+        sum += e.rms * e.rms; n++;
+      }
+      return Math.sqrt(sum / n);
+    };
+    var best = null, i2;
+    for (i2 = 0; i2 <= 60; i2++) {
+      var f2 = br.lo * Math.pow(br.hi / br.lo, i2 / 60);
+      var r2 = joint(f2);
+      if (r2 != null && (!best || r2 < best.rms)) best = { f: f2, rms: r2 };
+    }
+    if (!best) return null;
+    var lim = best.rms * 1.5 + 1e-5;
+    var fLo = best.f, fHi = best.f, rq;
+    for (i2 = 1; i2 <= 40; i2++) {
+      var fq = best.f * Math.pow(br.lo / best.f, i2 / 40);
+      rq = joint(fq);
+      if (rq == null || rq > lim) break;
+      fLo = fq;
+    }
+    for (i2 = 1; i2 <= 40; i2++) {
+      var fq2 = best.f * Math.pow(br.hi / best.f, i2 / 40);
+      rq = joint(fq2);
+      if (rq == null || rq > lim) break;
+      fHi = fq2;
+    }
+    var halfWidth = (fHi - fLo) / 2 / best.f;
+    return {
+      f: best.f, rms: best.rms, n: solos.length,
+      fLo: fLo, fHi: fHi,
+      identifiable: fLo > br.lo * 1.03 && fHi < br.hi * 0.97 && halfWidth <= 0.15
+    };
   }
 
   /* Tie two stations by the SAME physical hexagon they both calibrated on.
@@ -2356,7 +2445,7 @@ var EE = (function () {
     heightFromBaseTop: heightFromBaseTop, camHeightFromKnown: camHeightFromKnown,
     sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
     homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
-    fitPlanarByF: fitPlanarByF, hexTie: hexTie,
+    fitPlanarByF: fitPlanarByF, hexTie: hexTie, fuseLens: fuseLens, fBracket: fBracket,
     gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
     rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,
     principalAxis: principalAxis, adjust2D: adjust2D,
