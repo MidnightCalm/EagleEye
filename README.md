@@ -137,6 +137,16 @@ one tap); after that, shots at the new spot snap to each other as before, and th
 adjustment keeps the whole chain honest. Without this the first shot at a new spot would
 be glued onto the old position and the roof would fold onto itself.
 
+**One canonical panel, not a stack of copies.** Every shot's tapped hexagon carries its
+own tap noise, so three shots once drew three slightly different panels layered on the
+plan. The panel is one rigid object of exactly known size, so the survey now holds
+exactly one: the canonical hexagon — centre from the mean of the shots, orientation from
+the 6-fold circular mean, side exactly as entered — and every hex-tied shot is
+re-registered against IT rather than against whichever shot came first. The plan draws
+one perfectly regular panel per spot, and the live anchor matches the camera to the same
+canonical corners. The panel's true geometry: 150 mm sides at the base, beveling to a
+**146 mm-sided top face** at 9 mm — tap the top corners, type 146 mm.
+
 **The panel appears on the plan by itself.** Each hexagon calibration also writes the
 panel as a named outline object (“Panel”, at its true thickness) — no second tracing.
 Two shots' panels drawn on top of each other is the tie quality made visible. Panel
@@ -258,6 +268,16 @@ Live opens the camera and hangs the survey in real space: every traced shape dra
 it stands, wireframe tops at their heights, and a **floating pin at every shot's camera
 position** — "Shot 2 · 4.1 m" on a stem down to the deck — so walking the roof shows at a
 glance what has been surveyed from where, and what has not.
+
+The panel detector takes the LARGEST CONNECTED BLOB of the orange mask — never the bag
+of every orange-passing pixel. Field video showed stray orange-ish pixels far from the
+panel inflating the mask until every frame was rejected, and, when few enough slipped
+through, dragging the hull into pose leaps; a flood fill on the downscaled frame ended
+both, with edge-clip and solidity gates so a half-visible panel or wiry junk refuses
+rather than lies. Because a perfectly regular model fits all six corner rotations
+equally, the pose solve breaks that tie by expected heading — the 60° yaw leaps are
+structurally gone. Anchoring pauses while the phone swings faster than 25°/s (motion
+blur plus sensor lag), and a fresh anchor chain rejects teleports.
 
 The honest problem with walk-through AR in a web app is position: there is no ARKit, and
 no sensor knows you took three steps. The anchor is the **panel**. Whenever the orange

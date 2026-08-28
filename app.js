@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.26.0';
+var VERSION = '1.27.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1992,21 +1992,28 @@ function projToWorld(p, st, q) {
 /* The panel's corners in the live yaw-rotated world frame, from the first
    placed station that carries one. */
 function panelLiveCorners(p, st, yawRad) {
-  var src = null;
-  p.stations.forEach(function (s2) {
-    if (src || !s2.reg || !s2.cal || !s2.cal.hexGround) return;
-    src = s2;
-  });
-  if (!src) return null;
+  var canon = p.panelCanon && (p.panelCanon[1] || p.panelCanon[Object.keys(p.panelCanon)[0]]);
+  var projPts = null, thick = 0;
+  if (canon && canon.pts) {
+    projPts = canon.pts; thick = canon.thick || 0;
+  } else {
+    var src = null;
+    p.stations.forEach(function (s2) {
+      if (src || !s2.reg || !s2.cal || !s2.cal.hexGround) return;
+      src = s2;
+    });
+    if (!src) return null;
+    projPts = src.cal.hexGround.map(function (q) { return EE.applyRigid(src.reg, q); });
+    thick = src.cal.hexThick || 0;
+  }
   var cw = Math.cos(yawRad), sw = Math.sin(yawRad);
   var out = [];
-  for (var i = 0; i < src.cal.hexGround.length; i++) {
-    var pr = EE.applyRigid(src.reg, src.cal.hexGround[i]);   /* project frame */
-    var w = projToWorld(p, st, pr);
+  for (var i = 0; i < projPts.length; i++) {
+    var w = projToWorld(p, st, projPts[i]);
     if (!w) return null;
     out.push({ x: w.x * cw - w.y * sw, y: w.x * sw + w.y * cw });
   }
-  return { pts: out, thick: src.cal.hexThick || 0 };
+  return { pts: out, thick: thick };
 }
 
 /* Solve the live camera pose from detected panel corners: project the six
@@ -2028,14 +2035,31 @@ function anchorFromPanel(p, st, det, R, f, vw, vh, yawRad) {
     if (!gp) return null;
     unit.push(gp);
   }
-  var best = null;
-  [det && unit, unit.slice().reverse()].forEach(function (u2) {
+  /* A REGULAR model fits all six correspondence rotations equally well, so
+     best-rms alone picks one at random and the yaw leaps in 60-degree steps.
+     Collect every near-best candidate and break the tie by expected yaw: the
+     dial error should be near zero. */
+  var cands = [];
+  [unit, unit.slice().reverse()].forEach(function (u2) {
     for (var k = 0; k < 6; k++) {
       var dst = [];
       for (var j = 0; j < 6; j++) dst.push(panel.pts[(j + k) % 6]);
       var fit = EE.similarity2D(u2, dst);
-      if (fit && (!best || fit.rms < best.rms)) best = fit;
+      if (fit) cands.push(fit);
     }
+  });
+  if (!cands.length) return null;
+  var bestRms = Infinity;
+  cands.forEach(function (f2) { if (f2.rms < bestRms) bestRms = f2.rms; });
+  var wrapPi = function (a) {
+    while (a > Math.PI) a -= 2 * Math.PI;
+    while (a < -Math.PI) a += 2 * Math.PI;
+    return a;
+  };
+  var best = null;
+  cands.forEach(function (f2) {
+    if (f2.rms > bestRms + Math.max(0.002, bestRms * 0.5)) return;
+    if (!best || Math.abs(wrapPi(f2.theta)) < Math.abs(wrapPi(best.theta))) best = f2;
   });
   if (!best || !(best.scale > 0.4 && best.scale < 4)) return null;
   var span = 0;
@@ -2055,6 +2079,46 @@ function anchorFromPanel(p, st, det, R, f, vw, vh, yawRad) {
    corners. Thresholds are the ones that found the panel in both field
    photos; a panel-less frame fails the count or spread gates and returns
    null rather than inventing one. */
+/* The panel out of a downscaled frame's orange mask, as the LARGEST CONNECTED
+   BLOB — never the bag of every orange-passing pixel. Video replay showed why:
+   stray orange-ish pixels far from the panel inflated the mask's spread until
+   the sanity gate killed every frame ("not detecting"), and when few enough
+   slipped through, the hull wrapped them and the pose leapt ("jumping
+   around"). A flood fill on a 320 px grid costs nothing and ends both. */
+function panelBlobFromMask(mask, DW, DH) {
+  var best = null;
+  var seen = new Uint8Array(DW * DH);
+  var qx = new Int32Array(DW * DH), qy = new Int32Array(DW * DH);
+  for (var sy = 0; sy < DH; sy++) {
+    for (var sx = 0; sx < DW; sx++) {
+      var si = sy * DW + sx;
+      if (!mask[si] || seen[si]) continue;
+      var head = 0, tail = 0;
+      qx[tail] = sx; qy[tail] = sy; tail++; seen[si] = 1;
+      var pts = [];
+      var minX = sx, maxX = sx, minY = sy, maxY = sy;
+      while (head < tail) {
+        var x = qx[head], y = qy[head]; head++;
+        pts.push({ x: x, y: y });
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            var nx = x + dx, ny = y + dy;
+            if (nx < 0 || ny < 0 || nx >= DW || ny >= DH) continue;
+            var ni = ny * DW + nx;
+            if (mask[ni] && !seen[ni]) { seen[ni] = 1; qx[tail] = nx; qy[tail] = ny; tail++; }
+          }
+        }
+      }
+      if (!best || pts.length > best.pts.length) {
+        best = { pts: pts, minX: minX, maxX: maxX, minY: minY, maxY: maxY };
+      }
+    }
+  }
+  return best;
+}
+
 function detectPanelCorners(v) {
   var DW = 320;
   var scale = DW / v.videoWidth;
@@ -2065,25 +2129,27 @@ function detectPanelCorners(v) {
   g.drawImage(v, 0, 0, DW, DH);
   var d;
   try { d = g.getImageData(0, 0, DW, DH).data; } catch (e) { return null; }
-  var pts = [];
-  for (var y = 0; y < DH; y++) {
-    for (var x = 0; x < DW; x++) {
-      var i = (y * DW + x) * 4;
-      var r = d[i], gg = d[i + 1], b = d[i + 2];
-      if (r > 150 && gg > 40 && gg < 150 && b < 95 && r - b > 85 && r - gg > 35) {
-        pts.push({ x: x, y: y });
-      }
-    }
+  var mask = new Uint8Array(DW * DH);
+  for (var i2 = 0; i2 < DW * DH; i2++) {
+    var i = i2 * 4;
+    var r = d[i], gg = d[i + 1], b = d[i + 2];
+    if (r > 150 && gg > 40 && gg < 150 && b < 95 && r - b > 85 && r - gg > 35) mask[i2] = 1;
   }
-  if (pts.length < 55) return null;
-  var cx = 0, cy = 0;
-  pts.forEach(function (q) { cx += q.x / pts.length; cy += q.y / pts.length; });
-  var spread = 0;
-  pts.forEach(function (q) { spread = Math.max(spread, Math.hypot(q.x - cx, q.y - cy)); });
-  if (spread < 9 || spread > DW * 0.6) return null;
-  /* one blob, roughly: reject frames where the orange is scattered thin */
-  if (pts.length < spread * spread * 0.9) return null;
-  var hex = EE.hullSimplify(pts, 6);
+  return panelCornersFromBlob(panelBlobFromMask(mask, DW, DH), DW, DH, scale);
+}
+
+/* Gates on the blob, then the hull. Split from the canvas so the battery can
+   drive it with synthetic masks. */
+function panelCornersFromBlob(blob, DW, DH, scale) {
+  if (!blob || blob.pts.length < 55) return null;
+  /* clipped at the frame edge: half a panel solves to a wrong pose */
+  if (blob.minX <= 1 || blob.minY <= 1 || blob.maxX >= DW - 2 || blob.maxY >= DH - 2) return null;
+  var w = blob.maxX - blob.minX + 1, h = blob.maxY - blob.minY + 1;
+  if (w < 12 || h < 8) return null;
+  /* a filled convex panel is SOLID in its bounding box; wiry junk is not */
+  var solidity = blob.pts.length / (w * h);
+  if (solidity < 0.45) return null;
+  var hex = EE.hullSimplify(blob.pts, 6);
   if (!hex) return null;
   return hex.map(function (q) { return { x: q.x / scale, y: q.y / scale }; });
 }
@@ -2095,6 +2161,9 @@ function liveAnchorTick() {
   if (!v || !v.videoWidth || !ui.sensors.live) return;
   var st = findStation(p, l.stationId);
   if (!st) return;
+  /* mid-pan the frame is smeared and the attitude lags it — wait it out */
+  var pre = preTapAttitude(performance.now());
+  if (pre && pre.wobble > 25) { l.anchorSeen = false; return; }
   var det = detectPanelCorners(v);
   l.anchorSeen = !!det;
   if (!det) return;
@@ -2107,11 +2176,15 @@ function liveAnchorTick() {
      means the dial has overshot by that much, so the correction subtracts. */
   if (Math.abs(a.dYawDeg) < 25) l.yaw = (l.yaw || 0) - a.dYawDeg * 0.35;
   var prev = l.anchor;
+  var fresh = prev && (performance.now() - prev.at < 1500);
+  /* a person does not teleport: a fresh chain rejects sudden pose leaps */
+  if (fresh && Math.hypot(a.pos.x - prev.pos.x, a.pos.y - prev.pos.y) > 0.7) return;
   l.anchor = {
-    pos: prev && (performance.now() - prev.at < 1200)
-      ? { x: prev.pos.x * 0.5 + a.pos.x * 0.5, y: prev.pos.y * 0.5 + a.pos.y * 0.5 }
+    pos: fresh
+      ? { x: prev.pos.x * 0.65 + a.pos.x * 0.35, y: prev.pos.y * 0.65 + a.pos.y * 0.35 }
       : a.pos,
-    camH: a.camH, rms: a.rms, at: performance.now()
+    camH: fresh ? prev.camH * 0.65 + a.camH * 0.35 : a.camH,
+    rms: a.rms, at: performance.now()
   };
   l.pivot0 = null;               /* the pivot restarts from the anchored facing */
   l.pivotLast = null;
@@ -2296,15 +2369,16 @@ function paintLive() {
   });
 
   /* The anchor chip: the one line that says whether you can trust your feet. */
+  var chipY = Math.round(H * 0.10);
   g.font = '600 ' + Math.round(13 * scale * 2) / 2 + 'px ui-monospace, monospace';
   var chip = anchored
     ? '◈ panel-anchored · h ' + EE.fmtLen(camH, U(), 2) + (l.anchor.rms != null ? ' · ±' + (l.anchor.rms * 100).toFixed(0) + ' cm' : '')
     : (l.anchor ? '◈ anchor stale — pan over the panel' : '◈ pan over the orange panel to anchor');
   var chw = g.measureText(chip).width;
   g.fillStyle = anchored ? 'rgba(30,60,42,0.85)' : 'rgba(70,52,18,0.85)';
-  g.fillRect(8, 8, chw + 16, 26 * scale + 8);
+  g.fillRect(8, chipY, chw + 16, 26 * scale + 8);
   g.fillStyle = anchored ? '#6ED29A' : '#E4B54A';
-  g.fillText(chip, 16, 8 + 19 * scale);
+  g.fillText(chip, 16, chipY + 19 * scale);
 }
 
 function strokeScreenPoly(g, pts, close) {
@@ -2405,7 +2479,7 @@ function tplTraceCal(st, t) {
       hexBody +
       '<div class="field"><label>SIDE LENGTH — measure the FACE you tap (a beveled top runs smaller than the base)</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-side" inputmode="decimal" value="' +
-      esc(t.hexSide || EE.fromM(db.settings.hexSide || 0.145, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
+      esc(t.hexSide || EE.fromM(db.settings.hexSide || 0.146, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
       '<div class="field"><label>PANEL THICKNESS \u2014 tap the TOP corners, all six; never mix faces</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-thick" inputmode="decimal" value="' +
       esc(t.hexThick || EE.fromM(db.settings.hexThick || 0.009, U()).toFixed(4)) + '"><span>' + U() + '</span></div></div>' +
@@ -4924,7 +4998,10 @@ function startCamera() {
 
 function openLive() {
   var p = currentProject();
-  var st = p.stations.filter(function (s) { return s.reg && s.cal && s.cal.ok; })[0];
+  var placedL = p.stations.filter(function (s) { return s.reg && s.cal && s.cal.ok; });
+  /* the LATEST shot: its camera height is how you are standing NOW, not how
+     you crouched for the first one */
+  var st = placedL[placedL.length - 1];
   if (!st) return toast('Calibrate and place a shot first');
   ui.live = { stationId: st.id, stream: null, err: null, yaw: 0, showCoverage: true,
     anchor: null, anchorSeen: false, pivot0: null, pivotLast: null };
@@ -5166,7 +5243,7 @@ function applyHex() {
   var st = findStation(p, t.stationId);
   var sideEl = $('#hex-side');
   if (sideEl) t.hexSide = sideEl.value;
-  var side = EE.toM(parseFloat(t.hexSide || EE.fromM(db.settings.hexSide || 0.145, U()).toFixed(3)), U());
+  var side = EE.toM(parseFloat(t.hexSide || EE.fromM(db.settings.hexSide || 0.146, U()).toFixed(3)), U());
   if (!(side > 0.02 && side < 3)) return toast('Enter the hexagon\'s side length');
   if (t.taps.length < 6) return toast('Tap all six corners, walking around the panel');
 
@@ -5513,6 +5590,94 @@ function syncPanelObject(p, st) {
   }
 }
 
+/* Every tapped copy of the panel, fused into ONE canonical regular hexagon.
+
+   Three shots of the same panel gave three near-identical hexagons layered on
+   the plan — their centres coincided to the millimetre while their shapes
+   carried each shot's own noise (one, a stale recompute, ran 4.6% large). The
+   panel is one rigid object of exactly known size, so the survey should hold
+   exactly one: centre = mean of the per-shot centres, orientation = the
+   6-fold circular mean of the per-shot corner angles, side = as entered.
+   Hex-tied shots are then re-registered AGAINST the canonical rather than
+   against whichever shot came first, the plan carries a single panel object,
+   and the live anchor matches the camera to the same canonical corners. */
+function fusePanel(p) {
+  var byEpoch = {};
+  p.stations.forEach(function (st) {
+    var c = st.cal;
+    if (!st.reg || !c || !c.ok || !c.hexGround) return;
+    var ep = c.panelEpoch || 1;
+    (byEpoch[ep] || (byEpoch[ep] = [])).push(st);
+  });
+  p.panelCanon = {};
+  Object.keys(byEpoch).forEach(function (ep) {
+    var sts = byEpoch[ep];
+    for (var round = 0; round < 2; round++) {
+      var cx = 0, cy = 0, sSin = 0, sCos = 0, n = 0, side = 0;
+      sts.forEach(function (st) {
+        var g = st.cal.hexGround.map(function (q) { return EE.applyRigid(st.reg, q); });
+        var mx = 0, my = 0;
+        g.forEach(function (q) { mx += q.x / 6; my += q.y / 6; });
+        cx += mx; cy += my; n++;
+        side += st.cal.hexSide || 0.146;
+        g.forEach(function (q) {
+          var a6 = Math.atan2(q.y - my, q.x - mx) * 6;
+          sSin += Math.sin(a6); sCos += Math.cos(a6);
+        });
+      });
+      if (!n) return;
+      var canon = {
+        cx: cx / n, cy: cy / n,
+        theta: Math.atan2(sSin, sCos) / 6,
+        side: side / n,
+        thick: sts[0].cal.hexThick || 0
+      };
+      p.panelCanon[ep] = canon;
+      var canonPts = [];
+      for (var k = 0; k < 6; k++) {
+        var a = canon.theta + k * Math.PI / 3;
+        canonPts.push({ x: canon.cx + canon.side * Math.cos(a), y: canon.cy + canon.side * Math.sin(a) });
+      }
+      canon.pts = canonPts;
+      /* re-register hex-tied shots against the canonical */
+      sts.forEach(function (st) {
+        if (st.reg.method !== 'hex') return;
+        var expTheta = st.reg.theta;
+        var tie = EE.hexTie(canonPts, st.cal.hexGround, expTheta + (st.cal.hexNorthOff || 0) - (st.cal.hexNorthOff || 0));
+        if (tie && Math.abs(tie.scale - 1) < 0.08) {
+          st.reg.theta = tie.theta; st.reg.tx = tie.tx; st.reg.ty = tie.ty;
+          st.reg.rms = tie.rms; st.reg.canon = true;
+        }
+      });
+    }
+    /* one panel object per epoch, owned by the epoch's first placed station,
+       exactly regular, in that station's own frame */
+    var sts0 = sts[0];
+    var canon2 = p.panelCanon[ep];
+    var localPts = canon2.pts.map(function (q) { return fromProj(sts0, q); });
+    var keep = null;
+    p.objects = p.objects.filter(function (o) {
+      if (!o.panel) return true;
+      var ost = p.stations.find(function (s2) { return s2.id === o.stationId; });
+      var oep = (ost && ost.cal && ost.cal.panelEpoch) || 1;
+      if (String(oep) !== String(ep)) return true;
+      if (!keep) { keep = o; return true; }
+      return false;
+    });
+    if (keep) {
+      keep.stationId = sts0.id;
+      keep.pts = localPts;
+      keep.h = canon2.thick;
+    } else {
+      p.objects.push({
+        id: uid('o'), stationId: sts0.id, kind: 'outline', panel: true,
+        name: Number(ep) > 1 ? 'Panel · spot ' + ep : 'Panel', autoName: true,
+        h: canon2.thick, note: '', pts: localPts
+      });
+    }
+  });
+}
+
 /* Register a station against an already-placed one via their shared hexagon.
    Both must carry hexGround (the panel's corners in their own plan frames) and
    a known plan-to-north offset so the six-fold correspondence is decidable. */
@@ -5546,6 +5711,7 @@ function tryHexTie(p, st) {
   }
   p.scaleClash = null;
   st.reg = { theta: tie.theta, tx: tie.tx, ty: tie.ty, rms: tie.rms, n: 6, method: 'hex' };
+  fusePanel(p);
   touchProject(p); save();
   ui.plan.fitted = false;
   return tie;
@@ -6633,6 +6799,11 @@ if (screen.orientation && screen.orientation.addEventListener) {
    solve gone wrong (the field once wrote 100\u00b0), and it poisons every solve
    after it. Drop it; the fused solver will re-measure honestly. */
 (function () {
+  /* the panel's top face measures 146 mm a side (150 base, beveled); the old
+     suggested default of 145 gets nudged once */
+  if (db.settings.hexSide && Math.abs(db.settings.hexSide - 0.145) < 1e-9) {
+    db.settings.hexSide = 0.146;
+  }
   var m = db.settings.fovByFrame || {};
   var dropped = false;
   Object.keys(m).forEach(function (k) {
