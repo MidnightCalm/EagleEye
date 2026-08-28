@@ -4,7 +4,7 @@ A roof survey in your pocket. Photograph what is on a roof, trace it, and walk a
 metric dimensions, heights, and a KML that drops into HelioScope with the height carried in
 each shape's name.
 
-Same luxe-dark register as Trove and Ledger. Static PWA: no build step, no framework, no
+Skinned in LUXE DARK — the personal design language from Solar Calculations/luxe-dark-theme.css: purple-biased blacks, purple for what you touch, gold for what you read, ghost-paint edges on raised surfaces. Static PWA: no build step, no framework, no
 server of its own. Runs on the phone in the field and on the desktop from the same URL.
 
 ```

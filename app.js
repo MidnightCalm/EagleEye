@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.24.0';
+var VERSION = '1.25.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1607,7 +1607,7 @@ function tplPlan(p) {
     '</div>' +
     (ui.showCoverage ? '<div class="cov-legend">' +
       '<span><i style="background:#6ED29A"></i>≤ ' + EE.fmtLen(db.settings.tolerance, U(), 2) + '</span>' +
-      '<span><i style="background:#D4AF37"></i>≤ ' + EE.fmtLen(db.settings.tolerance * 2, U(), 2) + '</span>' +
+      '<span><i style="background:#D9A93F"></i>≤ ' + EE.fmtLen(db.settings.tolerance * 2, U(), 2) + '</span>' +
       '<span><i style="background:#C96A5E"></i>worse</span>' +
       '<em>seen, not measured</em></div>' : '') +
     '</div>' +
@@ -2182,7 +2182,7 @@ function paintLive() {
   var lw = Math.max(2, W / 500), scale = W / 1000;
 
   if (Math.abs(Hm[7]) > 1e-12) {
-    g.strokeStyle = 'rgba(244,240,232,0.25)'; g.lineWidth = lw * 0.6;
+    g.strokeStyle = 'rgba(237,234,244,0.25)'; g.lineWidth = lw * 0.6;
     g.beginPath();
     g.moveTo(0, -(Hm[8]) / Hm[7]);
     g.lineTo(W, -(Hm[8] + Hm[6] * W) / Hm[7]);
@@ -2237,7 +2237,7 @@ function paintLive() {
       return;
     }
 
-    var col = needsH ? '#E8C96A' : (o.kind === 'outline' ? 'rgba(244,240,232,0.7)' : '#D4AF37');
+    var col = needsH ? '#E4B54A' : (o.kind === 'outline' ? 'rgba(237,234,244,0.7)' : '#D9A93F');
     g.strokeStyle = col; g.lineWidth = lw;
     if (needsH) g.setLineDash([10 * scale, 8 * scale]);
     g.beginPath(); strokeScreenPoly(g, bp, true); g.stroke();
@@ -2285,14 +2285,14 @@ function paintLive() {
       g.beginPath(); g.moveTo(footPx.x, footPx.y); g.lineTo(pinPx.x, pinPx.y); g.stroke();
       g.setLineDash([]);
     }
-    g.fillStyle = '#E8C96A';
+    g.fillStyle = '#E4B54A';
     g.beginPath();
     g.moveTo(pinPx.x, pinPx.y - 9 * scale); g.lineTo(pinPx.x + 7 * scale, pinPx.y);
     g.lineTo(pinPx.x, pinPx.y + 9 * scale); g.lineTo(pinPx.x - 7 * scale, pinPx.y);
     g.closePath(); g.fill();
     var distM = Math.hypot(wc.x, wc.y);
     label(g, 'Shot ' + (si + 1) + ' · ' + EE.fmtLen(distM, U(), 1),
-      pinPx.x + 12 * scale, pinPx.y - 4 * scale, '#E8C96A', scale);
+      pinPx.x + 12 * scale, pinPx.y - 4 * scale, '#E4B54A', scale);
   });
 
   /* The anchor chip: the one line that says whether you can trust your feet. */
@@ -2303,7 +2303,7 @@ function paintLive() {
   var chw = g.measureText(chip).width;
   g.fillStyle = anchored ? 'rgba(30,60,42,0.85)' : 'rgba(70,52,18,0.85)';
   g.fillRect(8, 8, chw + 16, 26 * scale + 8);
-  g.fillStyle = anchored ? '#6ED29A' : '#E8C96A';
+  g.fillStyle = anchored ? '#6ED29A' : '#E4B54A';
   g.fillText(chip, 16, 8 + 19 * scale);
 }
 
@@ -2321,7 +2321,7 @@ function strokeScreenPoly(g, pts, close) {
 function label(g, text, x, y, col, scale) {
   g.font = '600 ' + Math.round(22 * scale) + 'px -apple-system, system-ui, sans-serif';
   var w = g.measureText(text).width;
-  g.fillStyle = 'rgba(12,10,16,0.72)';
+  g.fillStyle = 'rgba(10,9,13,0.72)';
   g.fillRect(x - 6 * scale, y - 19 * scale, w + 12 * scale, 26 * scale);
   g.fillStyle = col;
   g.fillText(text, x, y);
@@ -3527,7 +3527,7 @@ function paintPlan() {
   var y0 = Math.floor((ui.plan.oy - h / 2 / S) / step) * step;
   var y1 = ui.plan.oy + h / 2 / S;
   g.lineWidth = 1;
-  g.strokeStyle = 'rgba(244,240,232,0.055)';
+  g.strokeStyle = 'rgba(237,234,244,0.055)';
   g.beginPath();
   for (var gx = x0; gx <= x1; gx += step) { g.moveTo(X(gx), 0); g.lineTo(X(gx), h); }
   for (var gy = y0; gy <= y1; gy += step) { g.moveTo(0, Y(gy)); g.lineTo(w, Y(gy)); }
@@ -3548,10 +3548,10 @@ function paintPlan() {
       var cam = stationCamera(p, st);
       if (!cam) return;
       var sx = X(cam.x), sy = Y(cam.y);
-      g.strokeStyle = 'rgba(244,240,232,0.35)'; g.lineWidth = 1; g.setLineDash([3, 4]);
+      g.strokeStyle = 'rgba(237,234,244,0.35)'; g.lineWidth = 1; g.setLineDash([3, 4]);
       g.beginPath(); g.arc(sx, sy, trustedRadius(st.cal && st.cal.camH) * S, 0, Math.PI * 2); g.stroke();
       g.setLineDash([]);
-      g.fillStyle = 'rgba(244,240,232,0.85)';
+      g.fillStyle = 'rgba(237,234,244,0.85)';
       g.beginPath(); g.arc(sx, sy, 4, 0, Math.PI * 2); g.fill();
     });
   }
@@ -3564,12 +3564,12 @@ function paintPlan() {
       g.beginPath();
       pts.forEach(function (q, i) { i ? g.lineTo(X(q.x), Y(q.y)) : g.moveTo(X(q.x), Y(q.y)); });
       g.closePath();
-      g.fillStyle = 'rgba(244,240,232,0.05)'; g.fill();
-      g.strokeStyle = sel ? '#D4AF37' : 'rgba(244,240,232,0.6)'; g.lineWidth = sel ? 3 : 2; g.stroke();
+      g.fillStyle = 'rgba(237,234,244,0.05)'; g.fill();
+      g.strokeStyle = sel ? '#9D8CFF' : 'rgba(237,234,244,0.6)'; g.lineWidth = sel ? 3 : 2; g.stroke();
     } else if (o.kind === 'point') {
       var q0 = (o.pts || [])[0]; if (!q0) return;
       var px = X(q0.x), py = Y(q0.y);
-      g.strokeStyle = sel ? '#D4AF37' : '#6ED29A'; g.lineWidth = 2;
+      g.strokeStyle = sel ? '#9D8CFF' : '#6ED29A'; g.lineWidth = 2;
       g.beginPath(); g.moveTo(px - 7, py); g.lineTo(px + 7, py); g.moveTo(px, py - 7); g.lineTo(px, py + 7); g.stroke();
       if (o.name) { g.fillStyle = 'rgba(110,210,154,0.9)'; g.font = '10px ui-monospace, monospace'; g.fillText(o.name, px + 9, py - 5); }
     } else {
@@ -3577,9 +3577,9 @@ function paintPlan() {
       g.beginPath();
       poly.forEach(function (q, i) { i ? g.lineTo(X(q.x), Y(q.y)) : g.moveTo(X(q.x), Y(q.y)); });
       g.closePath();
-      g.fillStyle = o.kind === 'cylinder' ? 'rgba(138,99,210,0.28)' : 'rgba(212,175,55,0.22)';
+      g.fillStyle = o.kind === 'cylinder' ? 'rgba(138,99,210,0.28)' : 'rgba(228,181,74,0.22)';
       g.fill();
-      g.strokeStyle = sel ? '#F4F0E8' : (o.kind === 'cylinder' ? '#B79CE8' : '#D4AF37');
+      g.strokeStyle = sel ? '#F4F0E8' : (o.kind === 'cylinder' ? '#B7AAFF' : '#D9A93F');
       g.lineWidth = sel ? 3 : 1.6; g.stroke();
 
       var ctr = o.kind === 'cylinder' ? { x: o.cx, y: o.cy } : { x: o.cx, y: o.cy };
@@ -3588,7 +3588,7 @@ function paintPlan() {
         g.textAlign = 'center';
         g.fillText(o.name, X(ctr.x), Y(ctr.y) + 3);
         if (o.h) {
-          g.fillStyle = 'rgba(212,175,55,0.85)'; g.font = '10px ui-monospace, monospace';
+          g.fillStyle = 'rgba(228,181,74,0.85)'; g.font = '10px ui-monospace, monospace';
           g.fillText(EE.fmtLen(o.h, U(), U() === 'ft' ? 1 : 2), X(ctr.x), Y(ctr.y) + 16);
         }
         g.textAlign = 'left';
@@ -3601,11 +3601,11 @@ function paintPlan() {
     var cxN = w - 34, cyN = 40;
     var a = -p.anchor.bearing * Math.PI / 180;   /* plan-up bearing -> screen angle of north */
     g.save(); g.translate(cxN, cyN); g.rotate(a);
-    g.strokeStyle = '#D4AF37'; g.fillStyle = '#D4AF37'; g.lineWidth = 1.5;
+    g.strokeStyle = '#D9A93F'; g.fillStyle = '#D9A93F'; g.lineWidth = 1.5;
     g.beginPath(); g.moveTo(0, 14); g.lineTo(0, -14); g.stroke();
     g.beginPath(); g.moveTo(0, -18); g.lineTo(-5, -8); g.lineTo(5, -8); g.closePath(); g.fill();
     g.restore();
-    g.fillStyle = 'rgba(212,175,55,0.9)'; g.font = '10px ui-monospace, monospace'; g.textAlign = 'center';
+    g.fillStyle = 'rgba(228,181,74,0.9)'; g.font = '10px ui-monospace, monospace'; g.textAlign = 'center';
     g.fillText('N', cxN, cyN + 28); g.textAlign = 'left';
   }
 
@@ -3613,11 +3613,11 @@ function paintPlan() {
   var barM = step;
   var barPx = barM * S;
   var bx = 16, by = h - 26;
-  g.strokeStyle = 'rgba(244,240,232,0.8)'; g.lineWidth = 2;
+  g.strokeStyle = 'rgba(237,234,244,0.8)'; g.lineWidth = 2;
   g.beginPath(); g.moveTo(bx, by); g.lineTo(bx + barPx, by);
   g.moveTo(bx, by - 4); g.lineTo(bx, by + 4);
   g.moveTo(bx + barPx, by - 4); g.lineTo(bx + barPx, by + 4); g.stroke();
-  g.fillStyle = 'rgba(244,240,232,0.8)'; g.font = '10px ui-monospace, monospace';
+  g.fillStyle = 'rgba(237,234,244,0.8)'; g.font = '10px ui-monospace, monospace';
   g.fillText(EE.fmtLen(barM, U(), U() === 'ft' ? 0 : (barM < 1 ? 2 : 0)), bx, by - 8);
 }
 
@@ -3630,7 +3630,7 @@ function paintScene() {
 
   var objs = placedObjects(p);
   if (!objs.length) {
-    g.fillStyle = 'rgba(244,240,232,0.35)'; g.font = '13px -apple-system, system-ui, sans-serif';
+    g.fillStyle = 'rgba(237,234,244,0.35)'; g.font = '13px -apple-system, system-ui, sans-serif';
     g.textAlign = 'center'; g.fillText('Nothing traced yet.', w / 2, h / 2); g.textAlign = 'left';
     return;
   }
@@ -3677,8 +3677,8 @@ function paintScene() {
       g.beginPath();
       foot.forEach(function (q, i) { var s = P(q.x, q.y, 0); i ? g.lineTo(s.x, s.y) : g.moveTo(s.x, s.y); });
       g.closePath();
-      g.fillStyle = 'rgba(244,240,232,0.05)'; g.fill();
-      g.strokeStyle = 'rgba(244,240,232,0.5)'; g.lineWidth = 1.5; g.stroke();
+      g.fillStyle = 'rgba(237,234,244,0.05)'; g.fill();
+      g.strokeStyle = 'rgba(237,234,244,0.5)'; g.lineWidth = 1.5; g.stroke();
       return;
     }
     if (o.kind === 'point') {
@@ -3704,15 +3704,15 @@ function paintScene() {
       g.moveTo(a0.x, a0.y); g.lineTo(b0.x, b0.y); g.lineTo(b1.x, b1.y); g.lineTo(a1.x, a1.y); g.closePath();
       g.fillStyle = isCyl ? 'rgba(88,62,138,0.85)' : 'rgba(120,94,32,0.9)';
       g.fill();
-      if (!isCyl) { g.strokeStyle = 'rgba(12,10,16,0.5)'; g.lineWidth = 1; g.stroke(); }
+      if (!isCyl) { g.strokeStyle = 'rgba(10,9,13,0.5)'; g.lineWidth = 1; g.stroke(); }
     });
 
     g.beginPath();
     foot.forEach(function (q, i) { var s = P(q.x, q.y, hh); i ? g.lineTo(s.x, s.y) : g.moveTo(s.x, s.y); });
     g.closePath();
-    g.fillStyle = isCyl ? 'rgba(183,156,232,0.95)' : 'rgba(212,175,55,0.95)';
+    g.fillStyle = isCyl ? 'rgba(183,156,232,0.95)' : 'rgba(228,181,74,0.95)';
     g.fill();
-    g.strokeStyle = 'rgba(12,10,16,0.6)'; g.lineWidth = 1; g.stroke();
+    g.strokeStyle = 'rgba(10,9,13,0.6)'; g.lineWidth = 1; g.stroke();
 
     if (o.name) {
       var ctr = P(o.cx != null ? o.cx : foot[0].x, o.cy != null ? o.cy : foot[0].y, hh);
@@ -3758,7 +3758,7 @@ function paintTrace() {
 
   g.fillStyle = '#000'; g.fillRect(0, 0, w, h);
   if (!im) {
-    g.fillStyle = 'rgba(244,240,232,0.4)'; g.font = '13px -apple-system, system-ui, sans-serif';
+    g.fillStyle = 'rgba(237,234,244,0.4)'; g.font = '13px -apple-system, system-ui, sans-serif';
     g.textAlign = 'center'; g.fillText('Loading photo…', w / 2, h / 2); g.textAlign = 'left';
     return;
   }
@@ -3791,7 +3791,7 @@ function paintTrace() {
       var top = img2cv(v, { x: st.imgW / 2, y: 0 });
       var chip = label + '  ⇡ ' + Math.round(-yMid) + ' px above the photo';
       var cw2 = g.measureText(chip).width;
-      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillStyle = 'rgba(10,9,13,0.82)';
       g.fillRect(top.x - cw2 / 2 - 7, Math.max(2, top.y + 4), cw2 + 14, 17);
       g.fillStyle = col;
       g.fillText(chip, top.x - cw2 / 2, Math.max(14, top.y + 16));
@@ -3802,7 +3802,7 @@ function paintTrace() {
       var bot = img2cv(v, { x: st.imgW / 2, y: st.imgH });
       var chip2 = label + '  ⇣ ' + Math.round(yMid - st.imgH) + ' px below the photo';
       var cw3 = g.measureText(chip2).width;
-      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillStyle = 'rgba(10,9,13,0.82)';
       g.fillRect(bot.x - cw3 / 2 - 7, Math.min(h - 20, bot.y - 22), cw3 + 14, 17);
       g.fillStyle = col;
       g.fillText(chip2, bot.x - cw3 / 2, Math.min(h - 8, bot.y - 9));
@@ -3815,7 +3815,7 @@ function paintTrace() {
     g.setLineDash([]);
     var tw = g.measureText(label).width;
     var ly = Math.max(14, Math.min(h - 6, a.y - 8));
-    g.fillStyle = 'rgba(12,10,16,0.82)';
+    g.fillStyle = 'rgba(10,9,13,0.82)';
     g.fillRect(6, ly - 12, tw + 12, 17);
     g.fillStyle = col;
     g.fillText(label, 12, ly);
@@ -3870,7 +3870,7 @@ function paintTrace() {
     g.font = '600 12px ui-monospace, monospace';
     var sm = 'perspective unreliable — reference too small; recalibrate on something larger';
     var smw = g.measureText(sm).width;
-    g.fillStyle = 'rgba(212,175,55,0.94)';
+    g.fillStyle = 'rgba(228,181,74,0.94)';
     g.fillRect(6, 6, smw + 12, 19);
     g.fillStyle = '#2A0F0B';
     g.fillText(sm, 12, 19);
@@ -3905,7 +3905,7 @@ function paintTrace() {
         : o.kind === 'cylinder' ? EE.circlePoly(o.cx, o.cy, o.r, 32)
           : (o.pts || []);
       var img = poly.map(function (q) { return map.toImg(q); });
-      g.strokeStyle = o.kind === 'point' ? 'rgba(110,210,154,0.95)' : 'rgba(212,175,55,0.95)';
+      g.strokeStyle = o.kind === 'point' ? 'rgba(110,210,154,0.95)' : 'rgba(228,181,74,0.95)';
       g.lineWidth = 2;
       if (o.kind === 'point') {
         var s0 = img[0]; if (!s0) return;
@@ -3922,7 +3922,7 @@ function paintTrace() {
   /* live taps */
   var pts = t.taps.map(function (q) { return img2cv(v, q); });
   if (pts.length > 1) {
-    g.strokeStyle = '#D4AF37'; g.lineWidth = 2;
+    g.strokeStyle = '#9D8CFF'; g.lineWidth = 2;
     g.beginPath();
     pts.forEach(function (q, i) { i ? g.lineTo(q.x, q.y) : g.moveTo(q.x, q.y); });
     var closes = (t.step === 'cal' && t.calMode === 'quad' && pts.length === 4) ||
@@ -3933,16 +3933,16 @@ function paintTrace() {
   }
   pts.forEach(function (q, i) {
     g.beginPath(); g.arc(q.x, q.y, 7, 0, Math.PI * 2);
-    g.fillStyle = 'rgba(12,10,16,0.75)'; g.fill();
-    g.strokeStyle = '#D4AF37'; g.lineWidth = 2; g.stroke();
-    g.fillStyle = '#D4AF37'; g.font = '10px ui-monospace, monospace'; g.textAlign = 'center';
+    g.fillStyle = 'rgba(10,9,13,0.75)'; g.fill();
+    g.strokeStyle = '#9D8CFF'; g.lineWidth = 2; g.stroke();
+    g.fillStyle = '#9D8CFF'; g.font = '10px ui-monospace, monospace'; g.textAlign = 'center';
     g.fillText(String(i + 1), q.x, q.y + 3.5); g.textAlign = 'left';
   });
 
   /* horizon picking: mark the first tap so the second has something to aim with */
   if (t.horizonPick && t.horizonPick.length === 1) {
     var hp = img2cv(v, t.horizonPick[0]);
-    g.strokeStyle = '#D4AF37'; g.lineWidth = 2;
+    g.strokeStyle = '#9D8CFF'; g.lineWidth = 2;
     g.beginPath();
     g.moveTo(hp.x - 12, hp.y); g.lineTo(hp.x + 12, hp.y);
     g.moveTo(hp.x, hp.y - 12); g.lineTo(hp.x, hp.y + 12);
@@ -3955,15 +3955,15 @@ function paintTrace() {
     t.balls.forEach(function (b, i) {
       var cc = img2cv(v, { x: b.cx, y: b.cy });
       var cr = b.r * v.s;
-      g.strokeStyle = b.locked ? '#6ED29A' : '#D4AF37';
+      g.strokeStyle = b.locked ? '#6ED29A' : '#9D8CFF';
       g.lineWidth = 2;
       if (!b.locked) g.setLineDash([6, 5]);
       g.beginPath(); g.arc(cc.x, cc.y, cr, 0, Math.PI * 2); g.stroke();
       g.setLineDash([]);
       g.font = '700 12px ui-monospace, monospace';
-      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillStyle = 'rgba(10,9,13,0.82)';
       g.fillRect(cc.x - 9, cc.y - 9, 18, 18);
-      g.fillStyle = b.locked ? '#6ED29A' : '#D4AF37';
+      g.fillStyle = b.locked ? '#6ED29A' : '#9D8CFF';
       g.textAlign = 'center';
       g.fillText(String.fromCharCode(65 + i), cc.x, cc.y + 4);
       g.textAlign = 'left';
@@ -3979,7 +3979,7 @@ function paintTrace() {
       var rc2 = img2cv(v, rimSrc);
       var rad2 = Math.hypot(rc2.x - bc.x, rc2.y - bc.y);
       if (rad2 > 3) {
-        g.strokeStyle = '#D4AF37'; g.lineWidth = 2; g.setLineDash([6, 5]);
+        g.strokeStyle = '#9D8CFF'; g.lineWidth = 2; g.setLineDash([6, 5]);
         g.beginPath(); g.arc(bc.x, bc.y, rad2, 0, Math.PI * 2); g.stroke();
         g.setLineDash([]);
       }
@@ -3995,7 +3995,7 @@ function paintTrace() {
       var bl = 'Ø ' + t.ballFit.dh.toFixed(1) + ' px';
       g.font = '600 13px ui-monospace, monospace';
       var bw2 = g.measureText(bl).width;
-      g.fillStyle = 'rgba(12,10,16,0.82)';
+      g.fillStyle = 'rgba(10,9,13,0.82)';
       g.fillRect(fc.x - bw2 / 2 - 7, fc.y - fr - 30, bw2 + 14, 22);
       g.fillStyle = '#6ED29A'; g.textAlign = 'center';
       g.fillText(bl, fc.x, fc.y - fr - 14); g.textAlign = 'left';
@@ -4019,7 +4019,7 @@ function paintTrace() {
         var mid = img2cv(v, map.toImg({ x: shape.cx, y: shape.cy }) || { x: 0, y: 0 });
         g.font = '600 13px ui-monospace, monospace';
         var tw = g.measureText(lbl).width;
-        g.fillStyle = 'rgba(12,10,16,0.82)';
+        g.fillStyle = 'rgba(10,9,13,0.82)';
         g.fillRect(mid.x - tw / 2 - 7, mid.y - 11, tw + 14, 22);
         g.fillStyle = '#6ED29A'; g.textAlign = 'center';
         g.fillText(lbl, mid.x, mid.y + 4); g.textAlign = 'left';
@@ -4065,7 +4065,7 @@ function paintLoupe(st, im, v) {
   g.fillStyle = '#000'; g.fillRect(0, 0, box.width, box.height);
   g.imageSmoothingEnabled = true;
   g.drawImage(im, ip.x - half, ip.y - half, half * 2, half * 2, 0, 0, box.width, box.height);
-  g.strokeStyle = '#D4AF37'; g.lineWidth = 1.5;
+  g.strokeStyle = '#D9A93F'; g.lineWidth = 1.5;
   g.beginPath();
   g.moveTo(box.width / 2 - 14, box.height / 2); g.lineTo(box.width / 2 + 14, box.height / 2);
   g.moveTo(box.width / 2, box.height / 2 - 14); g.lineTo(box.width / 2, box.height / 2 + 14);
@@ -6418,9 +6418,9 @@ function renderPlanRaster(p) {
     /* Barely-there fill. This raster is a tracing base: the roof underneath has
        to stay visible, because the whole job is drawing HelioScope's own
        obstructions on top of it. A heavy fill hides the thing being traced. */
-    g.fillStyle = 'rgba(212,175,55,0.16)'; g.fill();
+    g.fillStyle = 'rgba(228,181,74,0.16)'; g.fill();
     g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 7 * s; g.stroke();
-    g.strokeStyle = '#E8C96A'; g.lineWidth = 3.5 * s; g.stroke();
+    g.strokeStyle = '#E4B54A'; g.lineWidth = 3.5 * s; g.stroke();
 
     /* No name painted here. A label baked into the ground image is underneath
        everything the moment modules are placed over it, which is exactly the
