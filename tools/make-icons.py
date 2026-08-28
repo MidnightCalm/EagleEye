@@ -1,18 +1,25 @@
 """Eagle Eye app icons.
 
-An aperture iris around a survey crosshair, in the Trove/Ledger palette. Drawn
-at 4x and downsampled, which is cheaper than antialiasing each primitive.
+An aperture iris around a survey crosshair, in the LUXE DARK language:
+purple-biased near-black ground, a ghost-paint purple edge (the raised
+surface), and the reticle in gold — the instrument you READ. Drawn at 4x
+and downsampled, which is cheaper than antialiasing each primitive.
 """
 import math
 from PIL import Image, ImageDraw
 
-BG = (11, 9, 16)
-PLUM = (36, 22, 53)
-GOLD = (212, 175, 55)
-GOLD_D = (138, 112, 33)
-CREAM = (244, 240, 232)
+BG = (10, 9, 13)          # --lx-bg
+SURFACE = (25, 21, 33)    # --lx-surface-2, the raised disc
+PURPLE = (157, 140, 255)  # --lx-purple, the ghost edge
+GOLD = (228, 181, 74)     # --lx-gold, the read accent
+GOLD_D = (150, 118, 48)   # dimmed gold for the brackets
+INK = (237, 234, 244)     # --lx-ink
 
 SS = 4  # supersample
+
+
+def mix(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def make(size: int) -> Image.Image:
@@ -21,8 +28,14 @@ def make(size: int) -> Image.Image:
     d = ImageDraw.Draw(im)
     c = n / 2
 
-    # plum ground, so the icon does not read as a black square on a dark home screen
-    d.ellipse([n * 0.045, n * 0.045, n * 0.955, n * 0.955], fill=PLUM)
+    # ghost glow: soft purple falloff outside the surface edge
+    for i, t in ((3, 0.05), (2, 0.09), (1, 0.16)):
+        r0 = n * 0.045 - i * n * 0.011
+        d.ellipse([r0, r0, n - r0, n - r0], outline=mix(BG, PURPLE, t),
+                  width=max(2, int(n * 0.012)))
+
+    # raised surface, so the icon does not read as a black square on a dark home screen
+    d.ellipse([n * 0.045, n * 0.045, n * 0.955, n * 0.955], fill=SURFACE)
 
     w = max(2, int(n * 0.017))
 
@@ -37,15 +50,16 @@ def make(size: int) -> Image.Image:
     # crosshair, broken at the centre so the ring reads clearly
     arm_o, arm_i = n * 0.235, n * 0.085
     for s in (-1, 1):
-        d.line([c + s * arm_i, c, c + s * arm_o, c], fill=CREAM, width=w)
-        d.line([c, c + s * arm_i, c, c + s * arm_o], fill=CREAM, width=w)
+        d.line([c + s * arm_i, c, c + s * arm_o, c], fill=INK, width=w)
+        d.line([c, c + s * arm_i, c, c + s * arm_o], fill=INK, width=w)
 
     rr = n * 0.115
     d.ellipse([c - rr, c - rr, c + rr, c + rr], outline=GOLD, width=w)
     d.ellipse([c - w, c - w, c + w, c + w], fill=GOLD)
 
-    # outer ring
-    d.ellipse([n * 0.045, n * 0.045, n * 0.955, n * 0.955], outline=GOLD, width=max(2, int(n * 0.012)))
+    # the ghost edge itself: a purple ring on the surface rim
+    d.ellipse([n * 0.045, n * 0.045, n * 0.955, n * 0.955],
+              outline=mix(BG, PURPLE, 0.55), width=max(2, int(n * 0.012)))
 
     return im.resize((size, size), Image.LANCZOS)
 

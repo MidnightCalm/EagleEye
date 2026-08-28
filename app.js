@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.25.0';
+var VERSION = '1.26.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
