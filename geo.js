@@ -1313,6 +1313,40 @@ var EE = (function () {
     };
   }
 
+  /* Convex hull of a point cloud, simplified to exactly n vertices by
+     repeatedly dropping the vertex whose removal loses the least area — the
+     shape-preserving way to turn a pixel-mask boundary into the polygon it
+     came from. Powers the LIVE panel detector. */
+  function hullSimplify(pts, n) {
+    if (!pts || pts.length < n) return null;
+    var P = pts.slice().sort(function (a, b) { return a.x - b.x || a.y - b.y; });
+    var cross2 = function (o, a, b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); };
+    var lo = [], hi = [], i;
+    for (i = 0; i < P.length; i++) {
+      while (lo.length >= 2 && cross2(lo[lo.length - 2], lo[lo.length - 1], P[i]) <= 0) lo.pop();
+      lo.push(P[i]);
+    }
+    for (i = P.length - 1; i >= 0; i--) {
+      while (hi.length >= 2 && cross2(hi[hi.length - 2], hi[hi.length - 1], P[i]) <= 0) hi.pop();
+      hi.push(P[i]);
+    }
+    lo.pop(); hi.pop();
+    var h = lo.concat(hi);
+    if (h.length < n) return null;
+    var tri = function (a, b, c) {
+      return Math.abs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) / 2;
+    };
+    while (h.length > n) {
+      var worst = Infinity, wi = -1, m = h.length;
+      for (i = 0; i < m; i++) {
+        var t = tri(h[(i - 1 + m) % m], h[i], h[(i + 1) % m]);
+        if (t < worst) { worst = t; wi = i; }
+      }
+      h.splice(wi, 1);
+    }
+    return h.map(function (q) { return { x: q.x, y: q.y }; });
+  }
+
   /* Tie two stations by the SAME physical hexagon they both calibrated on.
 
      Six corners, but which is which? A regular hexagon offers six rotations of
@@ -2466,6 +2500,7 @@ var EE = (function () {
     sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
     homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
     fitPlanarByF: fitPlanarByF, hexTie: hexTie, fuseLens: fuseLens, fBracket: fBracket,
+    hullSimplify: hullSimplify,
     gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
     rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,
     principalAxis: principalAxis, adjust2D: adjust2D,

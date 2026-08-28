@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.22.0';
+var VERSION = '1.23.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1979,6 +1979,144 @@ function projToWorld(p, st, q) {
   return { x: inv.x * c.pose.scale, y: inv.y * c.pose.scale };
 }
 
+/* ================= the live anchor =================
+
+   A web app gets no positional tracking, so "walk the roof and see the
+   survey in place" needs an anchor the camera can SEE. The orange panel is
+   exactly that: whenever it is in frame, its six detected corners plus the
+   live attitude re-run the same similarity solve the calibration uses —
+   camera position, height and yaw drift, live, several times a second. Out
+   of view, the last position holds with the body-pivot model, and the chip
+   says to pan back over the panel. */
+
+/* The panel's corners in the live yaw-rotated world frame, from the first
+   placed station that carries one. */
+function panelLiveCorners(p, st, yawRad) {
+  var src = null;
+  p.stations.forEach(function (s2) {
+    if (src || !s2.reg || !s2.cal || !s2.cal.hexGround) return;
+    src = s2;
+  });
+  if (!src) return null;
+  var cw = Math.cos(yawRad), sw = Math.sin(yawRad);
+  var out = [];
+  for (var i = 0; i < src.cal.hexGround.length; i++) {
+    var pr = EE.applyRigid(src.reg, src.cal.hexGround[i]);   /* project frame */
+    var w = projToWorld(p, st, pr);
+    if (!w) return null;
+    out.push({ x: w.x * cw - w.y * sw, y: w.x * sw + w.y * cw });
+  }
+  return { pts: out, thick: src.cal.hexThick || 0 };
+}
+
+/* Solve the live camera pose from detected panel corners: project the six
+   rays onto the deck at unit height, similarity-fit them to the panel's
+   known world corners over the six starts and two windings, and read off
+   position (the fit's translation), height (its scale) and yaw drift (its
+   rotation). The same mathematics that calibrates a shot, run at frame rate. */
+function anchorFromPanel(p, st, det, R, f, vw, vh, yawRad) {
+  var panel = panelLiveCorners(p, st, yawRad);
+  if (!panel || !det || det.length !== 6) return null;
+  /* Unit-height projection, plane at zero — the hexagon calibration's own
+     convention. The fit's scale is then the camera's height above the PANEL
+     TOP, and the thickness is added once at the end, exactly as applyHex
+     does it. */
+  var unit = [];
+  for (var i = 0; i < 6; i++) {
+    var gp = EE.groundPoint(EE.rayForPixel(det[i].x, det[i].y, vw, vh, f, screenAngle()),
+      R, 1, 0, deckNormalOf(st));
+    if (!gp) return null;
+    unit.push(gp);
+  }
+  var best = null;
+  [det && unit, unit.slice().reverse()].forEach(function (u2) {
+    for (var k = 0; k < 6; k++) {
+      var dst = [];
+      for (var j = 0; j < 6; j++) dst.push(panel.pts[(j + k) % 6]);
+      var fit = EE.similarity2D(u2, dst);
+      if (fit && (!best || fit.rms < best.rms)) best = fit;
+    }
+  });
+  if (!best || !(best.scale > 0.4 && best.scale < 4)) return null;
+  var span = 0;
+  panel.pts.forEach(function (a) {
+    panel.pts.forEach(function (b) { span = Math.max(span, Math.hypot(a.x - b.x, a.y - b.y)); });
+  });
+  if (best.rms > Math.max(0.012, span * 0.06)) return null;
+  return {
+    pos: { x: best.tx, y: best.ty },
+    camH: best.scale + panel.thick,
+    dYawDeg: best.theta * 180 / Math.PI,
+    rms: best.rms
+  };
+}
+
+/* Find the panel in a video frame: the orange mask's hull, simplified to six
+   corners. Thresholds are the ones that found the panel in both field
+   photos; a panel-less frame fails the count or spread gates and returns
+   null rather than inventing one. */
+function detectPanelCorners(v) {
+  var DW = 320;
+  var scale = DW / v.videoWidth;
+  var DH = Math.round(v.videoHeight * scale);
+  if (!snapCv) snapCv = document.createElement('canvas');
+  snapCv.width = DW; snapCv.height = DH;
+  var g = snapCv.getContext('2d', { willReadFrequently: true });
+  g.drawImage(v, 0, 0, DW, DH);
+  var d;
+  try { d = g.getImageData(0, 0, DW, DH).data; } catch (e) { return null; }
+  var pts = [];
+  for (var y = 0; y < DH; y++) {
+    for (var x = 0; x < DW; x++) {
+      var i = (y * DW + x) * 4;
+      var r = d[i], gg = d[i + 1], b = d[i + 2];
+      if (r > 150 && gg > 40 && gg < 150 && b < 95 && r - b > 85 && r - gg > 35) {
+        pts.push({ x: x, y: y });
+      }
+    }
+  }
+  if (pts.length < 55) return null;
+  var cx = 0, cy = 0;
+  pts.forEach(function (q) { cx += q.x / pts.length; cy += q.y / pts.length; });
+  var spread = 0;
+  pts.forEach(function (q) { spread = Math.max(spread, Math.hypot(q.x - cx, q.y - cy)); });
+  if (spread < 9 || spread > DW * 0.6) return null;
+  /* one blob, roughly: reject frames where the orange is scattered thin */
+  if (pts.length < spread * spread * 0.9) return null;
+  var hex = EE.hullSimplify(pts, 6);
+  if (!hex) return null;
+  return hex.map(function (q) { return { x: q.x / scale, y: q.y / scale }; });
+}
+
+function liveAnchorTick() {
+  var p = currentProject(), l = ui.live;
+  if (!p || !l) return;
+  var v = $('#live-video');
+  if (!v || !v.videoWidth || !ui.sensors.live) return;
+  var st = findStation(p, l.stationId);
+  if (!st) return;
+  var det = detectPanelCorners(v);
+  l.anchorSeen = !!det;
+  if (!det) return;
+  var f = EE.focalFromFov(fovValueFor(v.videoWidth, v.videoHeight), Math.max(v.videoWidth, v.videoHeight));
+  var R = attMatrix(ui.sensors);
+  var a = anchorFromPanel(p, st, det, R, f, v.videoWidth, v.videoHeight, (l.yaw || 0) * Math.PI / 180);
+  if (!a) return;
+  /* the yaw dial self-tunes, gently */
+  /* theta maps the attitude frame onto the DIALLED frame: a positive reading
+     means the dial has overshot by that much, so the correction subtracts. */
+  if (Math.abs(a.dYawDeg) < 25) l.yaw = (l.yaw || 0) - a.dYawDeg * 0.35;
+  var prev = l.anchor;
+  l.anchor = {
+    pos: prev && (performance.now() - prev.at < 1200)
+      ? { x: prev.pos.x * 0.5 + a.pos.x * 0.5, y: prev.pos.y * 0.5 + a.pos.y * 0.5 }
+      : a.pos,
+    camH: a.camH, rms: a.rms, at: performance.now()
+  };
+  l.pivot0 = null;               /* the pivot restarts from the anchored facing */
+  l.pivotLast = null;
+}
+
 /* Horizontal camera displacement since the live session began, assuming the
    surveyor pivots about their body axis with the phone held an arm ahead.
    0.35 m is a comfortable one-handed hold; looking straight down the facing
@@ -2010,8 +2148,9 @@ function paintLive() {
   g.setTransform(1, 0, 0, 1, 0, 0);
   g.clearRect(0, 0, W, H);
 
-  var camH = st.cal.camH || db.settings.camH;
-  var f = EE.focalFromFov(db.settings.fov, Math.max(W, H));
+  var anchored = l.anchor && (performance.now() - l.anchor.at) < 2500;
+  var camH = (l.anchor && l.anchor.camH) || st.cal.camH || db.settings.camH;
+  var f = EE.focalFromFov(fovValueFor(W, H), Math.max(W, H));
   var R = attMatrix(ui.sensors);
   var Hm = EE.homographyFromPose(R, camH, f, W, H, screenAngle(), deckNormalOf(st));
   var Hi = Hm && EE.invert3(Hm);
@@ -2026,10 +2165,17 @@ function paintLive() {
      behind the lens, so the camera's position is that axis plus an arm along
      the current facing; as the facing swings, the ground counter-translates. */
   var off = liveCamOffset(l, R);
-  var world = function (q) {
+  var base = l.anchor ? l.anchor.pos : { x: 0, y: 0 };
+  var camPos = { x: base.x + off.x, y: base.y + off.y };
+  var worldRaw = function (q) {
     var w = projToWorld(p, st, q);
     if (!w) return null;
-    return { x: w.x * cw - w.y * sw - off.x, y: w.x * sw + w.y * cw - off.y };
+    return { x: w.x * cw - w.y * sw, y: w.x * sw + w.y * cw };
+  };
+  var world = function (q) {
+    var w = worldRaw(q);
+    if (!w) return null;
+    return { x: w.x - camPos.x, y: w.y - camPos.y };
   };
   var toPix = function (q) { var w = world(q); return w ? EE.applyH(Hi, w) : null; };
 
@@ -2119,6 +2265,46 @@ function paintLive() {
         a.x, a.y - 12 * scale, col, scale);
     }
   });
+
+  /* Every shot, floating where its camera stood: a walkable map of what has
+     been seen from where. The stem ties the pin to its spot on the deck. */
+  p.stations.forEach(function (s2, si) {
+    if (!s2.reg || !s2.cal || !s2.cal.ok || !(s2.cal.camH > 0)) return;
+    var cp = stationCamera(p, s2);
+    if (!cp) return;
+    var wr = worldRaw(cp);
+    if (!wr) return;
+    var wc = { x: wr.x - camPos.x, y: wr.y - camPos.y };
+    var footPx = EE.applyH(Hi, wc);
+    var pinPx = EE.projectToPixel(wc, R, camH, W, H, f, screenAngle(), s2.cal.camH, deckNormalOf(st));
+    if (!pinPx) return;
+    g.strokeStyle = 'rgba(232,201,106,0.9)';
+    g.lineWidth = lw;
+    if (footPx) {
+      g.setLineDash([4 * scale, 6 * scale]);
+      g.beginPath(); g.moveTo(footPx.x, footPx.y); g.lineTo(pinPx.x, pinPx.y); g.stroke();
+      g.setLineDash([]);
+    }
+    g.fillStyle = '#E8C96A';
+    g.beginPath();
+    g.moveTo(pinPx.x, pinPx.y - 9 * scale); g.lineTo(pinPx.x + 7 * scale, pinPx.y);
+    g.lineTo(pinPx.x, pinPx.y + 9 * scale); g.lineTo(pinPx.x - 7 * scale, pinPx.y);
+    g.closePath(); g.fill();
+    var distM = Math.hypot(wc.x, wc.y);
+    label(g, 'Shot ' + (si + 1) + ' · ' + EE.fmtLen(distM, U(), 1),
+      pinPx.x + 12 * scale, pinPx.y - 4 * scale, '#E8C96A', scale);
+  });
+
+  /* The anchor chip: the one line that says whether you can trust your feet. */
+  g.font = '600 ' + Math.round(13 * scale * 2) / 2 + 'px ui-monospace, monospace';
+  var chip = anchored
+    ? '◈ panel-anchored · h ' + EE.fmtLen(camH, U(), 2) + (l.anchor.rms != null ? ' · ±' + (l.anchor.rms * 100).toFixed(0) + ' cm' : '')
+    : (l.anchor ? '◈ anchor stale — pan over the panel' : '◈ pan over the orange panel to anchor');
+  var chw = g.measureText(chip).width;
+  g.fillStyle = anchored ? 'rgba(30,60,42,0.85)' : 'rgba(70,52,18,0.85)';
+  g.fillRect(8, 8, chw + 16, 26 * scale + 8);
+  g.fillStyle = anchored ? '#6ED29A' : '#E8C96A';
+  g.fillText(chip, 16, 8 + 19 * scale);
 }
 
 function strokeScreenPoly(g, pts, close) {
@@ -4720,13 +4906,16 @@ function openLive() {
   var p = currentProject();
   var st = p.stations.filter(function (s) { return s.reg && s.cal && s.cal.ok; })[0];
   if (!st) return toast('Calibrate and place a shot first');
-  ui.live = { stationId: st.id, stream: null, err: null, yaw: 0, showCoverage: true };
+  ui.live = { stationId: st.id, stream: null, err: null, yaw: 0, showCoverage: true,
+    anchor: null, anchorSeen: false, pivot0: null, pivotLast: null };
+  ui.live.anchorTimer = setInterval(liveAnchorTick, 220);
   view.screen = 'live';
   if (!needsMotionPermission()) startSensors();
   render();
 }
 
 function closeLive() {
+  if (ui.live && ui.live.anchorTimer) clearInterval(ui.live.anchorTimer);
   if (ui.live && ui.live.stream) ui.live.stream.getTracks().forEach(function (t) { t.stop(); });
   ui.live = null;
   view.screen = 'project';

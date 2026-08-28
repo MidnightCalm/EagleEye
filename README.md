@@ -17,7 +17,7 @@ eagle-eye/
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     421 assertions over geo.js — open it in a browser
+    ├── test-geo.html     424 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
@@ -242,6 +242,27 @@ features in different shots), and flags any shot whose scale wants to differ fro
 rest. Manually-placed shots and the origin stay put.
 
 Failing landmarks, place a shot by hand from the plan (rotation and offset).
+
+## Walking the survey — Live mode
+
+Live opens the camera and hangs the survey in real space: every traced shape drawn where
+it stands, wireframe tops at their heights, and a **floating pin at every shot's camera
+position** — "Shot 2 · 4.1 m" on a stem down to the deck — so walking the roof shows at a
+glance what has been surveyed from where, and what has not.
+
+The honest problem with walk-through AR in a web app is position: there is no ARKit, and
+no sensor knows you took three steps. The anchor is the **panel**. Whenever the orange
+hexagon is anywhere in frame, its six corners are detected live and the same similarity
+solve that calibrates a shot runs at frame rate — your true position, height and heading,
+several times a second, measured against the survey itself. The chip says
+"◈ panel-anchored · h 1.31 m · ±2 cm" while it holds; walk it out of view and the last
+position freezes (the body-pivot model still absorbs panning in place), the chip turns
+amber, and panning back over the panel re-anchors. The yaw dial self-tunes from the same
+solve.
+
+So the field gesture is: stand anywhere the panel is visible, and the overlay is real AR
+— walk, look, compare. Where the panel is not visible you are on the pivot model: rotate
+in place freely, but expect drift if you walk.
 
 ## Locating the survey
 
@@ -690,7 +711,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 421 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 424 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

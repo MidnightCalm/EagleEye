@@ -1752,6 +1752,37 @@ function near(name, a, b, tol) {
      Math.round(fused.f) + ' vs ' + fTrue);
 })();
 
+/* ---- hull simplification: pixels back to the polygon they came from ---- */
+(function () {
+  /* a filled hexagon rasterised at unit steps, corners at radius 40 */
+  var corners = [];
+  for (var k = 0; k < 6; k++) {
+    corners.push({ x: 100 + 40 * Math.cos(k * Math.PI / 3 + 0.3),
+                   y: 100 + 40 * Math.sin(k * Math.PI / 3 + 0.3) });
+  }
+  var inside = function (x, y) {
+    for (var i = 0; i < 6; i++) {
+      var a = corners[i], b = corners[(i + 1) % 6];
+      if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) return false;
+    }
+    return true;
+  };
+  var mask = [];
+  for (var y = 50; y < 150; y++) for (var x = 50; x < 150; x++) {
+    if (inside(x, y)) mask.push({ x: x, y: y });
+  }
+  var six = EE.hullSimplify(mask, 6);
+  ok('hullSimplify returns six vertices', !!six && six.length === 6, six && six.length);
+  var worst = 0;
+  six.forEach(function (q) {
+    var best = 1e9;
+    corners.forEach(function (c) { best = Math.min(best, Math.hypot(q.x - c.x, q.y - c.y)); });
+    worst = Math.max(worst, best);
+  });
+  ok('…each within 3.5 px of a true corner (integer rasterisation shaves them)', worst < 3.5, worst.toFixed(2));
+  ok('too few points refused', EE.hullSimplify([{x:0,y:0},{x:1,y:1}], 6) === null);
+})();
+
 /* ---- tying two shots by their shared hexagon ---- */
 (function () {
   var side = 0.15;
