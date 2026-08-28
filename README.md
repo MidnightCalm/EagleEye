@@ -128,6 +128,15 @@ thickness you enter become the defaults everywhere after that, because a panel i
 physical object. Never mix faces in one calibration (bottom corners in front, top corners
 behind): that tilts the fitted plane by ~2°, which is worse than any bevel.
 
+**Leapfrogging a big roof.** A whole roof means picking the panel up and carrying it.
+Each resting place is a **spot**: shots snap to each other by the panel only within the
+same spot, and when you move it, say so — the calibration screen offers *panel where it
+was / I moved the panel*. A moved-panel shot starts spot #2 and is stitched to the survey
+by **two named landmarks** shared with earlier shots (the landmark chips make the naming
+one tap); after that, shots at the new spot snap to each other as before, and the global
+adjustment keeps the whole chain honest. Without this the first shot at a new spot would
+be glued onto the old position and the roof would fold onto itself.
+
 **The panel appears on the plan by itself.** Each hexagon calibration also writes the
 panel as a named outline object (“Panel”, at its true thickness) — no second tracing.
 Two shots' panels drawn on top of each other is the tie quality made visible. Panel

@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.23.0';
+var VERSION = '1.24.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -2409,6 +2409,22 @@ function tplTraceCal(st, t) {
       '<div class="field"><label>PANEL THICKNESS \u2014 tap the TOP corners, all six; never mix faces</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-thick" inputmode="decimal" value="' +
       esc(t.hexThick || EE.fromM(db.settings.hexThick || 0.009, U()).toFixed(4)) + '"><span>' + U() + '</span></div></div>' +
+      (function () {
+        var prior = currentProject().stations.some(function (s2) {
+          return s2.id !== st.id && s2.cal && s2.cal.hexGround;
+        });
+        if (!prior) return '';
+        return '<div class="live-row" style="justify-content:center">' +
+          '<button class="pill tiny' + (t.panelMoved ? '' : ' gold') + '" data-act="hex-moved" data-v="0">' +
+          'panel where it was</button>' +
+          '<button class="pill tiny' + (t.panelMoved ? ' gold' : '') + '" data-act="hex-moved" data-v="1">' +
+          'I moved the panel</button></div>' +
+          (t.panelMoved
+            ? '<div class="hint">A moved panel starts a <b>new spot</b>: this shot will not snap to the old ' +
+            'position. Tie it in with <b>two named landmarks</b> shared with earlier shots, and later shots ' +
+            'of the panel here will snap to each other.</div>'
+            : '');
+      })() +
       '<div class="btn-row">' +
       (hn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
       '<button class="btn primary sm" data-act="apply-hex"' + (hn >= 6 ? '' : ' disabled') + '>Calibrate</button>' +
@@ -4662,6 +4678,10 @@ function handle(el, e) {
     case 'apply-map': return applyMap();
     case 'apply-ball': return applyBall();
     case 'ball-add': return commitBall();
+    case 'hex-moved': {
+      ui.trace.panelMoved = el.dataset.v === '1';
+      return render();
+    }
     case 'horizon-pick': {
       ui.trace.horizonPick = ui.trace.horizonPick ? null : [];
       return render();
@@ -5279,6 +5299,22 @@ function applyHex() {
     return toast(full.err);
   }
 
+  /* Leapfrogging a big roof means picking the panel up and moving it. Each
+     resting place is an EPOCH: shots tie by panel only within their epoch,
+     and a new epoch is stitched to the survey by named landmarks instead —
+     otherwise the first shot at the new spot would be glued onto the old
+     one and the whole roof would fold onto itself. */
+  var maxEpoch = 0;
+  p.stations.forEach(function (s2) {
+    if (s2.id !== st.id && s2.cal && s2.cal.hexGround) {
+      maxEpoch = Math.max(maxEpoch, s2.cal.panelEpoch || 1);
+    }
+  });
+  cal.panelEpoch = maxEpoch === 0 ? 1 : (t.panelMoved ? maxEpoch + 1 : maxEpoch);
+  if (t.panelMoved && maxEpoch > 0) {
+    msg += ' · panel spot #' + cal.panelEpoch + ' — tie this shot with two named landmarks';
+  }
+
   st.cal = cal;
   syncPanelObject(p, st);
   touchProject(p); save();
@@ -5467,9 +5503,11 @@ function syncPanelObject(p, st) {
     ex.pts = c.hexGround.map(function (q) { return { x: q.x, y: q.y }; });
     ex.h = c.hexThick || 0;
   } else {
+    var ep = c.panelEpoch || 1;
     p.objects.push({
       id: uid('o'), stationId: st.id, kind: 'outline', panel: true,
-      name: 'Panel', autoName: true, h: c.hexThick || 0, note: '',
+      name: ep > 1 ? 'Panel · spot ' + ep : 'Panel', autoName: true,
+      h: c.hexThick || 0, note: '',
       pts: c.hexGround.map(function (q) { return { x: q.x, y: q.y }; })
     });
   }
@@ -5484,6 +5522,8 @@ function tryHexTie(p, st) {
   p.stations.forEach(function (s2) {
     if (s2.id === st.id || !s2.reg || !s2.cal || !s2.cal.hexGround || s2.cal.hexNorthOff == null) return;
     if (Math.abs((s2.cal.hexSide || 0) / (st.cal.hexSide || 1) - 1) > 0.02) return;
+    /* only shots of the SAME panel resting place may tie by the panel */
+    if ((s2.cal.panelEpoch || 1) !== (st.cal.panelEpoch || 1)) return;
     if (!anchor || s2.createdAt > anchor.createdAt) anchor = s2;
   });
   if (!anchor) return null;
