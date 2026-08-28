@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.21.0';
+var VERSION = '1.22.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1270,7 +1270,7 @@ function buildChecklist(p) {
       ', past ' + EE.fmtLen(far[0].lim, U(), 1) + '. Re-trace it from closer.', 'object', far[0].o.id);
   }
 
-  if (!p.objects.some(function (o) { return o.kind === 'outline'; }))
+  if (!p.objects.some(function (o) { return o.kind === 'outline' && !o.panel; }))
     add('warn', 'No roof outline', 'Without one there is no area and no boundary in the export.', 'tab', 'plan');
 
   if (p.objects.filter(function (o) { return o.kind === 'point'; }).length < 2)
@@ -1314,7 +1314,7 @@ function buildChecklist(p) {
     'Every length in the survey rides on one measured distance. Record which one, and how it was measured.', 'scale');
 
   var cov = computeCoverage(p);
-  var outline = p.objects.find(function (o) { return o.kind === 'outline'; });
+  var outline = p.objects.find(function (o) { return o.kind === 'outline' && !o.panel; });
   if (cov && outline && (outline.pts || []).length >= 3) {
     var po = projObj(p, outline);
     if (po) {
@@ -1518,8 +1518,8 @@ function render() {
 function tplHome() {
   var cards = db.projects.slice().sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); })
     .map(function (p) {
-      var objs = p.objects.filter(function (o) { return o.kind !== 'point'; }).length;
-      var outline = p.objects.find(function (o) { return o.kind === 'outline'; });
+      var objs = p.objects.filter(function (o) { return o.kind !== 'point' && !o.panel; }).length;
+      var outline = p.objects.find(function (o) { return o.kind === 'outline' && !o.panel; });
       var area = outline ? EE.polygonArea(outline.pts || []) : 0;
       var open = ui.swipe === p.id;
       return '<div class="card-wrap' + (open ? ' open' : '') + '" data-swipe="' + p.id + '">' +
@@ -1979,6 +1979,21 @@ function projToWorld(p, st, q) {
   return { x: inv.x * c.pose.scale, y: inv.y * c.pose.scale };
 }
 
+/* Horizontal camera displacement since the live session began, assuming the
+   surveyor pivots about their body axis with the phone held an arm ahead.
+   0.35 m is a comfortable one-handed hold; looking straight down the facing
+   is undefined and the offset freezes rather than jumps. */
+var PIVOT_ARM_M = 0.35;
+function liveCamOffset(l, R) {
+  var fwd = EE.applyM3(R, [0, 0, -1]);
+  var fh = Math.hypot(fwd[0], fwd[1]);
+  if (fh < 0.15) return l.pivotLast || { x: 0, y: 0 };
+  var fx = fwd[0] / fh, fy = fwd[1] / fh;
+  if (!l.pivot0) l.pivot0 = { x: fx, y: fy };
+  l.pivotLast = { x: PIVOT_ARM_M * (fx - l.pivot0.x), y: PIVOT_ARM_M * (fy - l.pivot0.y) };
+  return l.pivotLast;
+}
+
 function paintLive() {
   var p = currentProject(), l = ui.live;
   if (!p || !l) return;
@@ -2004,10 +2019,17 @@ function paintLive() {
 
   var yaw = (l.yaw || 0) * Math.PI / 180;
   var cw = Math.cos(yaw), sw = Math.sin(yaw);
+  /* Nobody pans a phone about its own lens — they pivot their BODY, and the
+     camera rides an arm-length arc around it. A rotation-only model then
+     drags the whole ground field sideways as you pan, which is exactly the
+     drift the field reported. Model the pivot: the body axis sits an arm
+     behind the lens, so the camera's position is that axis plus an arm along
+     the current facing; as the facing swings, the ground counter-translates. */
+  var off = liveCamOffset(l, R);
   var world = function (q) {
     var w = projToWorld(p, st, q);
     if (!w) return null;
-    return { x: w.x * cw - w.y * sw, y: w.x * sw + w.y * cw };
+    return { x: w.x * cw - w.y * sw - off.x, y: w.x * sw + w.y * cw - off.y };
   };
   var toPix = function (q) { var w = world(q); return w ? EE.applyH(Hi, w) : null; };
 
@@ -2195,12 +2217,12 @@ function tplTraceCal(st, t) {
       'never can. Lay the panel <b>flat on the deck</b>, fill a good part of the frame with it, ' +
       'and its 9 mm of thickness is beneath notice.</div>' +
       hexBody +
-      '<div class="field"><label>SIDE LENGTH (corner to corner along one edge)</label><div class="unit-suffix">' +
+      '<div class="field"><label>SIDE LENGTH — measure the FACE you tap (a beveled top runs smaller than the base)</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-side" inputmode="decimal" value="' +
-      esc(t.hexSide || EE.fromM(0.15, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
-      '<div class="field"><label>PANEL THICKNESS \u2014 tap the TOP corners; this is subtracted</label><div class="unit-suffix">' +
+      esc(t.hexSide || EE.fromM(db.settings.hexSide || 0.145, U()).toFixed(3)) + '"><span>' + U() + '</span></div></div>' +
+      '<div class="field"><label>PANEL THICKNESS \u2014 tap the TOP corners, all six; never mix faces</label><div class="unit-suffix">' +
       '<input class="inp mono" id="hex-thick" inputmode="decimal" value="' +
-      esc(t.hexThick || EE.fromM(0.009, U()).toFixed(4)) + '"><span>' + U() + '</span></div></div>' +
+      esc(t.hexThick || EE.fromM(db.settings.hexThick || 0.009, U()).toFixed(4)) + '"><span>' + U() + '</span></div></div>' +
       '<div class="btn-row">' +
       (hn ? '<button class="btn ghost sm" data-act="undo-tap">Undo</button>' : '') +
       '<button class="btn primary sm" data-act="apply-hex"' + (hn >= 6 ? '' : ' disabled') + '>Calibrate</button>' +
@@ -4935,7 +4957,7 @@ function applyHex() {
   var st = findStation(p, t.stationId);
   var sideEl = $('#hex-side');
   if (sideEl) t.hexSide = sideEl.value;
-  var side = EE.toM(parseFloat(t.hexSide || EE.fromM(0.15, U()).toFixed(3)), U());
+  var side = EE.toM(parseFloat(t.hexSide || EE.fromM(db.settings.hexSide || 0.145, U()).toFixed(3)), U());
   if (!(side > 0.02 && side < 3)) return toast('Enter the hexagon\'s side length');
   if (t.taps.length < 6) return toast('Tap all six corners, walking around the panel');
 
@@ -4984,8 +5006,11 @@ function applyHex() {
 
   var thickEl = $('#hex-thick');
   if (thickEl) t.hexThick = thickEl.value;
-  var thick = EE.toM(parseFloat(t.hexThick || EE.fromM(0.009, U()).toFixed(4)), U());
+  var thick = EE.toM(parseFloat(t.hexThick || EE.fromM(db.settings.hexThick || 0.009, U()).toFixed(4)), U());
   if (!(thick >= 0 && thick < 0.06)) thick = 0.009;
+  /* The panel is one physical object; whatever was measured for it is the
+     default from here on, in every project. */
+  db.settings.hexSide = side; db.settings.hexThick = thick;
 
   var cal, msg;
   var hyb = null;
@@ -5066,6 +5091,7 @@ function applyHex() {
   }
 
   st.cal = cal;
+  syncPanelObject(p, st);
   touchProject(p); save();
   coverageCache = { key: null, val: null };
 
@@ -5143,6 +5169,7 @@ function refitHexStation(p, st) {
       R, c.camH, c.hexThick || 0, deckNormalOf(st));
   });
   if (hg.every(Boolean)) c.hexGround = hg.map(function (g2) { return { x: g2.x, y: g2.y }; });
+  syncPanelObject(p, st);
   return true;
 }
 
@@ -5236,6 +5263,27 @@ function refineLensJoint(p, imgW, imgH) {
 
   return 'lens fused over ' + shots.length + ' shot' + (shots.length === 1 ? '' : 's') + ': ' +
     fov.toFixed(1) + '\u00b0' + (refit ? ' (' + refit + ' shot' + (refit === 1 ? '' : 's') + ' re-fitted)' : '');
+}
+
+/* The panel that calibrated a shot IS a surveyed object — six known corners
+   at a known height — so it appears on the plan without being traced again:
+   the drawn hexagons from different shots overlapping (or not) is the tie
+   quality made visible. Flagged `panel` so it never masquerades as the roof
+   outline or leaks into the HelioScope export. */
+function syncPanelObject(p, st) {
+  var c = st.cal;
+  if (!c || !c.hexGround) return;
+  var ex = p.objects.find(function (o) { return o.stationId === st.id && o.panel; });
+  if (ex) {
+    ex.pts = c.hexGround.map(function (q) { return { x: q.x, y: q.y }; });
+    ex.h = c.hexThick || 0;
+  } else {
+    p.objects.push({
+      id: uid('o'), stationId: st.id, kind: 'outline', panel: true,
+      name: 'Panel', autoName: true, h: c.hexThick || 0, note: '',
+      pts: c.hexGround.map(function (q) { return { x: q.x, y: q.y }; })
+    });
+  }
 }
 
 /* Register a station against an already-placed one via their shared hexagon.
@@ -5950,7 +5998,7 @@ function slug(s) { return String(s || 'survey').replace(/[^\w\- ]+/g, '').trim()
 function exportKml() {
   var p = currentProject();
   if (!p.anchor) return toast('Locate the survey first');
-  var placed = placedObjects(p).filter(function (o) { return o.kind !== 'point'; });
+  var placed = placedObjects(p).filter(function (o) { return o.kind !== 'point' && !o.panel; });
   if (!placed.length) return toast('Nothing placed to export');
 
   var kml = EE.buildKML({ name: p.name, address: p.address, anchor: p.anchor, objects: placed }, {

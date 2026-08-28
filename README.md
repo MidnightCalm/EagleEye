@@ -121,6 +121,18 @@ that band is dropped at startup. Until it certifies, the toast coaches: add a se
 panel shot at a different tilt. When it lands, every hex shot is re-fitted at the fused
 lens (its world rescaled with it), horizon locks are re-derived, and ties re-solved.
 
+**Measure the face you tap.** A beveled panel's top face runs smaller than its base —
+the field panel measures 14.5 cm along the top edge against 15.0 at the bottom — and the
+side you type must be the face you tap. The default is now 14.5 cm, and whatever side and
+thickness you enter become the defaults everywhere after that, because a panel is one
+physical object. Never mix faces in one calibration (bottom corners in front, top corners
+behind): that tilts the fitted plane by ~2°, which is worse than any bevel.
+
+**The panel appears on the plan by itself.** Each hexagon calibration also writes the
+panel as a named outline object (“Panel”, at its true thickness) — no second tracing.
+Two shots' panels drawn on top of each other is the tie quality made visible. Panel
+objects never masquerade as the roof outline and never leak into the HelioScope export.
+
 **Panel thickness is handled exactly** — tap the TOP corners, always (they are the
 visible, consistent ones); the typed thickness (default 9 mm) is subtracted so camera
 height is measured to the deck, and the tie corners are computed on the top plane. No
