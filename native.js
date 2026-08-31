@@ -2,7 +2,7 @@
 
    Loaded by index.html in every build and inert in a browser: everything here
    is behind a feature test for the native shell's message handler. In the
-   shell (eagle-eye-native/) it replaces the two weakest inputs in the whole
+   shell (native/) it replaces the two weakest inputs in the whole
    app with measured ones:
 
      ATTITUDE  DeviceOrientation, with its per-device bias, its shutter jerk

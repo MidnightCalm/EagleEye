@@ -25,7 +25,7 @@ eagle-eye/
 
 ## Going native
 
-`../eagle-eye-native/` wraps this exact bundle in an ARKit session. Nothing is
+`../native/` wraps this exact bundle in an ARKit session. Nothing is
 ported: `native.js` ships here, is inert in a browser, and inside the shell
 feeds ARKit's visual-inertial attitude into the same `ui.sensors` the sensor
 path wrote, and the camera's **factory intrinsics** into the same per-frame lens

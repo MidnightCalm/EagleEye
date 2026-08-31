@@ -1,0 +1,62 @@
+# Eagle Eye — native shell (XcodeGen spec).
+#
+# XcodeGen rather than a checked-in .xcodeproj: a pbxproj is a generated
+# artefact that no one can review and that merges badly, while this file is
+# the whole project in twenty readable lines. On the Mac:
+#
+#   brew install xcodegen
+#   ./sync-web.sh && xcodegen && open EagleEye.xcodeproj
+#
+# TEAM_ID is the only value that must be filled in — see README.md.
+
+name: EagleEye
+options:
+  bundleIdPrefix: com.midnightcalm
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${TEAM_ID}
+    MARKETING_VERSION: "1.28.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+
+targets:
+  EagleEye:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: www
+        type: folder          # copied in whole, unprocessed
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Eagle Eye
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIRequiredDeviceCapabilities: [arkit]
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+        UIViewControllerBasedStatusBarAppearance: false
+        NSCameraUsageDescription: >-
+          Eagle Eye measures roofs from the camera. ARKit needs the camera to
+          track where the phone is while you survey.
+        NSMotionUsageDescription: >-
+          Motion data is what tells Eagle Eye how the phone is tilted, which is
+          what turns a photograph into a measurement.
+        NSLocationWhenInUseUsageDescription: >-
+          A coarse fix places the survey on the map so the export lands in the
+          right place. Measurements never depend on it.
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.midnightcalm.eagleeye
+        INFOPLIST_KEY_UIStatusBarHidden: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
