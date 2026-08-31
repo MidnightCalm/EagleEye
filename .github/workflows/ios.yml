@@ -168,12 +168,20 @@ jobs:
           # `security`, which reports EVERY failure — wrong password, wrong
           # encryption, truncated file — as "the passphrase you entered is not
           # correct". openssl says which it actually is.
+          # OpenSSL 3 moved 3DES and RC2 into the legacy provider; LibreSSL has
+          # no such flag and rejects it. A macOS runner may present either, so
+          # try both rather than misreport a provider gap as a bad passphrase.
+          p12ok() {
+            openssl pkcs12 -in "$p12" -nokeys -noout -legacy -passin env:P12PW 2>/tmp/p12err \
+              || openssl pkcs12 -in "$p12" -nokeys -noout -passin env:P12PW 2>/tmp/p12err
+          }
+
           export P12PW="$IOS_DIST_P12_PASSWORD"
-          if ! openssl pkcs12 -in "$p12" -nokeys -noout -passin env:P12PW 2>/tmp/p12err; then
+          if ! p12ok; then
             # A secret pasted with a trailing newline is the classic cause, and
             # GitHub stores exactly what was pasted.
             export P12PW="$(printf '%s' "$IOS_DIST_P12_PASSWORD" | tr -d '\r\n')"
-            if openssl pkcs12 -in "$p12" -nokeys -noout -passin env:P12PW 2>/dev/null; then
+            if p12ok; then
               echo "::warning::IOS_DIST_P12_PASSWORD had trailing whitespace; trimmed for this run. Re-paste it without the newline."
             else
               echo "::error::IOS_DIST_P12_PASSWORD does not open IOS_DIST_P12_BASE64. openssl says:"
