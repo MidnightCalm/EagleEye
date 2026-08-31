@@ -155,7 +155,34 @@ jobs:
           keychain_pw="$(uuidgen)"
           p12="$RUNNER_TEMP/dist.p12"
 
-          printf '%s' "$IOS_DIST_P12_BASE64" | base64 --decode > "$p12"
+          # openssl rather than base64: macOS ships the BSD flavour, where
+          # --decode is not portable, and a silent decode failure would surface
+          # far downstream as a bogus "passphrase incorrect".
+          printf '%s' "$IOS_DIST_P12_BASE64" | openssl base64 -d -A > "$p12"
+          [ -s "$p12" ] || {
+            echo "::error::IOS_DIST_P12_BASE64 decoded to nothing. Re-run: base64 -w0 dist.p12 > dist.p12.b64"
+            exit 1
+          }
+
+          # Prove the passphrase opens the archive BEFORE handing it to
+          # `security`, which reports EVERY failure — wrong password, wrong
+          # encryption, truncated file — as "the passphrase you entered is not
+          # correct". openssl says which it actually is.
+          export P12PW="$IOS_DIST_P12_PASSWORD"
+          if ! openssl pkcs12 -in "$p12" -nokeys -noout -passin env:P12PW 2>/tmp/p12err; then
+            # A secret pasted with a trailing newline is the classic cause, and
+            # GitHub stores exactly what was pasted.
+            export P12PW="$(printf '%s' "$IOS_DIST_P12_PASSWORD" | tr -d '\r\n')"
+            if openssl pkcs12 -in "$p12" -nokeys -noout -passin env:P12PW 2>/dev/null; then
+              echo "::warning::IOS_DIST_P12_PASSWORD had trailing whitespace; trimmed for this run. Re-paste it without the newline."
+            else
+              echo "::error::IOS_DIST_P12_PASSWORD does not open IOS_DIST_P12_BASE64. openssl says:"
+              sed 's/^/::error::/' /tmp/p12err
+              echo "::error::Verify locally with: openssl pkcs12 -in dist.p12 -nokeys -noout -legacy"
+              exit 1
+            fi
+          fi
+          echo "passphrase verified against the .p12"
 
           security create-keychain -p "$keychain_pw" "$keychain"
           # -lut 21600: a short default timeout locks the keychain mid-archive
@@ -163,8 +190,8 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$keychain_pw" "$keychain"
 
-          security import "$p12" -k "$keychain" -P "$IOS_DIST_P12_PASSWORD" \
-            -A -t cert -f pkcs12
+          security import "$p12" -k "$keychain" -P "$P12PW" \
+            -f pkcs12 -A -T /usr/bin/codesign -T /usr/bin/security
 
           # Without a partition list, codesign blocks on a GUI "allow access"
           # prompt that nobody on a headless runner can ever click — the job
