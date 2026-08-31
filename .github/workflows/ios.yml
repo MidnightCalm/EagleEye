@@ -1,0 +1,394 @@
+name: iOS — TestFlight
+
+# Tag-driven release, plus a manual button for out-of-band builds:
+#   git tag v1.28.0 && git push origin v1.28.0
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      changelog:
+        description: 'What testers should look at'
+        required: false
+        default: 'Manual build from the default branch.'
+
+# Two tags pushed a minute apart must not race: build numbers have to reach
+# App Store Connect in increasing order, and a cancelled upload is worse than
+# a queued one.
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TEAM_ID: QNXFKPBTD8
+  BUNDLE_ID: com.midnightcalm.eagleeye
+  SCHEME: EagleEye
+  XCODEGEN_VERSION: '2.43.0'
+
+jobs:
+  testflight:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # Ten minutes of runner time is too much to spend discovering a typo'd
+      # secret at the upload step. Fail in fifteen seconds instead.
+      # printenv rather than ${!name}: /bin/bash here is 3.2, and a preflight
+      # that itself fails on a syntax quirk is the worst step in the file.
+      - name: Preflight — secrets and checked-in inputs
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_APP_APPLE_ID: ${{ secrets.ASC_APP_APPLE_ID }}
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          set -uo pipefail
+          missing=0
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64 ASC_APP_APPLE_ID \
+                      IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
+            if [ -z "$(printenv "$name" 2>/dev/null)" ]; then
+              echo "::error::Repository secret $name is not set."
+              missing=1
+            fi
+          done
+
+          # The runner sees only what is committed. A missing asset catalog
+          # fails xcodegen — or worse, archives fine and is rejected at upload
+          # with ITMS-90022 after twenty minutes.
+          for p in native/project.yml \
+                   native/sync-web.sh \
+                   native/Sources/SurveyViewController.swift \
+                   native/Assets.xcassets/Contents.json \
+                   native/Assets.xcassets/AppIcon.appiconset/Contents.json \
+                   native/Assets.xcassets/AppIcon.appiconset/icon-1024.png \
+                   native/Assets.xcassets/LaunchBackground.colorset/Contents.json; do
+            if [ ! -e "$p" ]; then
+              echo "::error::$p is missing from the checkout — is it committed?"
+              missing=1
+            fi
+          done
+
+          grep -q 'ASSETCATALOG_COMPILER_APPICON_NAME' native/project.yml || {
+            echo "::error::project.yml does not set ASSETCATALOG_COMPILER_APPICON_NAME; the upload would be rejected with ITMS-90022."
+            missing=1
+          }
+          grep -q '^schemes:' native/project.yml || {
+            echo "::error::project.yml has no schemes: block; xcodebuild -scheme cannot work."
+            missing=1
+          }
+
+          [ "$missing" -eq 0 ]
+
+      - name: Show the toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # Marketing version comes from the tag (v1.28.0 -> 1.28.0), so the tag is
+      # the single source of truth. Build number is the run number: monotonic
+      # across the whole repository, so it can never collide with an upload
+      # already accepted.
+      - name: Derive version and build number
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            marketing="${GITHUB_REF_NAME#v}"
+          else
+            marketing="$(sed -n 's/.*MARKETING_VERSION: *"\(.*\)".*/\1/p' native/project.yml | head -1)"
+          fi
+          [ -n "$marketing" ] || { echo "::error::could not determine the marketing version"; exit 1; }
+          echo "marketing=${marketing}"     >> "$GITHUB_OUTPUT"
+          echo "build=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Building ${marketing} (${GITHUB_RUN_NUMBER})"
+
+      - name: Cache XcodeGen
+        id: xcodegen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.xcodegen
+          key: xcodegen-${{ env.XCODEGEN_VERSION }}
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          dest="$HOME/.xcodegen"
+          if [ ! -x "$dest/bin/xcodegen" ]; then
+            rm -rf "$dest" /tmp/xcgen
+            if curl -fsSL -o /tmp/xcodegen.zip \
+                 "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"; then
+              unzip -q /tmp/xcodegen.zip -d /tmp/xcgen
+              mkdir -p "$dest"
+              cp -R /tmp/xcgen/xcodegen/. "$dest/"
+            else
+              echo "::warning::XcodeGen release download failed; falling back to Homebrew."
+              HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+              mkdir -p "$dest/bin"
+              ln -sf "$(command -v xcodegen)" "$dest/bin/xcodegen"
+            fi
+          fi
+          echo "$dest/bin" >> "$GITHUB_PATH"
+          "$dest/bin/xcodegen" --version
+
+      # The .p12 gives xcodebuild a distribution identity that already owns its
+      # private key. Without it, -allowProvisioningUpdates mints a BRAND NEW
+      # Apple Distribution certificate every run — the private key dying with
+      # the runner — and Apple's 2-3 certificate cap is reached in about three
+      # builds.
+      - name: Import the distribution identity into a throwaway keychain
+        env:
+          IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_pw="$(uuidgen)"
+          p12="$RUNNER_TEMP/dist.p12"
+
+          printf '%s' "$IOS_DIST_P12_BASE64" | base64 --decode > "$p12"
+
+          security create-keychain -p "$keychain_pw" "$keychain"
+          # -lut 21600: a short default timeout locks the keychain mid-archive
+          # on a slow build, and codesign then fails for no visible reason.
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+
+          security import "$p12" -k "$keychain" -P "$IOS_DIST_P12_PASSWORD" \
+            -A -t cert -f pkcs12
+
+          # Without a partition list, codesign blocks on a GUI "allow access"
+          # prompt that nobody on a headless runner can ever click — the job
+          # then hangs until the timeout rather than failing.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$keychain_pw" "$keychain" >/dev/null
+
+          # In the search list AND default, keeping login so system roots resolve.
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$keychain"
+
+          rm -f "$p12"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security find-identity -v -p codesigning "$keychain"
+
+      # An asymmetry that burns everyone exactly once:
+      #   xcodebuild wants an ABSOLUTE PATH to the .p8  (-authenticationKeyPath)
+      #   altool wants a DIRECTORY and finds the file itself by key id, where
+      #   the name must be exactly AuthKey_<KEYID>.p8
+      # Naming the file correctly inside a directory satisfies both.
+      - name: Stage the App Store Connect API key
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/private_keys"
+          mkdir -p "$dir"
+          key="$dir/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          # A .p8 is PEM. If the secret was pasted rather than base64'd, say so
+          # here rather than failing cryptically at the archive step.
+          head -1 "$key" | grep -q 'BEGIN PRIVATE KEY' || {
+            echo "::error::ASC_KEY_P8_BASE64 did not decode to a PEM private key."
+            exit 1
+          }
+          echo "ASC_KEY_PATH=$key"         >> "$GITHUB_ENV"
+          echo "API_PRIVATE_KEYS_DIR=$dir" >> "$GITHUB_ENV"
+
+      # Must precede xcodegen: project.yml declares www/ as a folder reference
+      # and XcodeGen errors if the directory does not exist. Invoked via bash
+      # because sync-web.sh may be mode 100644 in the index (committed from
+      # Windows), where ./sync-web.sh is "Permission denied".
+      - name: Sync the web app into the shell
+        run: bash native/sync-web.sh
+
+      - name: Generate the Xcode project
+        working-directory: native
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          # If EagleEye is missing from this list, project.yml has no schemes:
+          # block and the archive below cannot work.
+          xcodebuild -list -project EagleEye.xcodeproj
+
+      # This Swift has never met a compiler. Tee the whole log so a failed first
+      # build hands back the complete error list as a downloadable artifact
+      # rather than something to scroll for in the web UI.
+      - name: Archive
+        working-directory: native
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project EagleEye.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/EagleEye.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="${{ steps.ver.outputs.marketing }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild-archive.log"
+
+      - name: Keep the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/xcodebuild-archive.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # method must be app-store-connect; the old "app-store" spelling is
+      # deprecated since Xcode 15.3. manageAppVersionAndBuildNumber MUST be
+      # false or Xcode silently rewrites the build number set above and the run
+      # number stops meaning anything.
+      - name: Write ExportOptions.plist
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+            <key>generateAppStoreInformation</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: Export a signed .ipa
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/EagleEye.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ipa="$(ls "$RUNNER_TEMP/export"/*.ipa | head -1)"
+          echo "IPA_PATH=$ipa" >> "$GITHUB_ENV"
+          ls -lh "$RUNNER_TEMP/export"
+
+      # Keep the binary BEFORE attempting the upload. If App Store Connect is
+      # having a bad afternoon, the artifact is already saved and the upload can
+      # be retried without a twenty-minute rebuild.
+      - name: Keep the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: EagleEye-${{ steps.ver.outputs.marketing }}-${{ steps.ver.outputs.build }}-ipa
+          path: ${{ env.IPA_PATH }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Keep the dSYMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: EagleEye-${{ steps.ver.outputs.marketing }}-${{ steps.ver.outputs.build }}-dSYMs
+          path: ${{ runner.temp }}/EagleEye.xcarchive/dSYMs
+          retention-days: 90
+          if-no-files-found: warn
+
+      # Catches missing icons, bad orientations and entitlement mismatches in
+      # about thirty seconds, before spending minutes pushing bytes.
+      - name: Validate against App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcrun altool --validate-app \
+            -f "$IPA_PATH" \
+            -t ios \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+      # --upload-package, NOT --upload-app: the latter is deprecated in altool's
+      # own man page.
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_APP_APPLE_ID: ${{ secrets.ASC_APP_APPLE_ID }}
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::upload attempt ${attempt}"
+            if xcrun altool --upload-package "$IPA_PATH" \
+                 --type ios \
+                 --apple-id "$ASC_APP_APPLE_ID" \
+                 --bundle-id "$BUNDLE_ID" \
+                 --bundle-version "${{ steps.ver.outputs.build }}" \
+                 --bundle-short-version-string "${{ steps.ver.outputs.marketing }}" \
+                 --apiKey "$ASC_KEY_ID" \
+                 --apiIssuer "$ASC_ISSUER_ID"; then
+              echo "::endgroup::"
+              echo "uploaded"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::upload attempt ${attempt} failed"
+            sleep $(( attempt * 30 ))
+          done
+          echo "::error::upload failed after 3 attempts — the .ipa artifact on this run is still valid, so retry the upload rather than rebuilding."
+          exit 1
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Uploaded to TestFlight"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.ver.outputs.marketing }}\` |"
+            echo "| Build | \`${{ steps.ver.outputs.build }}\` |"
+            echo "| Bundle | \`${BUNDLE_ID}\` |"
+            echo ""
+            echo "Apple takes 5-15 minutes to process. It appears under TestFlight once that finishes."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tear down the keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/private_keys" "$RUNNER_TEMP/dist.p12" || true

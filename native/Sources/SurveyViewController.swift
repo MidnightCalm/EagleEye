@@ -1,6 +1,8 @@
 import UIKit
 import WebKit
 import ARKit
+import CoreImage
+import simd
 
 /// The whole native shell: an ARSession feeding the existing web app.
 ///
@@ -14,6 +16,14 @@ import ARKit
 final class SurveyViewController: UIViewController {
 
     private var webView: WKWebView!
+
+    /// Phase 1 is signing, TestFlight and the bundle — nothing else. ARKit and
+    /// WKWebView's getUserMedia cannot both hold the rear camera, and this
+    /// shell draws no preview of its own, so with ARKit running the capture
+    /// screen would go black. Flip this with phase 2, once the shell serves
+    /// shoot()'s frames itself.
+    private let arkitEnabled = false
+
     private let session = ARSession()
     private var lastPush: TimeInterval = 0
     private var pendingCaptures: [String] = []
@@ -34,12 +44,12 @@ final class SurveyViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        startSession()
+        if arkitEnabled { startSession() }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        session.pause()
+        if arkitEnabled { session.pause() }
     }
 
     override var prefersStatusBarHidden: Bool { false }
@@ -58,6 +68,7 @@ final class SurveyViewController: UIViewController {
         config.userContentController = ucc
 
         webView = WKWebView(frame: view.bounds, configuration: config)
+        webView.uiDelegate = self
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         webView.scrollView.bounces = false
         webView.scrollView.contentInsetAdjustmentBehavior = .never
@@ -83,9 +94,6 @@ final class SurveyViewController: UIViewController {
         cfg.worldAlignment = .gravityAndHeading
         cfg.planeDetection = [.horizontal]
         cfg.isAutoFocusEnabled = true
-        if type(of: cfg).supportsFrameSemantics(.sceneDepth) {
-            cfg.frameSemantics.insert(.sceneDepth)   // LiDAR when the light allows
-        }
         session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
     }
 
@@ -162,7 +170,7 @@ extension SurveyViewController: ARSessionDelegate {
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
-        NSLog("ARSession failed: \(error.localizedDescription)")
+        NSLog("%@", "ARSession failed: \(error.localizedDescription)")
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
@@ -170,8 +178,10 @@ extension SurveyViewController: ARSessionDelegate {
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
-        startSession()
+        evaluate("window.EENative && (window.EENative.tracking = 'relocalizing');")
     }
+
+    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool { true }
 }
 
 // MARK: - messages from the web app
@@ -194,6 +204,33 @@ extension SurveyViewController: WKScriptMessageHandler {
     }
 }
 
+// MARK: - permission prompts the shell answers on the app's behalf
+
+extension SurveyViewController: WKUIDelegate {
+
+    /// Without this WebKit denies every getUserMedia call outright and both
+    /// camera screens show a Safari-settings message that means nothing in a
+    /// native bundle. The only origin served is our own bundle, and both call
+    /// sites ask for video alone.
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        decisionHandler(type == .camera ? .grant : .deny)
+    }
+
+    /// The documented route for DeviceOrientationEvent.requestPermission. With
+    /// ARKit gated off this is the app's ONLY attitude source, so it is load
+    /// bearing rather than insurance.
+    func webView(_ webView: WKWebView,
+                 requestDeviceOrientationAndMotionPermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        decisionHandler(.grant)
+    }
+}
+
 // MARK: - serving the bundled web app
 
 enum AppScheme {
@@ -204,9 +241,11 @@ enum AppScheme {
 }
 
 /// Serves `www/` from the app bundle over a custom scheme. WKWebView treats a
-/// registered scheme as a first-class origin, which keeps the web app in a
-/// secure context — storage, service worker and camera all behave as they do
-/// on the deployed site.
+/// registered scheme as a first-class origin, so localStorage and IndexedDB
+/// behave as they do on the deployed site. Service workers do NOT: WebKit
+/// registers those only for http(s) origins, so sw.js is inert here and the
+/// in-app update check falls back to its no-worker path. Nothing is lost —
+/// the bundle is already local.
 final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private static let types: [String: String] = [

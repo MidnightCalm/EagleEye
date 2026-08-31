@@ -6,6 +6,7 @@ surface), and the reticle in gold — the instrument you READ. Drawn at 4x
 and downsampled, which is cheaper than antialiasing each primitive.
 """
 import math
+import os
 from PIL import Image, ImageDraw
 
 BG = (10, 9, 13)          # --lx-bg
@@ -67,3 +68,12 @@ def make(size: int) -> Image.Image:
 for s in (180, 192, 512):
     make(s).save(f"icons/icon-{s}.png", optimize=True)
     print(f"icons/icon-{s}.png")
+
+# The native shell's marketing icon. App Store Connect rejects a build without a
+# 1024 icon, and it must carry NO alpha channel — which is why every icon here is
+# drawn on an opaque RGB canvas rather than composited.
+native = "native/Assets.xcassets/AppIcon.appiconset"
+if os.path.isdir(os.path.dirname(os.path.dirname(native))):
+    os.makedirs(native, exist_ok=True)
+    make(1024).save(f"{native}/icon-1024.png", optimize=True)
+    print(f"{native}/icon-1024.png")

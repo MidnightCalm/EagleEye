@@ -46,7 +46,7 @@
     if (!pose) return;
     N.pose = pose;
     N.tracking = tracking || 'normal';
-    N.lastAt = (window.performance && performance.now) ? performance.now() : Date.now();
+    N.lastAt = performance.now();     /* the clock preTapAttitude compares against */
 
     if (window.ui && ui.sensors) {
       ui.sensors.alpha = pose.alpha;
@@ -68,7 +68,7 @@
        per-frame lens table the app already keys every measurement off. */
     if (fx > 0 && w > 0 && !N.lens) {
       var fov = EE.fovFromIntrinsics(fx, w, h);
-      if (fov > 20 && fov < 140) {
+      if (fov > 40 && fov < 100) {          /* the window app.js enforces at boot */
         N.lens = { fov: fov, fx: fx, w: w, h: h };
         if (window.db && db.settings) {
           db.settings.fov = fov;

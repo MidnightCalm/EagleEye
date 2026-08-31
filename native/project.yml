@@ -7,7 +7,10 @@
 #   brew install xcodegen
 #   ./sync-web.sh && xcodegen && open EagleEye.xcodeproj
 #
-# TEAM_ID is the only value that must be filled in — see README.md.
+# CI does exactly the same two commands on a macOS runner.
+#
+# Team QNXFKPBTD8, bundle com.midnightcalm.eagleeye. Built in the cloud:
+# see .github/workflows/ios.yml — no Mac required.
 
 name: EagleEye
 options:
@@ -18,11 +21,11 @@ options:
 
 settings:
   base:
-    DEVELOPMENT_TEAM: ${TEAM_ID}
+    DEVELOPMENT_TEAM: QNXFKPBTD8
     MARKETING_VERSION: "1.28.0"
     CURRENT_PROJECT_VERSION: "1"
-    SWIFT_VERSION: "5.9"
-    TARGETED_DEVICE_FAMILY: "1,2"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
 
 targets:
   EagleEye:
@@ -30,6 +33,7 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      - path: Assets.xcassets
       - path: www
         type: folder          # copied in whole, unprocessed
     info:
@@ -39,7 +43,7 @@ targets:
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
-          UIColorName: LaunchBackground
+          UIColorName: LaunchBackground     # Assets.xcassets/LaunchBackground.colorset
         UIRequiredDeviceCapabilities: [arkit]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -58,5 +62,15 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.midnightcalm.eagleeye
-        INFOPLIST_KEY_UIStatusBarHidden: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+schemes:
+  EagleEye:
+    build:
+      targets:
+        EagleEye: [run, test, profile, analyze, archive]
+    run:
+      config: Debug
+    archive:
+      config: Release

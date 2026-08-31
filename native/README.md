@@ -33,45 +33,112 @@ app too and is inert in a browser.
 The panel does not retire: it becomes the independent scale check on ARKit's
 drift, which is the job it should always have had.
 
-## Building it — the Mac side
+## Building it — the cloud, no Mac
 
-Prerequisites: macOS with Xcode 15+, and:
+`.github/workflows/ios.yml` does on a GitHub macOS runner exactly what a Mac
+would do by hand: `sync-web.sh`, `xcodegen`, `xcodebuild archive`, export, and
+`altool --upload-package` to TestFlight. Trigger it with a tag:
+
+```bash
+git tag v1.28.0 && git push origin v1.28.0
+```
+
+or the **Run workflow** button on the Actions tab. The marketing version comes
+from the tag; the build number is the run number, monotonic across the whole
+repository, so it can never collide with a build Apple has already accepted.
+
+### What you must do by hand, once, in this order
+
+**1. Register the bundle id.** developer.apple.com → Certificates, Identifiers &
+Profiles → Identifiers → **+** → App IDs → App. Description “Eagle Eye”,
+**explicit** id `com.midnightcalm.eagleeye`. Enable no capabilities — camera,
+motion and location are Info.plist usage strings, not entitlements, and are
+already declared. A wildcard id cannot be used for App Store distribution.
+
+**2. Create the distribution certificate — from Windows.** No Mac and no
+Keychain Access required. In Git Bash:
+
+```bash
+openssl genrsa -out dist.key 2048
+openssl req -new -key dist.key -out dist.csr \
+  -subj "/emailAddress=you@example.com/CN=Eagle Eye Distribution/C=CA"
+```
+
+Upload `dist.csr` at developer.apple.com → Certificates → **+** → **Apple
+Distribution**, download `distribution.cer`, then:
+
+```bash
+openssl x509 -inform DER -in distribution.cer -out dist.pem
+openssl pkcs12 -export -legacy -inkey dist.key -in dist.pem -out dist.p12 -name "Apple Distribution"
+openssl pkcs12 -info -in dist.p12 -noout
+base64 -w0 dist.p12 > dist.p12.b64
+```
+
+`-legacy` is not optional: OpenSSL 3 defaults to an AES-256 PKCS#12 encryption
+that macOS `security import` cannot read, and the error it gives is useless.
+**Back up `dist.key` and `dist.p12` offline** — losing the private key means
+revoking and redoing this, and Apple caps you at two or three distribution
+certificates.
+
+**3. Create the App Store Connect API key.** appstoreconnect.apple.com → Users
+and Access → Integrations → App Store Connect API → **Team Keys** → **+**.
+Access role **Admin**, not App Manager: App Manager can upload builds but cannot
+touch Certificates, Identifiers & Profiles over the API, which is exactly what
+`-allowProvisioningUpdates` needs. Download the `.p8` **immediately** — the link
+never appears again. Copy the Issuer ID from the top of the same page. Encode
+with `base64 -w0 AuthKey_XXXXXXXXXX.p8`; never `certutil -encode`, which adds
+header lines that corrupt the key.
+
+**4. Create the app record.** This is the step people skip, and an upload for a
+bundle id with no record is rejected. appstoreconnect.apple.com → Apps → **+**.
+Platform iOS, name “Eagle Eye”, bundle id from the dropdown (if it is not
+listed, step 1 has not propagated), SKU any private string. Then App Information
+→ General Information → copy the numeric **Apple ID**. Nothing else is needed
+for TestFlight — no screenshots, no description, no pricing.
+
+**5. Add the six repository secrets.** Settings → Secrets and variables →
+Actions. Paste base64 values as one line, no wrapping.
+
+| Secret | Source |
+|---|---|
+| `ASC_KEY_ID` | the 10-character key id from step 3 (also in the `.p8` filename) |
+| `ASC_ISSUER_ID` | the Issuer ID above the key list |
+| `ASC_KEY_P8_BASE64` | the `.p8`, `base64 -w0` |
+| `ASC_APP_APPLE_ID` | the **numeric** Apple ID from step 4 — not your email |
+| `IOS_DIST_P12_BASE64` | `dist.p12.b64` from step 2 |
+| `IOS_DIST_P12_PASSWORD` | the export passphrase you chose. Always set one |
+
+None of these values should ever be pasted into a chat, an issue or a commit.
+
+**6. Internal testing**, after the first build processes. TestFlight → Internal
+Testing → **+** next to Testers. Internal builds skip beta review and install in
+minutes; external testing triggers a 24–48 hour review and is not worth it while
+the Swift is still settling.
+
+### Two standing hazards
+
+**Never rename `ios.yml`** — `github.run_number` is per-workflow-file and resets
+to 1, after which every upload is rejected as a redundant binary. **Never re-run
+a job whose upload already succeeded** — the re-run reuses its run number and
+collides. Push a new tag, or retry the upload from the saved `.ipa` artifact.
+
+### Build one is deliberately not ARKit
+
+`arkitEnabled` is `false` in `SurveyViewController.swift`. ARKit and WKWebView's
+`getUserMedia` cannot both hold the rear camera, and this shell draws no preview
+of its own — so with the session running, the capture screen would go black.
+Build one therefore proves signing, TestFlight and the bundle with a known-good
+app inside; phase 2 flips the flag and takes over frame delivery in the same
+change.
+
+### If you ever do get a Mac
 
 ```bash
 brew install xcodegen
+./sync-web.sh && xcodegen && open EagleEye.xcodeproj
 ```
 
-Then, from this folder:
-
-```bash
-./sync-web.sh
-TEAM_ID=XXXXXXXXXX xcodegen        # your 10-character Apple team id
-open EagleEye.xcodeproj
-```
-
-Select your iPhone, press Run. First launch asks for camera and motion.
-
-`TEAM_ID` is the only project value that is yours. Set it once in your shell
-profile and `xcodegen` picks it up every time:
-
-```bash
-echo 'export TEAM_ID=XXXXXXXXXX' >> ~/.zshrc
-```
-
-## Signing and TestFlight
-
-Signing material — certificates, provisioning profiles, the App Store Connect
-API key — is created in your Apple account and installed on the build machine.
-None of it belongs in this repository and none of it should ever be pasted into
-a chat window:
-
-- **Local builds:** Xcode → Settings → Accounts → add your Apple ID → "Download
-  Manual Profiles". Automatic signing then works with `TEAM_ID` alone.
-- **TestFlight from CI:** create an App Store Connect API key (App Store Connect
-  → Users and Access → Integrations → App Store Connect API), download the `.p8`
-  **once**, and add it plus the key id and issuer id as GitHub repository
-  secrets. `.github/workflows/ios.yml` reads them by name; it never sees them
-  otherwise.
+Same two commands the runner uses.
 
 ## Phases
 
