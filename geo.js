@@ -1380,6 +1380,65 @@ var EE = (function () {
       rms: best.reg.rms, k: best.k, dThetaDeg: best.dTh / DEG, scale: best.scale };
   }
 
+  /* ================= ARKit =================
+
+     A native shell (eagle-eye-native/) runs an ARSession and streams the
+     camera's pose and the lens's FACTORY intrinsics into this same web app.
+     Both arrive in ARKit's conventions, and converting them is pure geometry
+     — so it lives here, where the test suite can prove it, rather than in
+     Swift where it could not be checked from this machine at all.
+
+     Frames:
+       ARKit world (.gravityAndHeading): X east, Y up, Z south.
+       This app's world:                 X east, Y north, Z up.
+     so v_app = C.v_ar with C = [1 0 0; 0 0 -1; 0 1 0].
+
+       ARKit's camera-local frame is tied to landscapeRight: +X runs along the
+       long axis from the front camera toward the home button, +Y is "up" in
+       that orientation, +Z out of the glass. The W3C device frame this app's
+       attitudes already use is portrait-fixed: +X right, +Y screen-top, +Z out
+       of the glass. In portrait terms ARKit's +X is -Y and its +Y is +X, so
+       v_device = M.v_arcam with M = [0 1 0; -1 0 0; 0 0 1].
+
+     ARCamera.transform maps camera-local to ARKit world, so this app's
+     device->world rotation is R = C.R_ar.M^T. Device-orientation angles are
+     device-fixed rather than interface-fixed, so that holds in every interface
+     orientation — the screen rotation stays where it has always been handled,
+     in rayForPixel's screenAngle. */
+  var AR_C = [1, 0, 0, 0, 0, -1, 0, 1, 0];
+  var AR_M = [0, 1, 0, -1, 0, 0, 0, 0, 1];
+
+  function rotFromARKit(Rar) {
+    return mul3(AR_C, mul3(Rar, transpose3(AR_M)));
+  }
+
+  /* A simd_float4x4 arrives column-major: m[0..3] is column 0. Returns the
+     attitude in the SAME alpha/beta/gamma the sensor path produces — so every
+     consumer downstream (attMatrix, homographyFromPose, the whole geometry)
+     works unchanged — plus the thing the web never had: metric position. */
+  function arkitPose(m) {
+    if (!m || m.length < 16) return null;
+    var Rar = [m[0], m[4], m[8],
+               m[1], m[5], m[9],
+               m[2], m[6], m[10]];
+    var R = rotFromARKit(Rar);
+    var e = orientationFromRot(R);
+    return {
+      R: R,
+      alpha: ((e.alpha % 360) + 360) % 360, beta: e.beta, gamma: e.gamma,
+      pos: { x: m[12], y: -m[14], z: m[13] }
+    };
+  }
+
+  /* Factory intrinsics -> the field of view this app stores. fx is already in
+     pixels of the captured frame, and pixels are square, so the long-edge FOV
+     follows directly — no assumption, no fusion, no search: the lens problem
+     that cost this project four versions simply stops existing. */
+  function fovFromIntrinsics(fx, imgW, imgH) {
+    if (!(fx > 0) || !(imgW > 0)) return null;
+    return fovFromFocalLong(fx, Math.max(imgW, imgH || 0));
+  }
+
   /* ================= the horizon as an instrument =================
 
      Outdoors the true horizon is a gravity reference better than any MEMS
@@ -2500,6 +2559,7 @@ var EE = (function () {
     sphereCenterDev: sphereCenterDev, ballPlane: ballPlane, colorAxis: colorAxis,
     homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
     fitPlanarByF: fitPlanarByF, hexTie: hexTie, fuseLens: fuseLens, fBracket: fBracket,
+    rotFromARKit: rotFromARKit, arkitPose: arkitPose, fovFromIntrinsics: fovFromIntrinsics,
     hullSimplify: hullSimplify,
     gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
     rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,

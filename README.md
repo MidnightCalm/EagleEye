@@ -12,15 +12,28 @@ eagle-eye/
 ├── index.html            app shell
 ├── geo.js                the geometry — homography, ray casting, fitting, geodesy, KML
 ├── app.js                state, screens, capture, tracing, export
+├── native.js             ARKit bridge — inert in a browser, live in the shell
 ├── style.css             palette + components (inherited from Trove via Ledger)
 ├── sw.js                 service worker — offline app shell
 ├── manifest.webmanifest  PWA metadata
 ├── icons/                180 / 192 / 512 px
 └── tools/
-    ├── test-geo.html     424 assertions over geo.js — open it in a browser
+    ├── test-geo.html     454 assertions over geo.js — open it in a browser
     ├── make-icons.py     regenerates the icons
     └── make-helioscope-test.py  regenerates the HelioScope import probes
 ```
+
+## Going native
+
+`../eagle-eye-native/` wraps this exact bundle in an ARKit session. Nothing is
+ported: `native.js` ships here, is inert in a browser, and inside the shell
+feeds ARKit's visual-inertial attitude into the same `ui.sensors` the sensor
+path wrote, and the camera's **factory intrinsics** into the same per-frame lens
+table every measurement keys off — retiring, at a stroke, the lens fusion and
+the sensor-bias machinery below. It also brings the one thing the web platform
+never offered: metric camera position, which turns "tie the shots together" into
+"the shots were never apart". The coordinate conversions are proven in the test
+suite; see that folder's README for the build.
 
 ## Why not LiDAR
 
@@ -740,7 +753,7 @@ built, it should be **step-and-stand bursts**, not video.
 
 ## Testing
 
-`tools/test-geo.html` runs 424 assertions against `geo.js` in a browser — homography against
+`tools/test-geo.html` runs 454 assertions against `geo.js` in a browser — homography against
 ray-cast cross-validation, pixel round trips at all four screen orientations, shape fitting,
 station registration, geodesy round trips, and KML structure. Open it; the title reads
 `PASS n` or `FAIL n`.

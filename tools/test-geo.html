@@ -1911,6 +1911,58 @@ function near(name, a, b, tol) {
   ok('one shared landmark is refused', EE.adjust2D(thin) === null);
 })();
 
+/* ---- ARKit conventions ----
+
+   The native shell cannot be compiled from the machine this was written on,
+   so the frame conversion is proven here instead: synthesise ARKit transforms
+   from attitudes this app already understands, and require the round trip. */
+(function () {
+  var C = [1, 0, 0, 0, 0, -1, 0, 1, 0];      /* ar-world -> app world */
+  var M = [0, 1, 0, -1, 0, 0, 0, 0, 1];      /* ar-camera -> portrait device */
+
+  /* R_app = C.R_ar.M^T  =>  R_ar = C^T.R_app.M */
+  var mk4 = function (alpha, beta, gamma, pos) {
+    var Rapp = EE.rotFromOrientation(alpha, beta, gamma);
+    var Rar = EE.mul3(EE.transpose3(C), EE.mul3(Rapp, M));
+    /* column-major simd_float4x4, ar-world translation from the app-frame one */
+    return [
+      Rar[0], Rar[3], Rar[6], 0,
+      Rar[1], Rar[4], Rar[7], 0,
+      Rar[2], Rar[5], Rar[8], 0,
+      pos.x, pos.z, -pos.y, 1
+    ];
+  };
+
+  [[0, 90, 0], [12, 52, -4], [187, 62, 3.5], [301, 20, 44], [45, -30, -160]].forEach(function (a) {
+    var pose = EE.arkitPose(mk4(a[0], a[1], a[2], { x: 1.5, y: -2.25, z: 1.31 }));
+    ok('arkitPose solves [' + a.join(',') + ']', !!pose, 'null');
+    var Rback = EE.rotFromOrientation(pose.alpha, pose.beta, pose.gamma);
+    var Rtrue = EE.rotFromOrientation(a[0], a[1], a[2]);
+    var err = 0;
+    for (var i = 0; i < 9; i++) err = Math.max(err, Math.abs(Rback[i] - Rtrue[i]));
+    near('...attitude round-trips exactly', err, 0, 1e-9);
+    near('...position east', pose.pos.x, 1.5, 1e-6);
+    near('...position north', pose.pos.y, -2.25, 1e-6);
+    near('...position up', pose.pos.z, 1.31, 1e-6);
+  });
+
+  /* The physical sanity case, stated independently of the algebra above: a
+     phone held upright in portrait with its REAR camera facing north. */
+  var Rar = [0, 1, 0, -1, 0, 0, 0, 0, 1];
+  var Rapp = EE.rotFromARKit(Rar);
+  var cam = EE.applyM3(Rapp, [0, 0, -1]);        /* rear camera looks down -Z */
+  near('upright portrait, ARKit: camera faces north', cam[1], 1, 1e-9);
+  near('...and is level', cam[2], 0, 1e-9);
+  var up = EE.applyM3(Rapp, [0, 1, 0]);
+  near('...screen-top is world up', up[2], 1, 1e-9);
+
+  /* Factory intrinsics: an iPhone main camera at 1920x1440 with fx ~1450 px
+     is about 66 degrees across the long edge. */
+  near('intrinsics -> long-edge FOV', EE.fovFromIntrinsics(1450, 1920, 1440),
+       2 * Math.atan(960 / 1450) * 180 / Math.PI, 1e-9);
+  ok('...and refuses nonsense', EE.fovFromIntrinsics(0, 1920, 1440) === null);
+})();
+
 document.getElementById('out').innerHTML = lines.join('');
 document.getElementById('sum').innerHTML = fail === 0
   ? '<span class="ok">ALL ' + pass + ' CHECKS PASSED</span>'

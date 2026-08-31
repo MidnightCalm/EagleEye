@@ -22,11 +22,14 @@
      load, before any service worker exists to go to the network. Bump this on
      every release; the service worker matches with ignoreSearch, so its offline
      copy is unaffected. -->
-<link rel="stylesheet" href="style.css?v=1.27.0">
+<link rel="stylesheet" href="style.css?v=1.28.0">
 </head>
 <body>
 <div id="app"></div>
-<script src="geo.js?v=1.27.0"></script>
-<script src="app.js?v=1.27.0"></script>
+<script src="geo.js?v=1.28.0"></script>
+<script src="app.js?v=1.28.0"></script>
+<!-- Inert in a browser; in the native shell it feeds ARKit pose and factory
+     intrinsics into the same globals the sensor path writes. -->
+<script src="native.js?v=1.28.0"></script>
 </body>
 </html>
