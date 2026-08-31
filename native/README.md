@@ -60,9 +60,16 @@ Keychain Access required. In Git Bash:
 
 ```bash
 openssl genrsa -out dist.key 2048
-openssl req -new -key dist.key -out dist.csr \
+MSYS_NO_PATHCONV=1 openssl req -new -key dist.key -out dist.csr \
   -subj "/emailAddress=you@example.com/CN=Eagle Eye Distribution/C=CA"
 ```
+
+`MSYS_NO_PATHCONV=1` is required in Git Bash and harmless everywhere else.
+Without it MSYS sees an argument beginning with `/` and rewrites it as a Windows
+path, so OpenSSL is handed `C:/Program Files/Git/emailAddress=...` and rejects the
+subject with “subject name is expected to be in the format /type0=value0…”. The
+rewrite happens before OpenSSL runs, which is why the error reads like a typo you
+did not make.
 
 Upload `dist.csr` at developer.apple.com → Certificates → **+** → **Apple
 Distribution**, download `distribution.cer`, then:
