@@ -6,3 +6,20 @@ desktop.ini
 # Python bytecode from tools/
 __pycache__/
 *.pyc
+
+# ---- signing material: NEVER commit ----
+# These are the keys that prove you are you. A private key pushed to a public
+# repository must be treated as compromised: revoke the certificate at
+# developer.apple.com and generate a new one. Keep them OUTSIDE this folder;
+# these patterns are a safety net, not a filing system.
+dist.key
+dist.csr
+dist.pem
+dist.p12
+dist.p12.b64*
+distribution.cer
+*.p12
+*.p8
+*.mobileprovision
+*.cer
+AuthKey_*
