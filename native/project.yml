@@ -64,6 +64,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.midnightcalm.eagleeye
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+      configs:
+        # Automatic signing picks the profile TYPE from the identity it is
+        # asked for. Left at the default "Apple Development" it hunts for a
+        # development profile, which requires registered device UDIDs — and a
+        # cloud runner has no device to register. Naming the distribution
+        # identity redirects it to an App Store profile, which needs none.
+        Release:
+          CODE_SIGN_IDENTITY: "Apple Distribution"
 
 schemes:
   EagleEye:
