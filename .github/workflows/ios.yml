@@ -50,11 +50,13 @@ jobs:
           ASC_APP_APPLE_ID: ${{ secrets.ASC_APP_APPLE_ID }}
           IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
         run: |
           set -uo pipefail
           missing=0
           for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8_BASE64 ASC_APP_APPLE_ID \
-                      IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD; do
+                      IOS_DIST_P12_BASE64 IOS_DIST_P12_PASSWORD \
+                      IOS_PROVISION_PROFILE_BASE64; do
             if [ -z "$(printenv "$name" 2>/dev/null)" ]; then
               echo "::error::Repository secret $name is not set."
               missing=1
@@ -140,11 +142,9 @@ jobs:
           echo "$dest/bin" >> "$GITHUB_PATH"
           "$dest/bin/xcodegen" --version
 
-      # The .p12 gives xcodebuild a distribution identity that already owns its
-      # private key. Without it, -allowProvisioningUpdates mints a BRAND NEW
-      # Apple Distribution certificate every run — the private key dying with
-      # the runner — and Apple's 2-3 certificate cap is reached in about three
-      # builds.
+      # The signing identity: the certificate plus the private key that proves
+      # it is yours. Imported into a keychain created and destroyed within this
+      # job, so nothing of yours outlives the runner.
       - name: Import the distribution identity into a throwaway keychain
         env:
           IOS_DIST_P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
@@ -241,6 +241,54 @@ jobs:
           echo "ASC_KEY_PATH=$key"         >> "$GITHUB_ENV"
           echo "API_PRIVATE_KEYS_DIR=$dir" >> "$GITHUB_ENV"
 
+      # Manual signing, deliberately. Automatic signing archives with a
+      # DEVELOPMENT identity and refuses to be overridden, and a development
+      # profile needs registered device UDIDs — which a cloud runner can never
+      # have. An App Store profile needs no devices and never changes between
+      # runs.
+      - name: Install the provisioning profile
+        env:
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          pp="$RUNNER_TEMP/profile.mobileprovision"
+          printf '%s' "$IOS_PROVISION_PROFILE_BASE64" | openssl base64 -d -A > "$pp"
+          [ -s "$pp" ] || {
+            echo "::error::IOS_PROVISION_PROFILE_BASE64 decoded to nothing."
+            exit 1
+          }
+
+          # A .mobileprovision is a CMS-signed plist; unwrap it to read its
+          # identifiers.
+          plist="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$pp" > "$plist" 2>/dev/null || {
+            echo "::error::that file is not a provisioning profile."
+            exit 1
+          }
+
+          uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist")"
+          name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$plist")"
+          appid="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$plist")"
+          expiry="$(/usr/libexec/PlistBuddy -c 'Print :ExpirationDate' "$plist")"
+          echo "profile: $name"
+          echo "uuid:    $uuid"
+          echo "app id:  $appid"
+          echo "expires: $expiry"
+
+          # The profile must actually be for this app, or the archive fails far
+          # later with a message that never mentions the profile.
+          case "$appid" in
+            *".$BUNDLE_ID") : ;;
+            *) echo "::error::profile is for $appid, not $BUNDLE_ID"; exit 1 ;;
+          esac
+
+          dest="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$dest"
+          cp "$pp" "$dest/$uuid.mobileprovision"
+
+          echo "PROFILE_UUID=$uuid" >> "$GITHUB_ENV"
+          echo "PROFILE_NAME=$name" >> "$GITHUB_ENV"
+
       # Must precede xcodegen: project.yml declares www/ as a folder reference
       # and XcodeGen errors if the directory does not exist. Invoked via bash
       # because sync-web.sh may be mode 100644 in the index (committed from
@@ -273,14 +321,11 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$RUNNER_TEMP/EagleEye.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             OTHER_CODE_SIGN_FLAGS="--keychain $SIGNING_KEYCHAIN" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
             MARKETING_VERSION="${{ steps.ver.outputs.marketing }}" \
             CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
             2>&1 | tee "$RUNNER_TEMP/xcodebuild-archive.log"
@@ -313,7 +358,14 @@ jobs:
             <key>teamID</key>
             <string>${TEAM_ID}</string>
             <key>signingStyle</key>
-            <string>automatic</string>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_UUID}</string>
+            </dict>
             <key>uploadSymbols</key>
             <true/>
             <key>stripSwiftSymbols</key>
@@ -336,11 +388,7 @@ jobs:
           xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/EagleEye.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
-            -exportPath "$RUNNER_TEMP/export" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+            -exportPath "$RUNNER_TEMP/export"
           ipa="$(ls "$RUNNER_TEMP/export"/*.ipa | head -1)"
           echo "IPA_PATH=$ipa" >> "$GITHUB_ENV"
           ls -lh "$RUNNER_TEMP/export"

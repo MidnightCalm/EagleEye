@@ -71,6 +71,7 @@ targets:
         # cloud runner has no device to register. Naming the distribution
         # identity redirects it to an App Store profile, which needs none.
         Release:
+          CODE_SIGN_STYLE: Manual
           CODE_SIGN_IDENTITY: "Apple Distribution"
 
 schemes:

@@ -96,14 +96,27 @@ never appears again. Copy the Issuer ID from the top of the same page. Encode
 with `base64 -w0 AuthKey_XXXXXXXXXX.p8`; never `certutil -encode`, which adds
 header lines that corrupt the key.
 
-**4. Create the app record.** This is the step people skip, and an upload for a
+**4. Create the App Store provisioning profile.** developer.apple.com →
+Profiles → **+** → Distribution → **App Store Connect** → App ID
+`com.midnightcalm.eagleeye` → pick the distribution certificate from step 2 →
+name it “Eagle Eye App Store” → Generate → Download. Then
+`base64 -w0 EagleEye_App_Store.mobileprovision > profile.b64`.
+
+This exists because the build signs **manually**. Automatic signing archives
+with a *development* identity and refuses to be told otherwise, and a
+development profile requires registered device UDIDs — which a cloud runner
+can never have. An App Store profile needs no devices and behaves identically
+on every run. Profiles expire after a year; regenerate and re-paste the secret
+when that happens.
+
+**5. Create the app record.** This is the step people skip, and an upload for a
 bundle id with no record is rejected. appstoreconnect.apple.com → Apps → **+**.
 Platform iOS, name “Eagle Eye”, bundle id from the dropdown (if it is not
 listed, step 1 has not propagated), SKU any private string. Then App Information
 → General Information → copy the numeric **Apple ID**. Nothing else is needed
 for TestFlight — no screenshots, no description, no pricing.
 
-**5. Add the six repository secrets.** Settings → Secrets and variables →
+**6. Add the seven repository secrets.** Settings → Secrets and variables →
 Actions. Paste base64 values as one line, no wrapping.
 
 | Secret | Source |
@@ -114,10 +127,11 @@ Actions. Paste base64 values as one line, no wrapping.
 | `ASC_APP_APPLE_ID` | the **numeric** Apple ID from step 4 — not your email |
 | `IOS_DIST_P12_BASE64` | `dist.p12.b64` from step 2 |
 | `IOS_DIST_P12_PASSWORD` | the export passphrase you chose. Always set one |
+| `IOS_PROVISION_PROFILE_BASE64` | `profile.b64` from step 4 |
 
 None of these values should ever be pasted into a chat, an issue or a commit.
 
-**6. Internal testing**, after the first build processes. TestFlight → Internal
+**7. Internal testing**, after the first build processes. TestFlight → Internal
 Testing → **+** next to Testers. Internal builds skip beta review and install in
 minutes; external testing triggers a 24–48 hour review and is not worth it while
 the Swift is still settling.
