@@ -1430,6 +1430,44 @@ var EE = (function () {
     };
   }
 
+  /* An ARPlaneAnchor as a rectangle in this app's frame.
+
+     ARKit describes a plane in its own anchor space: a centre, an extent lying
+     in the anchor's x/z axes, and a rotation about the anchor's y (its normal,
+     which for a horizontal plane is up). The anchor's transform then places
+     that in ARKit's world. Four corners come out of that; C brings them into
+     this app's east/north frame, and the plane's height is the world y.
+
+     Returned as the rectangle this app already draws and exports — centre,
+     sides, rotation — plus the corners it came from. */
+  function planeCornersFromARKit(m, cx, cy, cz, w, h, rotY) {
+    if (!m || m.length < 16) return null;
+    var cr = Math.cos(rotY || 0), sr = Math.sin(rotY || 0);
+    var hw = w / 2, hh = h / 2;
+    var local = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]];
+    var out = [], zs = 0;
+    for (var i = 0; i < 4; i++) {
+      var lx = local[i][0], lz = local[i][1];
+      var ax = cx + lx * cr + lz * sr;
+      var az = cz - lx * sr + lz * cr;
+      var ay = cy;
+      var wx = m[0] * ax + m[4] * ay + m[8] * az + m[12];
+      var wy = m[1] * ax + m[5] * ay + m[9] * az + m[13];
+      var wz = m[2] * ax + m[6] * ay + m[10] * az + m[14];
+      out.push({ x: wx, y: -wz });          /* ARKit east/up/south -> east/north */
+      zs += wy;
+    }
+    var mx = 0, my = 0;
+    out.forEach(function (q) { mx += q.x / 4; my += q.y / 4; });
+    var e1 = { x: out[1].x - out[0].x, y: out[1].y - out[0].y };
+    var e2 = { x: out[2].x - out[1].x, y: out[2].y - out[1].y };
+    return {
+      corners: out, z: zs / 4, cx: mx, cy: my,
+      w: Math.hypot(e1.x, e1.y), l: Math.hypot(e2.x, e2.y),
+      rot: Math.atan2(e1.y, e1.x)
+    };
+  }
+
   /* Factory intrinsics -> the field of view this app stores. fx is already in
      pixels of the captured frame, and pixels are square, so the long-edge FOV
      follows directly — no assumption, no fusion, no search: the lens problem
@@ -2560,6 +2598,7 @@ var EE = (function () {
     homographyFromPoints: homographyFromPoints, hexCorners: hexCorners, signedArea: signedArea,
     fitPlanarByF: fitPlanarByF, hexTie: hexTie, fuseLens: fuseLens, fBracket: fBracket,
     rotFromARKit: rotFromARKit, arkitPose: arkitPose, fovFromIntrinsics: fovFromIntrinsics,
+    planeCornersFromARKit: planeCornersFromARKit,
     hullSimplify: hullSimplify,
     gravityFromHorizon: gravityFromHorizon, orientationFromRot: orientationFromRot,
     rotAxisAngle: rotAxisAngle, alignToGravity: alignToGravity,

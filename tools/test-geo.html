@@ -1956,6 +1956,23 @@ function near(name, a, b, tol) {
   var up = EE.applyM3(Rapp, [0, 1, 0]);
   near('...screen-top is world up', up[2], 1, 1e-9);
 
+  /* A plane anchor: identity rotation, raised 1.2 m, centre (1,0,2) in anchor
+     space, 2 m along x and 1 m along z. */
+  var pm = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,1.2,0,1];
+  var pr = EE.planeCornersFromARKit(pm, 1, 0, 2, 2, 1, 0);
+  ok('plane anchor converts', !!pr);
+  near('...its height is the world y', pr.z, 1.2, 1e-9);
+  near('...centre east', pr.cx, 1, 1e-9);
+  near('...centre north (ARKit +z is south)', pr.cy, -2, 1e-9);
+  near('...width along x', pr.w, 2, 1e-9);
+  near('...length along z', pr.l, 1, 1e-9);
+  near('...unrotated', pr.rot, 0, 1e-9);
+  var prR = EE.planeCornersFromARKit(pm, 1, 0, 2, 2, 1, Math.PI / 2);
+  near('a quarter-turn about the normal swaps nothing but orientation: width', prR.w, 2, 1e-9);
+  near('...length', prR.l, 1, 1e-9);
+  near('...and reads as a quarter-turn', Math.abs(prR.rot), Math.PI / 2, 1e-9);
+  ok('...refuses a bad matrix', EE.planeCornersFromARKit([1,2,3], 0,0,0, 1,1, 0) === null);
+
   /* Factory intrinsics: an iPhone main camera at 1920x1440 with fx ~1450 px
      is about 66 degrees across the long edge. */
   near('intrinsics -> long-edge FOV', EE.fovFromIntrinsics(1450, 1920, 1440),

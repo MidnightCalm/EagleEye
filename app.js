@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.30.0';
+var VERSION = '1.31.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -47,6 +47,39 @@ var IDB = (function () {
     sizes: function () { return tx('readonly', function (s) { return s.getAll(); }); }
   };
 })();
+
+/* Where a photograph lives. Two homes: the shell's own files when there is a
+   shell — IndexedDB in a custom-scheme origin swallowed 220 frames of a real
+   roof without a word — and IndexedDB on the web. Every reader and writer goes
+   through here, and a failure is reported rather than returned as success. */
+var Photos = {
+  url: function (st) {
+    return (st && st.photoFile && window.EENative && EENative.photoUrl)
+      ? EENative.photoUrl(st.photoFile) : null;
+  },
+  get: function (st) {
+    if (!st) return Promise.resolve(null);
+    var u = Photos.url(st);
+    if (u) {
+      return fetch(u).then(function (r) { return r && r.ok ? r.blob() : null; })
+        .catch(function () { return null; });
+    }
+    return IDB.get(photoKey(st.id));
+  },
+  /* resolves TRUE only when the bytes are genuinely stored */
+  put: function (st, blob) {
+    if (st.photoFile) return Promise.resolve(true);      /* the shell already wrote it */
+    return IDB.put(photoKey(st.id), blob).then(function (ok) { return !!ok; });
+  },
+  del: function (st) {
+    if (!st) return Promise.resolve(null);
+    if (st.photoFile && window.EENative && EENative.deletePhoto) {
+      EENative.deletePhoto(st.photoFile);
+      return Promise.resolve(true);
+    }
+    return IDB.del(photoKey(st.id));
+  }
+};
 
 var DEFAULTS = {
   unit: 'm',
@@ -199,8 +232,26 @@ function fromProj(st, p) {
   return { x: c * x - s * y, y: s * x + c * y };
 }
 
+/* The ARKit session whose world IS this project's frame — set the moment the
+   first ARKit-placed shot arrives, since that registration is a pure
+   translation from world coordinates. */
+function projectFrameSession(p) {
+  var s2 = p.stations.find(function (s) { return s.reg && s.reg.method === 'arkit'; });
+  return s2 ? s2.arSession : null;
+}
+
 /* An object with its coordinates lifted into the project frame. */
 function projObj(p, o) {
+  /* World objects — proposed from ARKit's planes — carry project-frame
+     coordinates already, PROVIDED the project frame is that session's world.
+     Before any shot is placed, it will be; after a shot from some other
+     session defined the frame, they cannot be trusted and are not shown. */
+  if (o.world) {
+    var fs = projectFrameSession(p);
+    if (!fs && p.stations.some(function (s) { return !!s.reg; })) return null;
+    if (fs && fs !== o.arSession) return null;
+    return Object.assign({}, o);
+  }
   var st = findStation(p, o.stationId);
   var t = stationXform(st);
   if (!t) return null;                       /* station not yet placed */
@@ -1405,7 +1456,7 @@ function photoKey(id) { return 'p:' + id; }
 function loadImage(st) {
   if (!st) return Promise.resolve(null);
   if (ui.imgCache[st.id]) return Promise.resolve(ui.imgCache[st.id]);
-  return IDB.get(photoKey(st.id)).then(function (blob) {
+  return Photos.get(st).then(function (blob) {
     if (!blob) return null;
     return new Promise(function (res) {
       var url = URL.createObjectURL(blob);
@@ -1420,7 +1471,7 @@ function loadImage(st) {
 function thumbUrl(st) {
   if (ui.urlCache[st.id]) return ui.urlCache[st.id];
   if (st.photoGone) return '';
-  IDB.get(photoKey(st.id)).then(function (b) {
+  Photos.get(st).then(function (b) {
     if (!b) {
       /* Remembered, so a dropped photo reads as "dropped" rather than as a
          broken image that looks like a bug. */
@@ -1558,7 +1609,7 @@ function render() {
 function tplHome() {
   var cards = db.projects.slice().sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); })
     .map(function (p) {
-      var objs = p.objects.filter(function (o) { return o.kind !== 'point' && !o.panel; }).length;
+      var objs = p.objects.filter(function (o) { return o.kind !== 'point' && !o.panel && !o.proposed; }).length;
       var outline = p.objects.find(function (o) { return o.kind === 'outline' && !o.panel; });
       var area = outline ? EE.polygonArea(outline.pts || []) : 0;
       var open = ui.swipe === p.id;
@@ -1929,7 +1980,7 @@ function attCell(label, val, cls) {
 var AUTO_MOVE_M = 0.35;      /* a half-stride */
 var AUTO_TURN_DEG = 18;      /* a glance */
 var AUTO_MIN_MS = 900;       /* never faster than this, whatever the motion */
-var AUTO_MAX_SHOTS = 80;     /* a roof, not a film */
+var AUTO_MAX_SHOTS = 500;    /* the first real site wanted 220 and photos are files now */
 
 function autoCaptureTick() {
   var c = ui.cap;
@@ -1962,6 +2013,53 @@ function autoCaptureTick() {
     alpha: pose.alpha, beta: pose.beta, gamma: pose.gamma
   };
   shoot();
+}
+
+/* ================= the roof, proposed =================
+
+   A rooftop is horizontal planes all the way down: the deck is the lowest
+   broad one, and every unit top is an elevated rectangle. ARKit finds those
+   planes as you walk; this turns each elevated one into the box the app would
+   otherwise have needed someone to tap out on a photograph. They arrive as
+   PROPOSALS — dashed on the plan, kept out of the export — until saved. */
+var PROPOSE_MIN_H = 0.25, PROPOSE_MAX_H = 6;        /* below: a step; above: not a unit */
+var PROPOSE_MIN_AREA = 0.3, PROPOSE_MAX_AREA = 250; /* a duct; a whole deck level */
+
+function proposeFromPlanes() {
+  var p = currentProject();
+  if (!p || !window.EENative || !EENative.planes) return 0;
+  var floorZ = EENative.floorY;
+  if (floorZ == null) return 0;
+  var fs = projectFrameSession(p);
+  if (!fs && p.stations.some(function (s) { return !!s.reg; })) return 0;
+
+  var changed = 0;
+  Object.keys(EENative.planes).forEach(function (k) {
+    var pl = EENative.planes[k];
+    if (fs && pl.arSession !== fs) return;
+    var h = pl.z - floorZ;
+    var area = pl.w * pl.l;
+    if (h < PROPOSE_MIN_H || h > PROPOSE_MAX_H) return;
+    if (area < PROPOSE_MIN_AREA || area > PROPOSE_MAX_AREA) return;
+
+    var id = 'plane:' + pl.id;
+    var ex = p.objects.find(function (o) { return o.id === id; });
+    if (ex && !ex.proposed) return;          /* saved: the surveyor owns it now */
+    var next = {
+      id: id, stationId: null, world: true, arSession: pl.arSession, proposed: true,
+      kind: 'rect', cx: pl.cx, cy: pl.cy, w: pl.w, l: pl.l, rot: pl.rot,
+      h: h, hSrc: 'arkit',
+      name: ex ? ex.name : 'Unit', autoName: ex ? ex.autoName : true, note: ex ? ex.note : ''
+    };
+    if (ex) Object.assign(ex, next); else p.objects.push(next);
+    changed++;
+  });
+  if (changed) {
+    touchProject(p); save();
+    if (ui.plan) ui.plan.fitted = false;
+    if (view.screen === 'project') render();
+  }
+  return changed;
 }
 
 /* Whether the pose behind the readouts is one to measure against. The web
@@ -2441,8 +2539,9 @@ function paintLive() {
     }
 
     var col = needsH ? '#E4B54A' : (o.kind === 'outline' ? 'rgba(237,234,244,0.7)' : '#D9A93F');
+    if (o.proposed) col = '#9D8CFF';
     g.strokeStyle = col; g.lineWidth = lw;
-    if (needsH) g.setLineDash([10 * scale, 8 * scale]);
+    if (needsH || o.proposed) g.setLineDash([10 * scale, 8 * scale]);
     g.beginPath(); strokeScreenPoly(g, bp, true); g.stroke();
     g.setLineDash([]);
 
@@ -3140,7 +3239,10 @@ function sheetObject(s) {
       '<div class="field"><label>HEIGHT</label><div class="unit-suffix"><input class="inp mono" id="so-h" inputmode="decimal" value="' + EE.fromM(o.h || 0, U()).toFixed(2) + '"><span>' + U() + '</span></div></div>' + chips) +
     '<div class="field"><label>NOTE</label><input class="inp" id="so-note" value="' + esc(o.note || '') + '" autocomplete="off"></div>' +
     (o.kind === 'rect' || o.kind === 'cylinder' ? '<button class="btn ghost-gold sm" data-act="snap-dims">Round to the nearest ' + (U() === 'ft' ? 'inch' : '5 cm') + '</button>' : '') +
-    '<div class="btn-row"><button class="btn primary" data-act="save-object">Save</button>' +
+    (o.proposed ? '<div class="hint"><b>ARKit proposed this</b> from a surface it detected. ' +
+      'Save keeps it and stops it changing; Delete discards it.</div>' : '') +
+    '<div class="btn-row"><button class="btn primary" data-act="save-object">' +
+    (o.proposed ? 'Keep' : 'Save') + '</button>' +
     '<button class="btn danger" data-act="delete-object">Delete</button></div>';
 }
 
@@ -3783,7 +3885,8 @@ function paintPlan() {
       g.closePath();
       g.fillStyle = o.kind === 'cylinder' ? 'rgba(138,99,210,0.28)' : 'rgba(228,181,74,0.22)';
       g.fill();
-      g.strokeStyle = sel ? '#F4F0E8' : (o.kind === 'cylinder' ? '#B7AAFF' : '#D9A93F');
+      g.strokeStyle = sel ? '#F4F0E8' : (o.proposed ? '#9D8CFF' : (o.kind === 'cylinder' ? '#B7AAFF' : '#D9A93F'));
+      if (o.proposed) g.setLineDash([7, 5]);
       g.lineWidth = sel ? 3 : 1.6; g.stroke();
 
       var ctr = o.kind === 'cylinder' ? { x: o.cx, y: o.cy } : { x: o.cx, y: o.cy };
@@ -5033,7 +5136,7 @@ function confirmYes() {
   if (s.on === 'purge') {
     var jobs = [];
     db.projects.forEach(function (pr) {
-      pr.stations.forEach(function (st) { jobs.push(IDB.del(photoKey(st.id))); });
+      pr.stations.forEach(function (st) { jobs.push(Photos.del(st)); });
     });
     Promise.all(jobs).then(function () {
       ui.imgCache = {}; ui.urlCache = {};
@@ -5045,7 +5148,7 @@ function confirmYes() {
     var tgt = s.id ? db.projects.find(function (q) { return q.id === s.id; }) : p;
     if (tgt) {
       tgt.stations.forEach(function (st) {
-        IDB.del(photoKey(st.id));
+        Photos.del(st);
         delete ui.imgCache[st.id];
         if (ui.urlCache[st.id]) { URL.revokeObjectURL(ui.urlCache[st.id]); delete ui.urlCache[st.id]; }
       });
@@ -5059,7 +5162,7 @@ function confirmYes() {
   if (s.on === 'del-station') {
     var st = findStation(p, s.id);
     if (st) {
-      IDB.del(photoKey(st.id));
+      Photos.del(st);
       delete ui.imgCache[st.id];
       if (ui.urlCache[st.id]) { URL.revokeObjectURL(ui.urlCache[st.id]); delete ui.urlCache[st.id]; }
       /* Objects traced from a deleted shot have no frame to live in, so they go
@@ -5361,7 +5464,15 @@ function commitShot(src, natW, natH, arFrame) {
       if (ui.cap) ui.cap.busy = false;
       return toast('Could not save the frame');
     }
-    IDB.put(photoKey(st.id), blob).then(function () {
+    if (arFrame && arFrame.photoId) st.photoFile = arFrame.photoId;
+    Photos.put(st, blob).then(function (ok) {
+      if (!ok) {
+        /* The shot keeps its place in the survey — its pose is still real —
+           but nobody should discover at the trace screen that there is
+           nothing to trace. */
+        st.photoGone = true;
+        toast('The photo could NOT be stored. The shot is placed, but there is nothing to trace on it — storage may be full.');
+      }
       p.stations.push(st);
       ensureOrigin(p);
       touchProject(p); save();
@@ -5943,7 +6054,7 @@ function fusePanel(p) {
     var localPts = canon2.pts.map(function (q) { return fromProj(sts0, q); });
     var keep = null;
     p.objects = p.objects.filter(function (o) {
-      if (!o.panel) return true;
+      if (!o.panel && !o.proposed) return true;
       var ost = p.stations.find(function (s2) { return s2.id === o.stationId; });
       var oep = (ost && ost.cal && ost.cal.panelEpoch) || 1;
       if (String(oep) !== String(ep)) return true;
@@ -6478,6 +6589,7 @@ function commitShape() {
 function saveObjectSheet() {
   var p = currentProject();
   var o = p.objects.find(function (q) { return q.id === ui.sheet.id; });
+  if (o) o.proposed = false;      /* saving a proposal adopts it */
   if (!o) return;
   var nameEl = $('#so-name');
   if (nameEl) {
@@ -6679,7 +6791,7 @@ function slug(s) { return String(s || 'survey').replace(/[^\w\- ]+/g, '').trim()
 function exportKml() {
   var p = currentProject();
   if (!p.anchor) return toast('Locate the survey first');
-  var placed = placedObjects(p).filter(function (o) { return o.kind !== 'point' && !o.panel; });
+  var placed = placedObjects(p).filter(function (o) { return o.kind !== 'point' && !o.panel && !o.proposed; });
   if (!placed.length) return toast('Nothing placed to export');
 
   var kml = EE.buildKML({ name: p.name, address: p.address, anchor: p.anchor, objects: placed }, {
@@ -7057,7 +7169,7 @@ function exportDebugFull() {
   };
   var next = function (i) {
     if (i >= ids.length) return finish();
-    IDB.get(photoKey(ids[i])).then(function (blob) {
+    Photos.get(findStation(p, ids[i])).then(function (blob) {
       if (!blob || !blob.arrayBuffer) { missing.push(ids[i]); return next(i + 1); }
       blob.arrayBuffer().then(function (buf) {
         entries.push({ name: 'photos/' + ids[i] + '.jpg', data: new Uint8Array(buf) });

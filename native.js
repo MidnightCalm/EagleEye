@@ -37,7 +37,11 @@
        start puts the world origin wherever the phone happens to be, so shots
        from two sessions must never be registered against each other by
        position. Stored on every shot, compared before auto-registering. */
-    sessionId: null
+    sessionId: null,
+    /* Every horizontal plane ARKit currently believes in, keyed by anchor id,
+       already converted to this app's frame. The deck and the units are in
+       here before anyone has tapped anything. */
+    planes: {}
   };
 
   var send = function (msg) { try { post.postMessage(msg); } catch (e) { } };
@@ -96,12 +100,44 @@
     if (window.ui && ui.live && window.paintLive) paintLive();
   };
 
-  /* ARKit's floor plane, when it finds one: the deck, measured rather than
-     read off a phone lying on it. */
-  window.__eeNativeFloor = function (yMetres) {
-    N.floorY = yMetres;
-    if (window.ui && ui.live) ui.live.arFloor = yMetres;
+  /* The deck is the LOWEST BROAD horizontal plane — not whichever plane ARKit
+     happened to report last, which was the previous rule and which quietly
+     made an RTU top the floor whenever one was found late. A 0.44 m "camera
+     height" in the first real site's data is that bug wearing a number. */
+  var recomputeFloor = function () {
+    var best = null;
+    Object.keys(N.planes).forEach(function (k) {
+      var pl = N.planes[k];
+      if (pl.w * pl.l < 2) return;              /* a deck is big; a duct is not */
+      if (best == null || pl.z < best) best = pl.z;
+    });
+    N.floorY = best;
+    if (window.ui && ui.live) ui.live.arFloor = best;
   };
+
+  var proposeTimer = 0;
+  window.__eeNativePlane = function (id, m, cx, cy, cz, w, h, rotY, cls, sess) {
+    var r = EE.planeCornersFromARKit(m, cx, cy, cz, w, h, rotY);
+    if (!r) return;
+    r.id = id; r.cls = cls || 'none';
+    r.arSession = sess || N.sessionId; r.at = performance.now();
+    N.planes[id] = r;
+    recomputeFloor();
+    /* Proposals are rebuilt at most once a second: planes grow continuously
+       and the plan should not flicker with them. */
+    if (window.proposeFromPlanes && !proposeTimer) {
+      proposeTimer = setTimeout(function () {
+        proposeTimer = 0;
+        try { proposeFromPlanes(); } catch (e) { }
+      }, 1000);
+    }
+  };
+  window.__eeNativePlaneGone = function (id) {
+    delete N.planes[id];
+    recomputeFloor();
+  };
+  /* kept so an older shell build cannot throw */
+  window.__eeNativeFloor = function (yMetres) { if (N.floorY == null) N.floorY = yMetres; };
 
   /* ---- capture ----
 
@@ -109,15 +145,28 @@
      born already registered. Returns a promise; the phase-2 capture path
      consumes it in place of the canvas grab. */
   var pending = {}, seq = 0;
-  window.__eeNativeFrame = function (id, jpegB64, m, fx, w, h, sessionId) {
+  window.__eeNativeFrame = function (id, jpegB64, m, fx, w, h, sessionId, photoId) {
     var cb = pending[id];
     delete pending[id];
     if (!cb) return;
+    /* The frame the page will trace was shrunk by the shell; its lens entry is
+       keyed to the size it actually has. */
+    if (fx > 0 && w > 0 && window.db && db.settings) {
+      var fov = EE.fovFromIntrinsics(fx, w, h);
+      if (fov > 40 && fov < 100) {
+        (db.settings.fovByFrame || (db.settings.fovByFrame = {}))[w + 'x' + h] = fov;
+      }
+    }
     cb({
       jpeg: jpegB64, pose: EE.arkitPose(m), fx: fx, w: w, h: h,
-      sessionId: sessionId || N.sessionId
+      sessionId: sessionId || N.sessionId,
+      photoId: photoId || null
     });
   };
+
+  /* Where the shell keeps a photograph it took, as a URL the page can fetch. */
+  N.photoUrl = function (photoId) { return 'eagle-eye://app/_photos/' + photoId + '.jpg'; };
+  N.deletePhoto = function (photoId) { if (photoId) send({ cmd: 'deletePhoto', id: photoId }); };
 
   /* A captured frame as something canvas can draw. The shell hands back base64
      rather than a blob URL because a data: URL crosses the bridge as plain
@@ -137,6 +186,11 @@
   /* Callback first — the rest of this app is ES5 and callback-shaped, and a
      callback is testable without an event loop. A promise is returned too
      where the platform has one. */
+  /* The shell shrinks the frame to the app's own pixel limit before saving,
+     so the file on disk and the coordinates traced over it agree exactly. */
+  var maxPxNow = function () {
+    return (window.db && db.settings && db.settings.maxPx) || 1440;
+  };
   N.captureFrame = function (cb) {
     var id = 'c' + (++seq);
     var fire = function (r) { if (cb) cb(r); };
@@ -144,11 +198,11 @@
       var p = new Promise(function (resolve) {
         pending[id] = function (r) { fire(r); resolve(r); };
       });
-      send({ cmd: 'capture', id: id });
+      send({ cmd: 'capture', id: id, maxPx: maxPxNow() });
       return p;
     }
     pending[id] = fire;
-    send({ cmd: 'capture', id: id });
+    send({ cmd: 'capture', id: id, maxPx: maxPxNow() });
     return null;
   };
 

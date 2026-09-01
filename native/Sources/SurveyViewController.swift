@@ -37,7 +37,11 @@ final class SurveyViewController: UIViewController {
 
     private let session = ARSession()
     private var lastPush: TimeInterval = 0
-    private var pendingCaptures: [String] = []
+    private var pendingCaptures: [(id: String, maxPx: Int)] = []
+
+    /// Planes are re-reported by ARKit many times a second as they grow; the
+    /// page wants the shape, not the heartbeat.
+    private var planeLastSent: [UUID: TimeInterval] = [:]
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     /// Pose pushes per second. 30 is smooth for an overlay and leaves the web
@@ -166,21 +170,43 @@ final class SurveyViewController: UIViewController {
     /// device is held; the app is portrait-locked and its geometry assumes the
     /// photograph matches the interface, so the rotation is baked in here once
     /// rather than compensated for in four places later.
-    private func portraitJPEG(from pixelBuffer: CVPixelBuffer,
-                              quality: CGFloat = 0.72) -> (b64: String, width: Int, height: Int)? {
+    private func portraitJPEG(from pixelBuffer: CVPixelBuffer, maxPx: Int,
+                              quality: CGFloat = 0.72) -> (b64: String, data: Data, width: Int, height: Int)? {
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return nil }
 
         // .right turns a landscape sensor buffer upright for a portrait UI.
         let rotated = UIImage(cgImage: cg, scale: 1, orientation: .right)
-        let size = rotated.size
+        var size = rotated.size
+        let long = max(size.width, size.height)
+        if maxPx > 0, long > CGFloat(maxPx) {
+            let s = CGFloat(maxPx) / long
+            size = CGSize(width: (size.width * s).rounded(), height: (size.height * s).rounded())
+        }
         UIGraphicsBeginImageContextWithOptions(size, true, 1)
         rotated.draw(in: CGRect(origin: .zero, size: size))
         let baked = UIGraphicsGetImageFromCurrentImageContext()
         UIGraphicsEndImageContext()
 
         guard let out = baked, let data = out.jpegData(compressionQuality: quality) else { return nil }
-        return (data.base64EncodedString(), Int(size.width), Int(size.height))
+        return (data.base64EncodedString(), data, Int(size.width), Int(size.height))
+    }
+
+    /// Photographs live in the app's Documents directory as ordinary files —
+    /// backed up, unlimited but for the device, and readable by the scheme
+    /// handler below. Returns the name the page should remember, or "" if the
+    /// write failed, which the page treats as a photo that does not exist.
+    private func savePhoto(_ data: Data, id: String) -> String {
+        let safe = String(id.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        guard !safe.isEmpty else { return "" }
+        let url = AppScheme.photosDir.appendingPathComponent("\(safe).jpg")
+        do {
+            try data.write(to: url, options: .atomic)
+            return safe
+        } catch {
+            NSLog("%@", "photo write failed: \(error.localizedDescription)")
+            return ""
+        }
     }
 }
 
@@ -194,20 +220,27 @@ extension SurveyViewController: ARSessionDelegate {
         // Any capture the web app asked for is served from THIS frame, so the
         // photograph and the pose it is measured against are the same instant.
         if !pendingCaptures.isEmpty {
-            let ids = pendingCaptures
+            let requests = pendingCaptures
             pendingCaptures.removeAll()
             let m = frame.camera.transform.jsArray
             let k = frame.camera.intrinsics
-            // The captured buffer is always landscape (1920x1440) whatever the
-            // device is doing; the app is portrait and its geometry assumes the
-            // frame matches. Rotate once here so every downstream consumer —
-            // screenAngle, the lens table, the tap maths — stays as written.
-            if let shot = portraitJPEG(from: frame.capturedImage) {
-                for id in ids {
-                    evaluate("window.__eeNativeFrame && window.__eeNativeFrame("
-                             + "\(id.jsQuoted), \(shot.b64.jsQuoted), \(m), \(k.columns.0.x), "
-                             + "\(shot.width), \(shot.height), \(sessionId.jsQuoted));")
-                }
+            let captureLong = max(frame.camera.imageResolution.width, frame.camera.imageResolution.height)
+            for req in requests {
+                // The captured buffer is always landscape whatever the device is
+                // doing; the app is portrait and its geometry assumes the frame
+                // matches. Rotate — and shrink to the app's own pixel limit —
+                // once here, so every downstream consumer stays as written.
+                guard let shot = portraitJPEG(from: frame.capturedImage, maxPx: req.maxPx) else { continue }
+                // Intrinsics are per pixel of the ORIGINAL frame; a shrunk frame
+                // has a proportionally shorter focal length.
+                let fx = Double(k.columns.0.x) * Double(max(shot.width, shot.height)) / Double(captureLong)
+                // The photograph is written to disk HERE, by the shell, and the
+                // page keeps only its name. IndexedDB in a custom-scheme origin
+                // swallowed 220 frames of a real roof without a word.
+                let photoId = savePhoto(shot.data, id: req.id)
+                evaluate("window.__eeNativeFrame && window.__eeNativeFrame("
+                         + "\(req.id.jsQuoted), \(shot.b64.jsQuoted), \(m), \(fx), "
+                         + "\(shot.width), \(shot.height), \(sessionId.jsQuoted), \(photoId.jsQuoted));")
             }
         }
 
@@ -225,12 +258,45 @@ extension SurveyViewController: ARSessionDelegate {
                  + "\(sessionId.jsQuoted));")
     }
 
-    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
-        // The lowest broad horizontal plane is the deck the survey stands on.
+    /// Every horizontal plane ARKit knows about, as it learns it. A rooftop is
+    /// horizontal planes all the way down: the deck is the lowest broad one,
+    /// and every RTU top is an elevated rectangle — which is the survey, before
+    /// anyone has tapped anything. The page decides which is which.
+    private func forwardPlanes(_ anchors: [ARAnchor], force: Bool) {
+        let now = CACurrentMediaTime()
         for a in anchors {
             guard let plane = a as? ARPlaneAnchor, plane.alignment == .horizontal else { continue }
-            let y = plane.transform.columns.3.y
-            evaluate("window.__eeNativeFloor && window.__eeNativeFloor(\(y));")
+            if !force, let t = planeLastSent[plane.identifier], now - t < 0.5 { continue }
+            planeLastSent[plane.identifier] = now
+            let c = plane.center
+            let e = plane.planeExtent
+            let cls: String
+            switch plane.classification {
+            case .floor: cls = "floor"
+            case .table: cls = "table"
+            case .ceiling: cls = "ceiling"
+            case .wall: cls = "wall"
+            default: cls = "none"
+            }
+            evaluate("window.__eeNativePlane && window.__eeNativePlane("
+                     + "\(plane.identifier.uuidString.jsQuoted), \(plane.transform.jsArray), "
+                     + "\(c.x), \(c.y), \(c.z), \(e.width), \(e.height), \(e.rotationOnYAxis), "
+                     + "\(cls.jsQuoted), \(sessionId.jsQuoted));")
+        }
+    }
+
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        forwardPlanes(anchors, force: true)
+    }
+
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        forwardPlanes(anchors, force: false)
+    }
+
+    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        for a in anchors where a is ARPlaneAnchor {
+            planeLastSent[a.identifier] = nil
+            evaluate("window.__eeNativePlaneGone && window.__eeNativePlaneGone(\(a.identifier.uuidString.jsQuoted));")
         }
     }
 
@@ -260,7 +326,15 @@ extension SurveyViewController: WKScriptMessageHandler {
         case "ready":
             NSLog("Eagle Eye web bundle reported ready")
         case "capture":
-            if let id = body["id"] as? String { pendingCaptures.append(id) }
+            if let id = body["id"] as? String {
+                let maxPx = (body["maxPx"] as? Int) ?? 1440
+                pendingCaptures.append((id: id, maxPx: maxPx))
+            }
+        case "deletePhoto":
+            if let id = body["id"] as? String {
+                let safe = String(id.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+                try? FileManager.default.removeItem(at: AppScheme.photosDir.appendingPathComponent("\(safe).jpg"))
+            }
         case "reset":
             startSession()
         case "preview":
@@ -309,6 +383,14 @@ enum AppScheme {
     static let host = "app"
     static var indexURL: URL { URL(string: "\(name)://\(host)/index.html")! }
     static var root: URL { Bundle.main.bundleURL.appendingPathComponent("www") }
+
+    /// Documents/photos — created on first use.
+    static var photosDir: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("photos", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
 }
 
 /// Serves `www/` from the app bundle over a custom scheme. WKWebView treats a
@@ -330,7 +412,18 @@ final class BundleSchemeHandler: NSObject, WKURLSchemeHandler {
         var rel = url.path
         if rel.isEmpty || rel == "/" { rel = "/index.html" }
         // A query string is cache-busting, never part of the path.
-        let file = AppScheme.root.appendingPathComponent(rel)
+        // Photographs are served from Documents, everything else from the bundle.
+        let photoPrefix = "/_photos/"
+        let file: URL
+        if rel.hasPrefix(photoPrefix) {
+            let name = String(rel.dropFirst(photoPrefix.count))
+            guard !name.contains("/"), !name.contains("..") else {
+                task.didFailWithError(SchemeError.badURL); return
+            }
+            file = AppScheme.photosDir.appendingPathComponent(name)
+        } else {
+            file = AppScheme.root.appendingPathComponent(rel)
+        }
 
         guard let data = try? Data(contentsOf: file) else {
             task.didFailWithError(SchemeError.notFound(rel))
