@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.28.0';
+var VERSION = '1.29.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -799,6 +799,25 @@ function paintLevelHud() {
           : 'still moving — ' + l.spread.toFixed(1) + '°';
     }
   }
+}
+
+/* True when ARKit is driving the camera: the shell is present, the session is
+   tracking, and therefore the web camera is neither available nor wanted. Every
+   native branch in this file hangs off this one question. */
+function nativeAR() {
+  return !!(window.EENative && EENative.arkit);
+}
+
+/* The frame geometry the live overlay should assume. With the web camera it is
+   the video's own pixels; under ARKit it is the portrait frame the shell hands
+   back, which the AR view behind the page renders with the same aspect-fill the
+   canvas uses — so the two align without computing a crop. */
+function liveFrameSize() {
+  var v = $('#live-video');
+  if (v && v.videoWidth) return { w: v.videoWidth, h: v.videoHeight };
+  var lens = window.EENative && EENative.lens;
+  if (lens) return { w: Math.min(lens.w, lens.h), h: Math.max(lens.w, lens.h) };
+  return null;
 }
 
 /* The normal a shot should be measured against.
@@ -1858,7 +1877,7 @@ function tplCapture() {
     '<div class="full-head"><span class="ftitle">CAPTURE</span>' +
     '<button class="close-btn" data-act="close-capture">×</button></div>' +
     '<div class="full-body">' +
-    (c.err ? '' : '<video id="cam-video" autoplay playsinline muted></video>') +
+    (c.err || nativeAR() ? '' : '<video id="cam-video" autoplay playsinline muted></video>') +
     '</div>' +
     '<div class="full-foot">' + foot + '</div></div>';
 }
@@ -1958,7 +1977,8 @@ function tplLive() {
     '<div class="full-head"><span class="ftitle">LIVE — DRIFT CHECK</span>' +
     '<button class="close-btn" data-act="close-live">×</button></div>' +
     '<div class="full-body">' +
-    (l.err ? '' : '<video id="live-video" autoplay playsinline muted></video><canvas id="live-canvas"></canvas>') +
+    (l.err ? '' : (nativeAR() ? '' : '<video id="live-video" autoplay playsinline muted></video>') +
+      '<canvas id="live-canvas"></canvas>') +
     '</div>' +
     '<div class="full-foot">' + foot + '</div></div>';
 }
@@ -2157,6 +2177,17 @@ function panelCornersFromBlob(blob, DW, DH, scale) {
 function liveAnchorTick() {
   var p = currentProject(), l = ui.live;
   if (!p || !l) return;
+  /* ARKit reports position continuously and to a centimetre; hunting for the
+     panel would be a worse answer to a question already answered. */
+  if (nativeAR()) {
+    var np = EENative.pose;
+    l.anchorSeen = !!np;
+    if (np) {
+      l.anchor = { pos: { x: np.pos.x, y: np.pos.y }, camH: np.pos.z, rms: 0, at: performance.now() };
+      l.pivot0 = null; l.pivotLast = null;      /* no arm-arc guess needed */
+    }
+    return;
+  }
   var v = $('#live-video');
   if (!v || !v.videoWidth || !ui.sensors.live) return;
   var st = findStation(p, l.stationId);
@@ -2208,14 +2239,17 @@ function liveCamOffset(l, R) {
 function paintLive() {
   var p = currentProject(), l = ui.live;
   if (!p || !l) return;
-  var v = $('#live-video'), cv = $('#live-canvas');
-  if (!v || !cv || !v.videoWidth) return;
+  var cv = $('#live-canvas');
+  var fr = liveFrameSize();
+  if (!cv || !fr) return;
   var st = findStation(p, l.stationId);
   if (!st || !st.cal || !st.cal.ok) return;
 
-  /* The canvas takes the video's own pixel dimensions and the same object-fit, so
-     overlay and image align without ever computing the cover crop. */
-  if (cv.width !== v.videoWidth) { cv.width = v.videoWidth; cv.height = v.videoHeight; }
+  /* The canvas takes the frame's own pixel dimensions and the same object-fit,
+     so overlay and image align without ever computing the cover crop. Under
+     ARKit the frame is the shell's portrait capture and the AR view behind the
+     page fills the same way. */
+  if (cv.width !== fr.w) { cv.width = fr.w; cv.height = fr.h; }
   var W = cv.width, H = cv.height;
   var g = cv.getContext('2d');
   g.setTransform(1, 0, 0, 1, 0, 0);
@@ -4358,6 +4392,8 @@ function bindLive() {
   var yaw = $('#live-yaw');
   if (yaw) yaw.oninput = function () { l.yaw = parseFloat(yaw.value) || 0; paintLive(); };
 
+  if (nativeAR()) { paintLive(); return; }   /* the shell draws the camera */
+
   var v = $('#live-video');
   if (!v) return;
   if (l.stream) { v.srcObject = l.stream; v.onloadedmetadata = function () { paintLive(); }; return; }
@@ -4968,6 +5004,18 @@ function openCapture() {
 }
 
 function startCamera() {
+  /* ARKit already holds the rear camera and is drawing it behind this page.
+     Asking getUserMedia for it now would fail, and succeeding would be worse:
+     two capture sessions fighting over one lens. */
+  if (nativeAR()) {
+    var lens = EENative.lens || {};
+    ui.cap.cam = {
+      label: 'ARKit (factory intrinsics)',
+      w: lens.w || 0, h: lens.h || 0, id: EENative.sessionId || ''
+    };
+    ui.cap.ready = true;
+    return render();
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     ui.cap.err = 'This browser exposes no camera. Open Eagle Eye over https in Safari.';
     return render();
@@ -5050,22 +5098,94 @@ function closeCapture() {
   render();
 }
 
+/* Acquire a frame from whichever camera this build actually has, then commit
+   it. Split from commitShot because the two sources differ in exactly one way
+   that matters: ARKit's arrives asynchronously and brings its own pose. */
 function shoot() {
-  var p = currentProject();
+  if (nativeAR()) {
+    EENative.captureFrame(function (frame) {
+      if (!frame || !frame.jpeg) return toast('ARKit returned no frame — is tracking still settling?');
+      EENative.frameToImage(frame, function (img) {
+        if (!img) return toast('Could not decode the captured frame');
+        commitShot(img, frame.w, frame.h, frame);
+      });
+    });
+    return;
+  }
   var v = $('#cam-video');
   if (!v || !v.videoWidth) return toast('Camera is not ready yet');
+  commitShot(v, v.videoWidth, v.videoHeight, null);
+}
 
+/* Everything a shot gains from having been taken by ARKit rather than by a
+   camera that does not know where it is. Separated from commitShot so it can be
+   exercised without a canvas, a blob or a database. */
+function applyArPose(p, st, arFrame) {
+  if (!arFrame || !arFrame.pose) return st;
+
+  /* Where the camera stood, in metres, in that session's own world frame. */
+  st.arPos = { x: arFrame.pose.pos.x, y: arFrame.pose.pos.y, z: arFrame.pose.pos.z };
+  st.arSession = arFrame.sessionId || null;
+
+  /* THE POINT OF GOING NATIVE. In ray mode a station's plan frame is already
+     world-aligned — east and north — with the camera at its origin, so placing
+     it in the project frame is a pure translation by the camera's position,
+     with no rotation at all. No landmarks, no panel, no ties: shots taken in
+     one ARKit session were never apart.
+
+     Within one session only. A cold start drops the world origin wherever the
+     phone happened to be, so a project already holding shots from an earlier
+     session falls back to the tie machinery rather than stacking two unrelated
+     frames on top of each other. */
+  var sameWorld = !!st.arSession && p.stations.every(function (s2) {
+    return s2 === st || !s2.reg || s2.arSession === st.arSession;
+  });
+  if (sameWorld) {
+    st.reg = { theta: 0, tx: st.arPos.x, ty: st.arPos.y, rms: 0, n: 0, method: 'arkit' };
+  }
+
+  /* Height above ARKit's detected floor is a measurement rather than a guess,
+     so when a floor exists the shot arrives already calibrated and the capture
+     screen hands straight over to tracing. */
+  var floorZ = (window.EENative && EENative.floorY != null) ? EENative.floorY : null;
+  if (floorZ != null) {
+    var camH = st.arPos.z - floorZ;
+    if (camH > 0.3 && camH < 4) {
+      st.cal = {
+        mode: 'ray', camH: camH, f: stationF(st), ok: true, source: 'arkit',
+        provisionalScale: false
+      };
+    }
+  }
+  return st;
+}
+
+/* `src` is anything canvas can draw — a <video> from getUserMedia, or an <img>
+   decoded from ARKit's capture. `arFrame`, when present, carries the pose the
+   photograph was taken at, which is worth more than everything the sensor path
+   reconstructs after the fact. */
+function commitShot(src, natW, natH, arFrame) {
+  var p = currentProject();
   var s = db.settings;
-  var scale = Math.min(1, s.maxPx / Math.max(v.videoWidth, v.videoHeight));
-  var W = Math.round(v.videoWidth * scale), H = Math.round(v.videoHeight * scale);
+  var scale = Math.min(1, s.maxPx / Math.max(natW, natH));
+  var W = Math.round(natW * scale), H = Math.round(natH * scale);
   var cv = document.createElement('canvas');
   cv.width = W; cv.height = H;
-  cv.getContext('2d').drawImage(v, 0, 0, W, H);
+  cv.getContext('2d').drawImage(src, 0, 0, W, H);
 
   var st = {
     id: uid('s'), createdAt: Date.now(),
     imgW: W, imgH: H, screenAngle: screenAngle(),
     att: (function () {
+      /* ARKit's attitude belongs to this exact frame: no shutter jerk to
+         subtract, no pre-tap window to guess at, no per-device bias to trim. */
+      if (arFrame && arFrame.pose) {
+        return {
+          alpha: arFrame.pose.alpha, beta: arFrame.pose.beta, gamma: arFrame.pose.gamma,
+          heading: ui.sensors.heading, headingAcc: ui.sensors.headingAcc,
+          preTap: true, wobble: 0, arkit: true
+        };
+      }
       if (!ui.sensors.live) return null;
       var pre = preTapAttitude(performance.now());
       if (pre && pre.wobble > 30) {
@@ -5088,6 +5208,8 @@ function shoot() {
     cal: null, reg: null
   };
 
+  applyArPose(p, st, arFrame);
+
   cv.toBlob(function (blob) {
     if (!blob) return toast('Could not save the frame');
     IDB.put(photoKey(st.id), blob).then(function () {
@@ -5098,6 +5220,12 @@ function shoot() {
 
       if (ui.cap && ui.cap.stream) ui.cap.stream.getTracks().forEach(function (t) { t.stop(); });
       ui.cap = null; stopGps();
+      if (st.cal && st.cal.source === 'arkit') {
+        toast('Shot placed and calibrated by ARKit — camera ' +
+          EE.fmtLen(st.cal.camH, U(), 2) + ' above the floor. Trace away.');
+      } else if (st.reg && st.reg.method === 'arkit') {
+        toast('Shot placed by ARKit. Calibrate it and it joins the survey with no ties.');
+      }
       openTrace(st.id);
     });
   }, 'image/jpeg', s.jpegQ);

@@ -570,3 +570,25 @@ textarea.inp { min-height: 72px; resize: vertical; }
   .add-card { grid-column: 1 / -1; }
   .row3 { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ============ native AR: the page goes clear ============
+
+   In the native shell an ARSCNView draws the live camera BEHIND this page.
+   Everywhere else the app paints its own ground, so the class is toggled on
+   only for the capture and live screens — otherwise the home screen would have
+   a roof moving about behind it. The head and foot chrome keep their gradients:
+   they are what makes the readouts legible over a bright sky. */
+.ee-ar-live,
+.ee-ar-live body,
+.ee-ar-live #app,
+.ee-ar-live #app.wide,
+.ee-ar-live .full,
+.ee-ar-live .full-body,
+.ee-ar-live .stage {
+  background: transparent !important;
+}
+/* The video element is absent under ARKit; the canvas overlay must not paint a
+   ground of its own either. */
+.ee-ar-live .full-body > canvas {
+  background: transparent !important;
+}

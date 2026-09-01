@@ -31,7 +31,13 @@
     tracking: 'initializing',
     lens: null,          /* {fov, fx, w, h} once intrinsics arrive */
     floorY: null,        /* ARKit's detected floor, app-frame z */
-    lastAt: 0
+    lastAt: 0,
+    arkit: false,        /* true once ARKit is genuinely tracking */
+    /* New for every ARSession. Positions only mean anything within one: a cold
+       start puts the world origin wherever the phone happens to be, so shots
+       from two sessions must never be registered against each other by
+       position. Stored on every shot, compared before auto-registering. */
+    sessionId: null
   };
 
   var send = function (msg) { try { post.postMessage(msg); } catch (e) { } };
@@ -41,11 +47,15 @@
      ui.sensors is exactly where the sensor path deposited its readings, so
      writing it here means every consumer — attMatrix, the capture HUD, the
      live overlay — is fed by ARKit without knowing anything changed. */
-  window.__eeNativePose = function (m, tracking, fx, w, h) {
+  window.__eeNativePose = function (m, tracking, fx, w, h, sessionId) {
     var pose = EE.arkitPose(m);
     if (!pose) return;
     N.pose = pose;
     N.tracking = tracking || 'normal';
+    N.sessionId = sessionId || N.sessionId;
+    /* 'normal' is ARKit saying the pose is trustworthy. Anything else and the
+       position is a guess, so the app must not register shots against it. */
+    N.arkit = N.tracking === 'normal';
     N.lastAt = performance.now();     /* the clock preTapAttitude compares against */
 
     if (window.ui && ui.sensors) {
@@ -99,12 +109,31 @@
      born already registered. Returns a promise; the phase-2 capture path
      consumes it in place of the canvas grab. */
   var pending = {}, seq = 0;
-  window.__eeNativeFrame = function (id, jpegB64, m, fx, w, h) {
+  window.__eeNativeFrame = function (id, jpegB64, m, fx, w, h, sessionId) {
     var cb = pending[id];
     delete pending[id];
     if (!cb) return;
-    cb({ jpeg: jpegB64, pose: EE.arkitPose(m), fx: fx, w: w, h: h });
+    cb({
+      jpeg: jpegB64, pose: EE.arkitPose(m), fx: fx, w: w, h: h,
+      sessionId: sessionId || N.sessionId
+    });
   };
+
+  /* A captured frame as something canvas can draw. The shell hands back base64
+     rather than a blob URL because a data: URL crosses the bridge as plain
+     text and needs no lifetime management on either side. */
+  N.frameToImage = function (frame, cb) {
+    if (!frame || !frame.jpeg) return cb(null);
+    var img = new Image();
+    img.onload = function () { cb(img, frame); };
+    img.onerror = function () { cb(null); };
+    img.src = 'data:image/jpeg;base64,' + frame.jpeg;
+  };
+
+  /* Ask the shell to draw the camera, or stop. The feed is only wanted on the
+     capture and live screens; everywhere else the page paints its own ground
+     and the AR view is power burnt behind it. */
+  N.preview = function (on) { send({ cmd: 'preview', on: !!on }); };
   /* Callback first — the rest of this app is ES5 and callback-shaped, and a
      callback is testable without an event loop. A promise is returned too
      where the platform has one. */
@@ -127,6 +156,31 @@
 
   /* The shell owns motion; never ask iOS for the web permission. */
   window.needsMotionPermission = function () { return false; };
+
+  /* The page is opaque everywhere except the camera screens, where it must go
+     clear for the AR view behind it to show. Toggled after every render rather
+     than inside app.js, so the whole bridge stays additive. */
+  var wrapRender = function () {
+    var orig = window.render;
+    if (typeof orig !== 'function' || orig.__eeWrapped) return;
+    var wrapped = function () {
+      var r = orig.apply(this, arguments);
+      try {
+        var camScreen = window.view &&
+          (view.screen === 'capture' || view.screen === 'live');
+        var want = !!(N.arkit && camScreen);
+        if (want !== wrapped.__last) {
+          wrapped.__last = want;
+          document.documentElement.classList.toggle('ee-ar-live', want);
+          N.preview(want);
+        }
+      } catch (e) { }
+      return r;
+    };
+    wrapped.__eeWrapped = true;
+    window.render = wrapped;
+  };
+  wrapRender();
 
   send({ cmd: 'ready' });
 })();

@@ -163,11 +163,23 @@ Same two commands the runner uses.
 
 ## Phases
 
-1. **Shell** — the current app, installable, no ARKit dependence. Proves signing,
-   TestFlight and the bundle. *This is what the scaffold builds today.*
-2. **ARKit inputs** — `native.js` is already wired for it: pose into `ui.sensors`,
-   factory intrinsics into `fovByFrame`. Every existing screen gets better
-   without being rewritten.
+1. **Shell** — the app, installable, no ARKit dependence. Proved signing,
+   TestFlight and the bundle. *Shipped as build 5.*
+2. **ARKit owns the camera** — *shipped.* An `ARSCNView` draws the live frame
+   behind a transparent web view, `shoot()` is served from the same session, and
+   the web app never calls `getUserMedia` at all. Each shot carries the pose it
+   was taken at, so: attitude with no shutter jerk and no per-device bias, the
+   lens from factory intrinsics, and — the part no web build could ever do — the
+   camera's metric position. A shot taken in an ARKit session **places itself**:
+   in ray mode a station's plan frame is already east/north with the camera at
+   its origin, so registration is a pure translation and no rotation. No
+   landmarks, no panel, no ties. Where ARKit has found a floor, the shot is also
+   **already calibrated** from its measured height above it, and capture hands
+   straight over to tracing.
+
+   Positions only mean anything inside one session, so every shot records its
+   session id and a project holding older shots falls back to the tie machinery
+   rather than stacking two unrelated world frames.
 3. **Walk-capture** — `EENative.captureFrame()` returns a JPEG and the pose it
    was taken at, so a shot is born registered; keyframes bank automatically on
    travel or turn. Tapping moves off the roof and into review.

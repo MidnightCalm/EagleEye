@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import ARKit
+import SceneKit
 import CoreImage
 import simd
 
@@ -17,12 +18,21 @@ final class SurveyViewController: UIViewController {
 
     private var webView: WKWebView!
 
-    /// Phase 1 is signing, TestFlight and the bundle — nothing else. ARKit and
-    /// WKWebView's getUserMedia cannot both hold the rear camera, and this
-    /// shell draws no preview of its own, so with ARKit running the capture
-    /// screen would go black. Flip this with phase 2, once the shell serves
-    /// shoot()'s frames itself.
-    private let arkitEnabled = false
+    /// Phase 2: ARKit owns the camera. An ARSCNView behind a transparent web
+    /// view draws the live frame, and shoot() is served from the same session
+    /// — so the photograph and the pose it is measured against are one
+    /// instant, and the web app never calls getUserMedia at all.
+    /// Set false to fall back to the phase-1 shell: the web camera returns and
+    /// everything still works, just without pose or factory intrinsics.
+    private let arkitEnabled = true
+
+    private var arView: ARSCNView!
+
+    /// New every ARSession. Positions are only comparable within one: a cold
+    /// start puts the world origin wherever the phone happens to be, so shots
+    /// from different sessions must never be registered against each other by
+    /// position alone.
+    private let sessionId = UUID().uuidString
 
     private let session = ARSession()
     private var lastPush: TimeInterval = 0
@@ -38,6 +48,7 @@ final class SurveyViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 0.039, green: 0.035, blue: 0.051, alpha: 1) // --lx-bg
+        if arkitEnabled { buildARView() }
         buildWebView()
         session.delegate = self
     }
@@ -54,6 +65,19 @@ final class SurveyViewController: UIViewController {
 
     override var prefersStatusBarHidden: Bool { false }
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    // MARK: - the camera behind the page
+
+    private func buildARView() {
+        arView = ARSCNView(frame: view.bounds)
+        arView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        arView.session = session                 // shares the session we drive
+        arView.automaticallyUpdatesLighting = false
+        arView.rendersContinuously = true
+        arView.isUserInteractionEnabled = false  // every touch belongs to the page
+        arView.isHidden = true                   // shown only on camera screens
+        view.addSubview(arView)
+    }
 
     // MARK: - web
 
@@ -72,8 +96,12 @@ final class SurveyViewController: UIViewController {
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         webView.scrollView.bounces = false
         webView.scrollView.contentInsetAdjustmentBehavior = .never
+        // Transparent, so the ARSCNView shows through wherever the page does
+        // not paint. The page paints its own ground everywhere EXCEPT the
+        // camera screens, which go clear under the .ee-ar-live class.
         webView.isOpaque = false
-        webView.backgroundColor = view.backgroundColor
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
         if #available(iOS 16.4, *) { webView.isInspectable = true }   // Safari devtools over USB
         view.addSubview(webView)
 
@@ -116,12 +144,26 @@ final class SurveyViewController: UIViewController {
         }
     }
 
-    /// The captured frame as JPEG, in the orientation the buffer arrives in.
-    private func jpeg(from pixelBuffer: CVPixelBuffer, quality: CGFloat = 0.72) -> String? {
+    /// The captured frame as a PORTRAIT JPEG, base64, with the dimensions it
+    /// ended up with. ARKit hands over a landscape buffer regardless of how the
+    /// device is held; the app is portrait-locked and its geometry assumes the
+    /// photograph matches the interface, so the rotation is baked in here once
+    /// rather than compensated for in four places later.
+    private func portraitJPEG(from pixelBuffer: CVPixelBuffer,
+                              quality: CGFloat = 0.72) -> (b64: String, width: Int, height: Int)? {
         let ci = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return nil }
-        let data = UIImage(cgImage: cg).jpegData(compressionQuality: quality)
-        return data?.base64EncodedString()
+
+        // .right turns a landscape sensor buffer upright for a portrait UI.
+        let rotated = UIImage(cgImage: cg, scale: 1, orientation: .right)
+        let size = rotated.size
+        UIGraphicsBeginImageContextWithOptions(size, true, 1)
+        rotated.draw(in: CGRect(origin: .zero, size: size))
+        let baked = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        guard let out = baked, let data = out.jpegData(compressionQuality: quality) else { return nil }
+        return (data.base64EncodedString(), Int(size.width), Int(size.height))
     }
 }
 
@@ -139,12 +181,15 @@ extension SurveyViewController: ARSessionDelegate {
             pendingCaptures.removeAll()
             let m = frame.camera.transform.jsArray
             let k = frame.camera.intrinsics
-            let size = frame.camera.imageResolution
-            if let b64 = jpeg(from: frame.capturedImage) {
+            // The captured buffer is always landscape (1920x1440) whatever the
+            // device is doing; the app is portrait and its geometry assumes the
+            // frame matches. Rotate once here so every downstream consumer —
+            // screenAngle, the lens table, the tap maths — stays as written.
+            if let shot = portraitJPEG(from: frame.capturedImage) {
                 for id in ids {
                     evaluate("window.__eeNativeFrame && window.__eeNativeFrame("
-                             + "\(id.jsQuoted), \(b64.jsQuoted), \(m), \(k.columns.0.x), "
-                             + "\(Int(size.width)), \(Int(size.height)));")
+                             + "\(id.jsQuoted), \(shot.b64.jsQuoted), \(m), \(k.columns.0.x), "
+                             + "\(shot.width), \(shot.height), \(sessionId.jsQuoted));")
                 }
             }
         }
@@ -156,8 +201,11 @@ extension SurveyViewController: ARSessionDelegate {
         let fx = frame.camera.intrinsics.columns.0.x
         let size = frame.camera.imageResolution
         let state = trackingWord(frame.camera.trackingState).jsQuoted
+        // Portrait dimensions, matching what portraitJPEG will hand back, so
+        // the lens lands under the frame size the photographs actually carry.
         evaluate("window.__eeNativePose && window.__eeNativePose("
-                 + "\(m), \(state), \(fx), \(Int(size.width)), \(Int(size.height)));")
+                 + "\(m), \(state), \(fx), \(Int(size.height)), \(Int(size.width)), "
+                 + "\(sessionId.jsQuoted));")
     }
 
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
@@ -198,6 +246,12 @@ extension SurveyViewController: WKScriptMessageHandler {
             if let id = body["id"] as? String { pendingCaptures.append(id) }
         case "reset":
             startSession()
+        case "preview":
+            // The camera feed is only wanted on the capture and live screens;
+            // everywhere else the page paints its own ground and the AR view is
+            // wasted power behind it.
+            let on = (body["on"] as? Bool) ?? false
+            DispatchQueue.main.async { self.arView?.isHidden = !on }
         default:
             break
         }
