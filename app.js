@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.29.2';
+var VERSION = '1.30.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1891,6 +1891,17 @@ function tplCapture() {
       '<div class="mark" id="tilt-mark" style="left:' + clamp(tiltDeg(), 0, 90) / 90 * 100 + '%"></div></div>' +
       '<div class="pill tiny" id="plumb-chip" style="align-self:flex-start;display:none"></div>' +
       '<div class="hint" id="cap-hint">' + captureHint() + '</div>' +
+      (nativeAR()
+        ? '<div class="live-row" style="justify-content:center">' +
+          '<button class="pill tiny' + (c.auto ? ' on' : '') + '" data-act="auto-cap">' +
+          (c.auto ? '◉ recording · ' + (c.count || 0) + ' banked' : '○ Walk and record') +
+          '</button>' +
+          (c.count ? '<button class="pill tiny gold" data-act="auto-done">Done · review</button>' : '') +
+          '</div>' +
+          (c.auto ? '<div class="hint">Walk the roof at a normal pace. A frame banks every ' +
+            'half-stride or glance — each one already knows where it was taken, so they need no ' +
+            'tying together afterwards.</div>' : '')
+        : '') +
       '<div class="shutter-row"><button class="shutter" data-act="shoot"' +
       ((c.ready && trackingOk()) ? '' : ' disabled') + '><div></div></button></div>';
   }
@@ -1906,6 +1917,53 @@ function tplCapture() {
 function attCell(label, val, cls) {
   return '<div class="att-cell ' + (cls || '') + '"><div class="al">' + label + '</div><div class="av">' + val + '</div></div>';
 }
+/* ================= walk-and-bank =================
+
+   A roof is not a sequence of decisions about where to stand; it is a walk.
+   With ARKit reporting position continuously there is no reason to make
+   someone tap for every frame — the app can bank one whenever the view has
+   actually changed enough to be worth keeping.
+
+   Distance OR rotation, not a timer: standing still adds nothing but storage,
+   and a slow sweep from one spot is exactly when a timer under-samples. */
+var AUTO_MOVE_M = 0.35;      /* a half-stride */
+var AUTO_TURN_DEG = 18;      /* a glance */
+var AUTO_MIN_MS = 900;       /* never faster than this, whatever the motion */
+var AUTO_MAX_SHOTS = 80;     /* a roof, not a film */
+
+function autoCaptureTick() {
+  var c = ui.cap;
+  if (!c || !c.auto || c.busy) return;
+  if (!nativeAR() || !trackingOk() || !c.ready) return;
+  var pose = EENative.pose;
+  if (!pose) return;
+
+  var now = performance.now();
+  var last = c.lastAuto;
+  if (last) {
+    if (now - last.t < AUTO_MIN_MS) return;
+    var moved = Math.hypot(pose.pos.x - last.pos.x, pose.pos.y - last.pos.y,
+      pose.pos.z - last.pos.z);
+    var turned = EE.quatAngleDeg(
+      EE.quatFromOrientation(last.alpha, last.beta, last.gamma),
+      EE.quatFromOrientation(pose.alpha, pose.beta, pose.gamma));
+    if (moved < AUTO_MOVE_M && turned < AUTO_TURN_DEG) return;
+  }
+
+  if ((c.count || 0) >= AUTO_MAX_SHOTS) {
+    c.auto = false;
+    toast('Banked ' + c.count + ' frames — that is plenty for one walk. Review them, then start again if you need more.');
+    return render();
+  }
+
+  c.busy = true;
+  c.lastAuto = {
+    t: now, pos: { x: pose.pos.x, y: pose.pos.y, z: pose.pos.z },
+    alpha: pose.alpha, beta: pose.beta, gamma: pose.gamma
+  };
+  shoot();
+}
+
 /* Whether the pose behind the readouts is one to measure against. The web
    sensor is always "ok" in this sense — it has no notion of confidence — while
    ARKit reports honestly that it is still initialising or relocalising. */
@@ -4831,6 +4889,29 @@ function handle(el, e) {
       return render();
     }
     case 'apply-quad': return applyQuad();
+    case 'auto-cap': {
+      if (!ui.cap) return;
+      ui.cap.auto = !ui.cap.auto;
+      ui.cap.lastAuto = null;
+      if (ui.cap.auto) {
+        ui.cap.count = ui.cap.count || 0;
+        if (!ui.cap.autoTimer) ui.cap.autoTimer = setInterval(autoCaptureTick, 250);
+        toast('Recording. Walk the roof — frames bank themselves.');
+      } else {
+        clearInterval(ui.cap.autoTimer); ui.cap.autoTimer = null;
+      }
+      return render();
+    }
+    case 'auto-done': {
+      if (!ui.cap) return;
+      clearInterval(ui.cap.autoTimer);
+      var n = ui.cap.count || 0;
+      ui.cap = null; stopGps();
+      view.screen = 'project'; view.tab = 'plan';
+      ui.plan.fitted = false;
+      toast(n + ' frames banked and placed. Trace what you need from any of them.');
+      return render();
+    }
     case 'apply-hex': return applyHex();
     case 'apply-map': return applyMap();
     case 'apply-ball': return applyBall();
@@ -5149,6 +5230,7 @@ function saveScaleRef() {
 }
 
 function closeCapture() {
+  if (ui.cap && ui.cap.autoTimer) clearInterval(ui.cap.autoTimer);
   if (ui.cap && ui.cap.stream) ui.cap.stream.getTracks().forEach(function (t) { t.stop(); });
   ui.cap = null;
   stopGps();
@@ -5162,9 +5244,15 @@ function closeCapture() {
 function shoot() {
   if (nativeAR()) {
     EENative.captureFrame(function (frame) {
-      if (!frame || !frame.jpeg) return toast('ARKit returned no frame — is tracking still settling?');
+      if (!frame || !frame.jpeg) {
+        if (ui.cap) ui.cap.busy = false;
+        return toast('ARKit returned no frame — is tracking still settling?');
+      }
       EENative.frameToImage(frame, function (img) {
-        if (!img) return toast('Could not decode the captured frame');
+        if (!img) {
+          if (ui.cap) ui.cap.busy = false;
+          return toast('Could not decode the captured frame');
+        }
         commitShot(img, frame.w, frame.h, frame);
       });
     });
@@ -5269,12 +5357,24 @@ function commitShot(src, natW, natH, arFrame) {
   applyArPose(p, st, arFrame);
 
   cv.toBlob(function (blob) {
-    if (!blob) return toast('Could not save the frame');
+    if (!blob) {
+      if (ui.cap) ui.cap.busy = false;
+      return toast('Could not save the frame');
+    }
     IDB.put(photoKey(st.id), blob).then(function () {
       p.stations.push(st);
       ensureOrigin(p);
       touchProject(p); save();
       refreshStorage();
+
+      /* Recording: bank it and stay put. Opening the trace screen after every
+         frame would make walking impossible, which is the whole point. */
+      if (ui.cap && ui.cap.auto) {
+        ui.cap.count = (ui.cap.count || 0) + 1;
+        ui.cap.busy = false;
+        buzz(12);
+        return render();
+      }
 
       if (ui.cap && ui.cap.stream) ui.cap.stream.getTracks().forEach(function (t) { t.stop(); });
       ui.cap = null; stopGps();
