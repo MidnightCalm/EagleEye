@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.29.0';
+var VERSION = '1.29.1';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -723,9 +723,30 @@ function tickLevel() {
   });
   while (l.samples.length && l.samples[0].t < now - LEVEL_WINDOW) l.samples.shift();
 
+  /* Stillness is measured on GRAVITY AS THE DEVICE SEES IT, not on the whole
+     attitude. What is being recorded is where flat is, and that is a question
+     about the phone's orientation with respect to down — nothing to do with
+     which way it is pointing.
+
+     Yaw is the least trustworthy number the phone produces, and it is worst in
+     exactly the pose this feature requires: a phone lying flat has its screen
+     axis along gravity, the degenerate case for the alpha/gamma pair, and the
+     heading behind alpha is magnetic — so on a steel roof, or a desk with a
+     laptop on it, alpha swings tens of degrees while the phone sits perfectly
+     still. Judging stillness on the full attitude counted every bit of that as
+     wobble and refused to settle: the "volatile, takes forever" the field
+     reported.
+
+     Even the world-frame normal is not enough, because a TILTED phone's normal
+     sweeps a cone as yaw turns. Gravity in the DEVICE frame is the honest
+     measure — it answers "is the phone physically moving?" and nothing else,
+     and it cannot be perturbed by heading at all. */
+  var g0 = gravityDev(l.samples[0].a, l.samples[0].b, l.samples[0].g);
   var spread = 0;
   for (var i = 1; i < l.samples.length; i++) {
-    spread = Math.max(spread, EE.quatAngleDeg(l.samples[0].q, l.samples[i].q));
+    var gi = gravityDev(l.samples[i].a, l.samples[i].b, l.samples[i].g);
+    var d = g0[0] * gi[0] + g0[1] * gi[1] + g0[2] * gi[2];
+    spread = Math.max(spread, Math.acos(Math.min(1, Math.max(-1, d))) * 180 / Math.PI);
   }
   l.spread = spread;
   var span = l.samples.length > 1 ? l.samples[l.samples.length - 1].t - l.samples[0].t : 0;
@@ -5014,6 +5035,17 @@ function startCamera() {
       w: lens.w || 0, h: lens.h || 0, id: EENative.sessionId || ''
     };
     ui.cap.ready = true;
+    return render();
+  }
+  /* Inside the native shell with ARKit not yet tracking. Falling through to
+     getUserMedia here is how the shutter ends up permanently dead with no
+     explanation: WebKit does not treat a custom scheme as a secure context, so
+     the web camera cannot start in the shell at all — the AR session is the
+     only camera there is. Say so, and say what to do about it. */
+  if (window.EENative && !EENative.arkit) {
+    ui.cap.err = 'Waiting for ARKit to start tracking — move the phone slowly so it '
+      + 'can see some texture. If this does not clear, the session failed to start '
+      + '(tracking: ' + (EENative.tracking || 'unknown') + ').';
     return render();
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
