@@ -188,6 +188,22 @@ Same two commands the runner uses.
    at known heights. Confirm, name, export. Plus DXF for CAD, and the LiDAR mesh
    as a bonus where sunlight allows.
 
+## Phase 3, so far
+
+Shipped in 1.32.0: **review mode** (proposals dashed on the plan, Keep / Discard per
+object, Keep all / Discard all, a checklist item counting them; nothing proposed
+is exported), **merged units** (ARKit sees one RTU top as two or three planes —
+touching planes at one height become one box), **the parapet** (vertical planes
+standing on the deck chain into a proposed roof outline; convex for now, so an
+L-shaped roof gets its notch drawn back in by hand), and **photos optional** while
+walking and recording (every frame / one per 5 m / none — the surfaces carry the
+model either way).
+
+Not yet, deliberately: the **LiDAR mesh** (box-fitting what planes miss, OBJ/USDZ
+export) needs a site's worth of real mesh data before the fitting is worth
+writing; and **landscape** stays off until the model no longer depends on the
+photographs the shell rotates.
+
 ## What is verified, and what is not
 
 The coordinate conversions are proven in `../eagle-eye/tools/test-geo.html`:

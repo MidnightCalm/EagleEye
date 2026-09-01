@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.31.0';
+var VERSION = '1.32.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -90,6 +90,7 @@ var DEFAULTS = {
   cornerSnap: true,
   circleSegments: 24,
   maxPx: 1440,
+  recordPhotos: 'all',         /* all | sparse | none — while walking and recording under ARKit */
   jpegQ: 0.72,
 
   /* The survey's declared error model. These three numbers decide the trusted
@@ -1344,6 +1345,10 @@ function buildChecklist(p) {
   if (noH.length) add('block', noH.length + (noH.length === 1 ? ' object has no height' : ' objects have no height'),
     'HelioScope needs a height for every obstruction. Measure with the height tool or type it.', 'object', noH[0].id);
 
+  var props = p.objects.filter(function (o) { return o.proposed; });
+  if (props.length) add('warn', props.length + (props.length === 1 ? ' surface proposed by ARKit' : ' surfaces proposed by ARKit'),
+    'Dashed on the plan. Keep the real units and the outline, discard the rest \u2014 nothing proposed is exported.', 'object', props[0].id);
+
   var far = [];
   var tr = trustedRadius(typicalCamH(p));
   p.objects.forEach(function (o) {
@@ -1688,6 +1693,14 @@ function tplPlan(p) {
     (unplaced.length ? '<button class="pill" style="border-color:rgba(201,106,94,.6);color:var(--red-light)" data-act="place-station" data-id="' + unplaced[0].id + '">' +
       unplaced.length + ' shot' + (unplaced.length > 1 ? 's' : '') + ' unplaced — tap to place</button>' : '') +
     (ui.sel ? '<button class="pill gold" data-act="edit-object" data-id="' + ui.sel + '">Edit selected</button>' : '') +
+    (function () {
+      var n = p.objects.filter(function (o) { return o.proposed; }).length;
+      if (!n) return '';
+      return '<button class="pill" style="border-color:rgba(157,140,255,.6);color:var(--purple-light)">' +
+        n + ' proposed by ARKit \u2014 tap one to keep or discard it</button>' +
+        '<button class="pill tiny" data-act="keep-proposals">Keep all</button>' +
+        '<button class="pill tiny" data-act="discard-proposals">Discard all</button>';
+    })() +
     '</div>' +
     '<div class="stage-chrome">' +
     '<button class="pill" data-act="plan-fit">Fit</button>' +
@@ -1945,9 +1958,9 @@ function tplCapture() {
       (nativeAR()
         ? '<div class="live-row" style="justify-content:center">' +
           '<button class="pill tiny' + (c.auto ? ' on' : '') + '" data-act="auto-cap">' +
-          (c.auto ? '◉ recording · ' + (c.count || 0) + ' banked' : '○ Walk and record') +
+          (c.auto ? '◉ recording · ' + (c.count || 0) + ' banked' + (c.walked > 0 ? ' · ' + EE.fmtLen(c.walked, U(), 0) : '') : '○ Walk and record') +
           '</button>' +
-          (c.count ? '<button class="pill tiny gold" data-act="auto-done">Done · review</button>' : '') +
+          ((c.count || c.walked > 0) ? '<button class="pill tiny gold" data-act="auto-done">Done · review</button>' : '') +
           '</div>' +
           (c.auto ? '<div class="hint">Walk the roof at a normal pace. A frame banks every ' +
             'half-stride or glance — each one already knows where it was taken, so they need no ' +
@@ -1989,6 +2002,16 @@ function autoCaptureTick() {
   var pose = EENative.pose;
   if (!pose) return;
 
+  /* the walk itself, for the HUD and for knowing a photo-less recording did
+     something */
+  if (c.lastTickPos) {
+    c.walked = (c.walked || 0) + Math.hypot(pose.pos.x - c.lastTickPos.x, pose.pos.y - c.lastTickPos.y);
+  }
+  c.lastTickPos = { x: pose.pos.x, y: pose.pos.y };
+
+  var policy = db.settings.recordPhotos || 'all';
+  if (policy === 'none') return;             /* the planes are the record */
+
   var now = performance.now();
   var last = c.lastAuto;
   if (last) {
@@ -1998,7 +2021,8 @@ function autoCaptureTick() {
     var turned = EE.quatAngleDeg(
       EE.quatFromOrientation(last.alpha, last.beta, last.gamma),
       EE.quatFromOrientation(pose.alpha, pose.beta, pose.gamma));
-    if (moved < AUTO_MOVE_M && turned < AUTO_TURN_DEG) return;
+    if (policy === 'sparse') { if (moved < 5) return; }
+    else if (moved < AUTO_MOVE_M && turned < AUTO_TURN_DEG) return;
   }
 
   if ((c.count || 0) >= AUTO_MAX_SHOTS) {
@@ -2024,7 +2048,118 @@ function autoCaptureTick() {
    PROPOSALS — dashed on the plan, kept out of the export — until saved. */
 var PROPOSE_MIN_H = 0.25, PROPOSE_MAX_H = 6;        /* below: a step; above: not a unit */
 var PROPOSE_MIN_AREA = 0.3, PROPOSE_MAX_AREA = 250; /* a duct; a whole deck level */
+var MERGE_GAP_M = 0.3, MERGE_DH_M = 0.25;           /* one unit, seen as two planes */
+var PARAPET_FOOT_M = 0.5, PARAPET_MIN_H = 0.25, PARAPET_MIN_W = 0.5, PARAPET_MIN_TOTAL_M = 6;
 
+/* ---- small geometry for deciding whether two rectangles are one unit ---- */
+function segDist(q, a, b) {
+  var dx = b.x - a.x, dy = b.y - a.y, L2 = dx * dx + dy * dy;
+  var t = L2 > 0 ? Math.max(0, Math.min(1, ((q.x - a.x) * dx + (q.y - a.y) * dy) / L2)) : 0;
+  return Math.hypot(q.x - (a.x + t * dx), q.y - (a.y + t * dy));
+}
+function pointInPoly(q, poly) {
+  var inside = false;
+  for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    var a = poly[i], b = poly[j];
+    if ((a.y > q.y) !== (b.y > q.y) && q.x < (b.x - a.x) * (q.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+function polyGap(A, B) {
+  var best = Infinity, i, j;
+  for (i = 0; i < A.length; i++) if (pointInPoly(A[i], B)) return 0;
+  for (i = 0; i < B.length; i++) if (pointInPoly(B[i], A)) return 0;
+  for (i = 0; i < A.length; i++) for (j = 0; j < B.length; j++) {
+    best = Math.min(best, segDist(A[i], B[j], B[(j + 1) % B.length]));
+    best = Math.min(best, segDist(B[j], A[i], A[(i + 1) % A.length]));
+  }
+  return best;
+}
+function rectsTouch(a, b) {
+  var ra = Math.hypot(a.w, a.l) / 2, rb = Math.hypot(b.w, b.l) / 2;
+  if (Math.hypot(a.cx - b.cx, a.cy - b.cy) > ra + rb + MERGE_GAP_M) return false;
+  return polyGap(EE.rectCorners(a), EE.rectCorners(b)) <= MERGE_GAP_M;
+}
+/* The union of two rectangles, framed by the larger one's rotation. */
+function unionRect(a, b) {
+  var c = Math.cos(-a.rot), s = Math.sin(-a.rot);
+  var pts = EE.rectCorners(a).concat(EE.rectCorners(b));
+  var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  pts.forEach(function (q) {
+    var dx = q.x - a.cx, dy = q.y - a.cy;
+    var lx = dx * c - dy * s, ly = dx * s + dy * c;
+    if (lx < minX) minX = lx; if (lx > maxX) maxX = lx;
+    if (ly < minY) minY = ly; if (ly > maxY) maxY = ly;
+  });
+  var lcx = (minX + maxX) / 2, lcy = (minY + maxY) / 2;
+  var c2 = Math.cos(a.rot), s2 = Math.sin(a.rot);
+  return {
+    ids: a.ids.concat(b.ids), arSession: a.arSession,
+    cx: a.cx + lcx * c2 - lcy * s2, cy: a.cy + lcx * s2 + lcy * c2,
+    w: maxX - minX, l: maxY - minY, rot: a.rot, h: Math.max(a.h, b.h)
+  };
+}
+/* ARKit often sees one RTU top as two or three planes — split by a duct, a
+   shadow, or where it lost sight of it for a moment. Touching planes at one
+   height are one unit. */
+function mergeRects(cands) {
+  var parent = cands.map(function (_, i) { return i; });
+  var find = function (i) { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  for (var i = 0; i < cands.length; i++) {
+    for (var j = i + 1; j < cands.length; j++) {
+      if (Math.abs(cands[i].h - cands[j].h) > MERGE_DH_M) continue;
+      if (!rectsTouch(cands[i], cands[j])) continue;
+      parent[find(i)] = find(j);
+    }
+  }
+  var groups = {};
+  cands.forEach(function (r, i) { (groups[find(i)] || (groups[find(i)] = [])).push(r); });
+  return Object.keys(groups).map(function (g) {
+    var rs = groups[g].slice().sort(function (a, b) { return b.w * b.l - a.w * a.l; });
+    var acc = rs[0];
+    for (var k = 1; k < rs.length; k++) acc = unionRect(acc, rs[k]);
+    return acc;
+  });
+}
+
+/* The parapet, from the vertical planes standing on the deck. Their footprint
+   lines are chained into the roof's boundary — a convex hull for now, which
+   is right for most industrial roofs and honest about the rest: it is
+   proposed, and an L-shaped roof gets its notch drawn back in by hand. */
+function parapetFrom(walls, floorZ) {
+  var pts = [], total = 0, ids = [];
+  walls.forEach(function (pl) {
+    if (pl.zMin > floorZ + PARAPET_FOOT_M) return;    /* must stand on the deck */
+    if (pl.zMax - pl.zMin < PARAPET_MIN_H) return;
+    if (pl.w < PARAPET_MIN_W) return;
+    pts.push(pl.corners[0], pl.corners[1]);
+    total += pl.w; ids.push(pl.id);
+  });
+  if (ids.length < 3 || total < PARAPET_MIN_TOTAL_M) return null;
+  var hull = null;
+  for (var n = Math.min(12, pts.length); n >= 3 && !hull; n--) hull = EE.hullSimplify(pts, n);
+  if (!hull) return null;
+  return { pts: hull, ids: ids.slice().sort(), arSession: walls[0].arSession };
+}
+
+function sameGeom(a, b) {
+  var keys = ['cx', 'cy', 'w', 'l', 'rot', 'h'];
+  for (var i = 0; i < keys.length; i++) {
+    if (typeof a[keys[i]] === 'number' && Math.abs(a[keys[i]] - b[keys[i]]) > 1e-6) return false;
+  }
+  if (a.pts || b.pts) {
+    if (!a.pts || !b.pts || a.pts.length !== b.pts.length) return false;
+    for (var j = 0; j < a.pts.length; j++) {
+      if (Math.abs(a.pts[j].x - b.pts[j].x) > 1e-6 || Math.abs(a.pts[j].y - b.pts[j].y) > 1e-6) return false;
+    }
+  }
+  return true;
+}
+
+/* Everything ARKit currently believes about the roof, as proposals: merged
+   unit tops, and the parapet. Proposals follow the planes until KEPT, after
+   which they are the surveyor's and the planes they came from are spoken for.
+   Proposals whose planes vanish, or get merged into a bigger one, vanish too. */
 function proposeFromPlanes() {
   var p = currentProject();
   if (!p || !window.EENative || !EENative.planes) return 0;
@@ -2033,33 +2168,82 @@ function proposeFromPlanes() {
   var fs = projectFrameSession(p);
   if (!fs && p.stations.some(function (s) { return !!s.reg; })) return 0;
 
-  var changed = 0;
+  var spoken = {};
+  p.objects.forEach(function (o) {
+    if (o.world && !o.proposed && o.planes) o.planes.forEach(function (id) { spoken[id] = true; });
+  });
+
+  var cands = [], walls = [];
   Object.keys(EENative.planes).forEach(function (k) {
     var pl = EENative.planes[k];
     if (fs && pl.arSession !== fs) return;
-    var h = pl.z - floorZ;
-    var area = pl.w * pl.l;
+    if (spoken[pl.id]) return;
+    if (pl.alignment === 'vertical') { walls.push(pl); return; }
+    var h = pl.z - floorZ, area = pl.w * pl.l;
     if (h < PROPOSE_MIN_H || h > PROPOSE_MAX_H) return;
     if (area < PROPOSE_MIN_AREA || area > PROPOSE_MAX_AREA) return;
+    cands.push({ ids: [pl.id], arSession: pl.arSession, cx: pl.cx, cy: pl.cy, w: pl.w, l: pl.l, rot: pl.rot, h: h });
+  });
 
-    var id = 'plane:' + pl.id;
-    var ex = p.objects.find(function (o) { return o.id === id; });
-    if (ex && !ex.proposed) return;          /* saved: the surveyor owns it now */
-    var next = {
-      id: id, stationId: null, world: true, arSession: pl.arSession, proposed: true,
-      kind: 'rect', cx: pl.cx, cy: pl.cy, w: pl.w, l: pl.l, rot: pl.rot,
-      h: h, hSrc: 'arkit',
-      name: ex ? ex.name : 'Unit', autoName: ex ? ex.autoName : true, note: ex ? ex.note : ''
+  var wanted = {};
+  mergeRects(cands).forEach(function (r) {
+    var ids = r.ids.slice().sort();
+    var id = 'plane:' + ids.join('+');
+    wanted[id] = {
+      id: id, stationId: null, world: true, arSession: r.arSession, proposed: true,
+      kind: 'rect', cx: r.cx, cy: r.cy, w: r.w, l: r.l, rot: r.rot, h: r.h, hSrc: 'arkit',
+      planes: ids, name: 'Unit', autoName: true, note: ''
     };
-    if (ex) Object.assign(ex, next); else p.objects.push(next);
+  });
+  var par = parapetFrom(walls, floorZ);
+  if (par) {
+    wanted.parapet = {
+      id: 'parapet', stationId: null, world: true, arSession: par.arSession, proposed: true,
+      kind: 'outline', pts: par.pts, planes: par.ids, name: 'Roof outline', autoName: true, note: '', h: 0
+    };
+  }
+
+  var changed = 0;
+  Object.keys(wanted).forEach(function (id) {
+    var spec = wanted[id];
+    var ex = p.objects.find(function (o) { return o.id === id; });
+    if (ex && !ex.proposed) return;              /* kept: the surveyor owns it now */
+    if (ex) {
+      if (sameGeom(ex, spec)) return;
+      Object.assign(ex, spec, { name: ex.name, autoName: ex.autoName, note: ex.note });
+    } else {
+      p.objects.push(spec);
+    }
     changed++;
   });
+  var before = p.objects.length;
+  p.objects = p.objects.filter(function (o) { return !(o.world && o.proposed && !wanted[o.id]); });
+  changed += before - p.objects.length;
+
   if (changed) {
     touchProject(p); save();
     if (ui.plan) ui.plan.fitted = false;
     if (view.screen === 'project') render();
   }
   return changed;
+}
+
+function keepAllProposals() {
+  var p = currentProject(); var n = 0;
+  p.objects.forEach(function (o) { if (o.proposed) { o.proposed = false; n++; } });
+  touchProject(p); save();
+  if (ui.plan) ui.plan.fitted = false;
+  toast(n + ' kept — they are yours now, and no longer follow ARKit');
+  render();
+}
+function discardAllProposals() {
+  var p = currentProject();
+  var before = p.objects.length;
+  p.objects = p.objects.filter(function (o) { return !o.proposed; });
+  touchProject(p); save();
+  if (ui.plan) ui.plan.fitted = false;
+  toast((before - p.objects.length) + ' discarded');
+  render();
 }
 
 /* Whether the pose behind the readouts is one to measure against. The web
@@ -2083,6 +2267,15 @@ function captureHint() {
   if (nativeAR && window.EENative && EENative.active && EENative.tracking !== 'normal') {
     return 'ARKit is still finding its bearings (<b>' + esc(EENative.tracking) + '</b>) — ' +
       'move the phone slowly across something with texture. The readings settle when it locks.';
+  }
+  if (nativeAR()) {
+    var np = (window.EENative && EENative.planes) ? Object.keys(EENative.planes).length : 0;
+    var cp = currentProject();
+    var npr = cp ? cp.objects.filter(function (o) { return o.proposed; }).length : 0;
+    var walked = (ui.cap && ui.cap.walked > 0) ? EE.fmtLen(ui.cap.walked, U(), 0) : null;
+    return 'Tracking. <b>' + np + '</b> surface' + (np === 1 ? '' : 's') + ' seen · <b>' + npr +
+      '</b> proposed' + (walked ? ' · ' + walked + ' walked' : '') +
+      '. Walk past every unit; slow down where it is dense.';
   }
   if (!ui.sensors.live) return 'Tilt sensor idle — calibrate from a measured rectangle instead.';
   if (Math.abs(ui.sensors.gamma) > 8) return 'Level the phone — <b>roll ' + ui.sensors.gamma.toFixed(0) + '°</b>.';
@@ -3746,6 +3939,13 @@ function sheetSettings() {
     '<input class="inp mono" id="set-seg" inputmode="numeric" value="' + s.circleSegments + '"></div>' +
     '<div class="field"><label>PHOTO LONG EDGE (PX)</label>' +
     '<input class="inp mono" id="set-maxpx" inputmode="numeric" value="' + s.maxPx + '"></div>' +
+    '<div class="field"><label>PHOTOS WHILE WALKING AND RECORDING</label><div class="seg tight">' +
+    [['all', 'Every frame'], ['sparse', 'One per 5 m'], ['none', 'None']].map(function (opt) {
+      return '<button class="' + ((s.recordPhotos || 'all') === opt[0] ? 'active' : '') +
+        '" data-act="rec-photos" data-v="' + opt[0] + '">' + opt[1] + '</button>';
+    }).join('') + '</div>' +
+    '<div class="hint">Under ARKit the surfaces carry the model; photographs are reference. ' +
+    '<b>None</b> banks nothing but the walk and its proposals.</div></div>' +
     '<div class="kv"><span>Photos stored</span><span>' + fmtBytes(ui.storageBytes) + '</span></div>' +
     '<div class="kv"><span>Version</span><span>' + VERSION + '</span></div>' +
     '<button class="btn ghost-gold sm" data-act="check-update">Check for an update</button>' +
@@ -4992,6 +5192,13 @@ function handle(el, e) {
       return render();
     }
     case 'apply-quad': return applyQuad();
+    case 'keep-proposals': return keepAllProposals();
+    case 'discard-proposals': return discardAllProposals();
+    case 'rec-photos': {
+      db.settings.recordPhotos = el.dataset.v || 'all';
+      save();
+      return render();
+    }
     case 'auto-cap': {
       if (!ui.cap) return;
       ui.cap.auto = !ui.cap.auto;

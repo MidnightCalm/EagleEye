@@ -1972,6 +1972,19 @@ function near(name, a, b, tol) {
   near('...length', prR.l, 1, 1e-9);
   near('...and reads as a quarter-turn', Math.abs(prR.rot), Math.PI / 2, 1e-9);
   ok('...refuses a bad matrix', EE.planeCornersFromARKit([1,2,3], 0,0,0, 1,1, 0) === null);
+  near('...and a flat plane has one height at every corner', pr.zMax - pr.zMin, 0, 1e-9);
+
+  /* A VERTICAL plane: anchor x stays world x, anchor y (its normal) points
+     along world +z (horizontal, ARKit's south), anchor z points along world
+     -y (down). A 3 m wide, 1 m tall wall centred 1 m up becomes a 3 m
+     footprint line whose corners sit at two heights. */
+  var vm = [1,0,0,0,  0,0,1,0,  0,-1,0,0,  0,1.0,0,1];
+  var vr = EE.planeCornersFromARKit(vm, 0, 0, 0, 3, 1, 0);
+  ok('vertical plane converts', !!vr);
+  near('...its footprint spans the wall width', vr.w, 3, 1e-9);
+  near('...and collapses in plan (no depth)', vr.l, 0, 1e-9);
+  near('...top of the wall', vr.zMax, 1.5, 1e-9);
+  near('...bottom of the wall', vr.zMin, 0.5, 1e-9);
 
   /* Factory intrinsics: an iPhone main camera at 1920x1440 with fx ~1450 px
      is about 66 degrees across the long edge. */

@@ -108,6 +108,7 @@
     var best = null;
     Object.keys(N.planes).forEach(function (k) {
       var pl = N.planes[k];
+      if (pl.alignment === 'vertical') return;  /* walls have no say in the floor */
       if (pl.w * pl.l < 2) return;              /* a deck is big; a duct is not */
       if (best == null || pl.z < best) best = pl.z;
     });
@@ -116,10 +117,11 @@
   };
 
   var proposeTimer = 0;
-  window.__eeNativePlane = function (id, m, cx, cy, cz, w, h, rotY, cls, sess) {
+  window.__eeNativePlane = function (id, m, cx, cy, cz, w, h, rotY, cls, sess, alignment) {
     var r = EE.planeCornersFromARKit(m, cx, cy, cz, w, h, rotY);
     if (!r) return;
     r.id = id; r.cls = cls || 'none';
+    r.alignment = alignment || 'horizontal';
     r.arSession = sess || N.sessionId; r.at = performance.now();
     N.planes[id] = r;
     recomputeFloor();

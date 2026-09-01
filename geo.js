@@ -1461,10 +1461,19 @@ var EE = (function () {
     out.forEach(function (q) { mx += q.x / 4; my += q.y / 4; });
     var e1 = { x: out[1].x - out[0].x, y: out[1].y - out[0].y };
     var e2 = { x: out[2].x - out[1].x, y: out[2].y - out[1].y };
+    /* per-corner heights too: a VERTICAL plane's four corners are two heights
+       over one footprint line, and the parapet is read off exactly that */
+    var zEach = [];
+    for (var j = 0; j < 4; j++) {
+      var lx2 = local[j][0], lz2 = local[j][1];
+      var ax2 = cx + lx2 * cr + lz2 * sr, az2 = cz - lx2 * sr + lz2 * cr;
+      zEach.push(m[1] * ax2 + m[5] * cy + m[9] * az2 + m[13]);
+    }
     return {
       corners: out, z: zs / 4, cx: mx, cy: my,
       w: Math.hypot(e1.x, e1.y), l: Math.hypot(e2.x, e2.y),
-      rot: Math.atan2(e1.y, e1.x)
+      rot: Math.atan2(e1.y, e1.x),
+      zs: zEach, zMin: Math.min.apply(null, zEach), zMax: Math.max.apply(null, zEach)
     };
   }
 

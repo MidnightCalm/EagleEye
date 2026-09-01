@@ -258,14 +258,16 @@ extension SurveyViewController: ARSessionDelegate {
                  + "\(sessionId.jsQuoted));")
     }
 
-    /// Every horizontal plane ARKit knows about, as it learns it. A rooftop is
-    /// horizontal planes all the way down: the deck is the lowest broad one,
-    /// and every RTU top is an elevated rectangle — which is the survey, before
-    /// anyone has tapped anything. The page decides which is which.
+    /// Every plane ARKit knows about, as it learns it. A rooftop is planes all
+    /// the way down: the deck is the lowest broad horizontal one, every RTU top
+    /// is an elevated horizontal rectangle, and the parapet is a ring of
+    /// vertical ones — which is the survey, before anyone has tapped anything.
+    /// The page decides which is which.
     private func forwardPlanes(_ anchors: [ARAnchor], force: Bool) {
         let now = CACurrentMediaTime()
         for a in anchors {
-            guard let plane = a as? ARPlaneAnchor, plane.alignment == .horizontal else { continue }
+            guard let plane = a as? ARPlaneAnchor else { continue }
+            let alignment = plane.alignment == .vertical ? "vertical" : "horizontal"
             if !force, let t = planeLastSent[plane.identifier], now - t < 0.5 { continue }
             planeLastSent[plane.identifier] = now
             let c = plane.center
@@ -281,7 +283,7 @@ extension SurveyViewController: ARSessionDelegate {
             evaluate("window.__eeNativePlane && window.__eeNativePlane("
                      + "\(plane.identifier.uuidString.jsQuoted), \(plane.transform.jsArray), "
                      + "\(c.x), \(c.y), \(c.z), \(e.width), \(e.height), \(e.rotationOnYAxis), "
-                     + "\(cls.jsQuoted), \(sessionId.jsQuoted));")
+                     + "\(cls.jsQuoted), \(sessionId.jsQuoted), \(alignment.jsQuoted));")
         }
     }
 
