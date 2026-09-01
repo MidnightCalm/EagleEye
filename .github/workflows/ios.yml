@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Ten minutes of runner time is too much to spend discovering a typo'd
       # secret at the upload step. Fail in fifteen seconds instead.
@@ -116,7 +116,7 @@ jobs:
 
       - name: Cache XcodeGen
         id: xcodegen-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.xcodegen
           key: xcodegen-${{ env.XCODEGEN_VERSION }}
@@ -332,7 +332,7 @@ jobs:
 
       - name: Keep the build log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xcodebuild-log-${{ github.run_number }}
           path: ${{ runner.temp }}/xcodebuild-archive.log
@@ -397,7 +397,7 @@ jobs:
       # having a bad afternoon, the artifact is already saved and the upload can
       # be retried without a twenty-minute rebuild.
       - name: Keep the .ipa
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: EagleEye-${{ steps.ver.outputs.marketing }}-${{ steps.ver.outputs.build }}-ipa
           path: ${{ env.IPA_PATH }}
@@ -405,7 +405,7 @@ jobs:
           if-no-files-found: error
 
       - name: Keep the dSYMs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: EagleEye-${{ steps.ver.outputs.marketing }}-${{ steps.ver.outputs.build }}-dSYMs
           path: ${{ runner.temp }}/EagleEye.xcarchive/dSYMs
