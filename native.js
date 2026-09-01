@@ -154,6 +154,17 @@
 
   N.resetTracking = function () { send({ cmd: 'reset' }); };
 
+  /* The hardware shutter — Camera Control, or either volume button. It fires
+     wherever the app happens to be, so it checks that a shot is actually what
+     the screen is offering rather than trusting the press. */
+  window.__eeNativeShutter = function () {
+    if (!window.view || view.screen !== 'capture') return;
+    if (!window.ui || !ui.cap || !ui.cap.ready) return;
+    if (N.tracking !== 'normal') return;      /* the same bar the on-screen one has */
+    if (window.buzz) buzz(20);
+    if (window.shoot) shoot();
+  };
+
   /* The shell owns motion; never ask iOS for the web permission. */
   window.needsMotionPermission = function () { return false; };
 

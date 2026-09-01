@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.29.1';
+var VERSION = '1.29.2';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -1891,7 +1891,8 @@ function tplCapture() {
       '<div class="mark" id="tilt-mark" style="left:' + clamp(tiltDeg(), 0, 90) / 90 * 100 + '%"></div></div>' +
       '<div class="pill tiny" id="plumb-chip" style="align-self:flex-start;display:none"></div>' +
       '<div class="hint" id="cap-hint">' + captureHint() + '</div>' +
-      '<div class="shutter-row"><button class="shutter" data-act="shoot"' + (c.ready ? '' : ' disabled') + '><div></div></button></div>';
+      '<div class="shutter-row"><button class="shutter" data-act="shoot"' +
+      ((c.ready && trackingOk()) ? '' : ' disabled') + '><div></div></button></div>';
   }
 
   return '<div class="full">' +
@@ -1905,12 +1906,28 @@ function tplCapture() {
 function attCell(label, val, cls) {
   return '<div class="att-cell ' + (cls || '') + '"><div class="al">' + label + '</div><div class="av">' + val + '</div></div>';
 }
+/* Whether the pose behind the readouts is one to measure against. The web
+   sensor is always "ok" in this sense — it has no notion of confidence — while
+   ARKit reports honestly that it is still initialising or relocalising. */
+function trackingOk() {
+  if (!(window.EENative && EENative.active)) return true;
+  return EENative.tracking === 'normal';
+}
+
 /* beta is 90 when the phone stands upright, so depression below the horizon is
    the shortfall from 90. */
 function tiltDeg() { return clamp(90 - (ui.sensors.beta || 0), -90, 90); }
 function tiltClass() { var t = tiltDeg(); return (t >= 25 && t <= 65) ? 'good' : 'bad'; }
 function captureHint() {
   var t = tiltDeg();
+  /* While ARKit is initialising or relocalising it is still solving for where
+     it is, and the pose it reports genuinely jumps — which is the roll and
+     tilt "freaking out and flickering". Nothing is broken, but a shot taken
+     then would carry a wrong attitude, so say so and hold the shutter. */
+  if (nativeAR && window.EENative && EENative.active && EENative.tracking !== 'normal') {
+    return 'ARKit is still finding its bearings (<b>' + esc(EENative.tracking) + '</b>) — ' +
+      'move the phone slowly across something with texture. The readings settle when it locks.';
+  }
   if (!ui.sensors.live) return 'Tilt sensor idle — calibrate from a measured rectangle instead.';
   if (Math.abs(ui.sensors.gamma) > 8) return 'Level the phone — <b>roll ' + ui.sensors.gamma.toFixed(0) + '°</b>.';
   if (t < 25) return 'Tilt down a little — <b>too flat</b> and distance error runs away.';
@@ -4347,8 +4364,17 @@ function bindScene() {
 }
 
 function bindCapture() {
+  if (!ui.cap) return;
+  /* Under ARKit there IS no <video> — the shell draws the camera behind the
+     page — so guarding on the element skipped startCamera() entirely and left
+     the shutter disabled forever. The element is a detail of one of the two
+     camera paths, not a precondition for either. */
+  if (nativeAR()) {
+    if (!ui.cap.ready) startCamera();
+    return;
+  }
   var v = $('#cam-video');
-  if (!v || !ui.cap) return;
+  if (!v) return;
   if (ui.cap.stream) { v.srcObject = ui.cap.stream; return; }
   startCamera();
 }

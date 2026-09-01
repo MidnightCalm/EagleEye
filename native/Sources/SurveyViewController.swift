@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import ARKit
+import AVKit
 import SceneKit
 import CoreImage
 import simd
@@ -50,6 +51,7 @@ final class SurveyViewController: UIViewController {
         view.backgroundColor = UIColor(red: 0.039, green: 0.035, blue: 0.051, alpha: 1) // --lx-bg
         if arkitEnabled { buildARView() }
         buildWebView()
+        buildHardwareShutter()
         session.delegate = self
     }
 
@@ -65,6 +67,21 @@ final class SurveyViewController: UIViewController {
 
     override var prefersStatusBarHidden: Bool { false }
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+
+    /// The Camera Control on iPhone 16, and the volume buttons on every phone,
+    /// both arrive as capture events. On a roof in gloves, a physical button you
+    /// can find without looking beats a target on glass — and pressing it moves
+    /// the phone far less than reaching for the screen does, which for a
+    /// measurement is the whole point.
+    private func buildHardwareShutter() {
+        guard #available(iOS 17.2, *) else { return }
+        let interaction = AVCaptureEventInteraction { [weak self] event in
+            // .ended is the release: a press-and-hold should not fire twice.
+            guard event.phase == .ended else { return }
+            self?.evaluate("window.__eeNativeShutter && window.__eeNativeShutter();")
+        }
+        view.addInteraction(interaction)
+    }
 
     // MARK: - the camera behind the page
 
