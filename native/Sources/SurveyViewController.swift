@@ -42,6 +42,14 @@ final class SurveyViewController: UIViewController {
     /// Planes are re-reported by ARKit many times a second as they grow; the
     /// page wants the shape, not the heartbeat.
     private var planeLastSent: [UUID: TimeInterval] = [:]
+
+    /// Which physical camera ARKit tracks with. Every ARKit device calibrates
+    /// its visual-inertial tracking on the main wide camera; recent phones also
+    /// list the ultra-wide as a trackable format. The page's setting chooses,
+    /// and it is applied only before the first capture of a session — a
+    /// restart moves the world origin, and a survey in progress must not.
+    private var preferUltraWide = false
+    private var capturedAny = false
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     /// Pose pushes per second. 30 is smooth for an overlay and leaves the web
@@ -143,7 +151,27 @@ final class SurveyViewController: UIViewController {
         cfg.worldAlignment = .gravityAndHeading
         cfg.planeDetection = [.horizontal]
         cfg.isAutoFocusEnabled = true
+
+        // What this phone offers, and which camera each format tracks on.
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats
+        var ultraWideAvailable = false
+        for f in formats {
+            NSLog("%@", "ARKit format \(Int(f.imageResolution.width))x\(Int(f.imageResolution.height)) "
+                  + "@\(f.framesPerSecond)fps on \(f.captureDeviceType.rawValue)")
+            if f.captureDeviceType == .builtInUltraWideCamera { ultraWideAvailable = true }
+        }
+        if preferUltraWide,
+           let uw = formats.first(where: { $0.captureDeviceType == .builtInUltraWideCamera }) {
+            cfg.videoFormat = uw
+        }
         session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
+        capturedAny = false
+
+        let active = cfg.videoFormat
+        evaluate("window.__eeNativeLens && window.__eeNativeLens("
+                 + "\(active.captureDeviceType.rawValue.jsQuoted), "
+                 + "\(Int(active.imageResolution.width)), \(Int(active.imageResolution.height)), "
+                 + "\(ultraWideAvailable ? "true" : "false"));")
     }
 
     private func evaluate(_ js: String) {
@@ -238,6 +266,7 @@ extension SurveyViewController: ARSessionDelegate {
                 // page keeps only its name. IndexedDB in a custom-scheme origin
                 // swallowed 220 frames of a real roof without a word.
                 let photoId = savePhoto(shot.data, id: req.id)
+                capturedAny = true
                 evaluate("window.__eeNativeFrame && window.__eeNativeFrame("
                          + "\(req.id.jsQuoted), \(shot.b64.jsQuoted), \(m), \(fx), "
                          + "\(shot.width), \(shot.height), \(sessionId.jsQuoted), \(photoId.jsQuoted));")
@@ -331,6 +360,15 @@ extension SurveyViewController: WKScriptMessageHandler {
             if let id = body["id"] as? String {
                 let maxPx = (body["maxPx"] as? Int) ?? 1440
                 pendingCaptures.append((id: id, maxPx: maxPx))
+            }
+        case "lens":
+            // Honoured only before the first capture of a session: switching
+            // the tracked camera restarts tracking and moves the world origin,
+            // which a survey in progress cannot survive.
+            let want = (body["ultraWide"] as? Bool) ?? false
+            if want != preferUltraWide {
+                preferUltraWide = want
+                if arkitEnabled && !capturedAny { startSession() }
             }
         case "deletePhoto":
             if let id = body["id"] as? String {

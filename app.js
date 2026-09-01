@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.32.0';
+var VERSION = '1.33.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -982,6 +982,11 @@ function fovValueFor(w, h2) {
   return m[key] || db.settings.fov;
 }
 function stationF(st) {
+  /* A shot taken under ARKit carries its own focal length, exact for the
+     camera it was taken with. The frame-size table below cannot tell two
+     lenses at one resolution apart, so it is only for shots that have no
+     better answer. */
+  if (st && st.fPx > 0) return st.fPx;
   return EE.focalFromFov(fovValueFor(st.imgW, st.imgH), Math.max(st.imgW, st.imgH));
 }
 
@@ -3946,6 +3951,15 @@ function sheetSettings() {
     }).join('') + '</div>' +
     '<div class="hint">Under ARKit the surfaces carry the model; photographs are reference. ' +
     '<b>None</b> banks nothing but the walk and its proposals.</div></div>' +
+    ((window.EENative && EENative.ultraWideAvailable)
+      ? '<div class="field"><label>AR CAMERA</label><div class="seg tight">' +
+        '<button class="' + (s.arUltraWide ? '' : 'active') + '" data-act="ar-lens" data-v="0">Wide</button>' +
+        '<button class="' + (s.arUltraWide ? 'active' : '') + '" data-act="ar-lens" data-v="1">Ultra-wide</button>' +
+        '</div><div class="hint">Ultra-wide fits more roof per frame and lets you stand closer and look ' +
+        'steeper, which helps distance error. Each pixel covers about 1.5\u00d7 more angle, and the frame ' +
+        'edges are the least trustworthy part after iOS straightens the lens. Takes effect at the start of a ' +
+        'session, before the first shot.</div></div>'
+      : '') +
     '<div class="kv"><span>Photos stored</span><span>' + fmtBytes(ui.storageBytes) + '</span></div>' +
     '<div class="kv"><span>Version</span><span>' + VERSION + '</span></div>' +
     '<button class="btn ghost-gold sm" data-act="check-update">Check for an update</button>' +
@@ -5194,6 +5208,12 @@ function handle(el, e) {
     case 'apply-quad': return applyQuad();
     case 'keep-proposals': return keepAllProposals();
     case 'discard-proposals': return discardAllProposals();
+    case 'ar-lens': {
+      db.settings.arUltraWide = el.dataset.v === '1';
+      save();
+      if (window.EENative && EENative.setLens) EENative.setLens(db.settings.arUltraWide);
+      return render();
+    }
     case 'rec-photos': {
       db.settings.recordPhotos = el.dataset.v || 'all';
       save();
@@ -5448,7 +5468,7 @@ function startCamera() {
   if (nativeAR()) {
     var lens = EENative.lens || {};
     ui.cap.cam = {
-      label: 'ARKit (factory intrinsics)',
+      label: 'ARKit ' + (EENative.ultraWide ? 'ultra-wide' : 'wide') + ' (factory intrinsics)',
       w: lens.w || 0, h: lens.h || 0, id: EENative.sessionId || ''
     };
     ui.cap.ready = true;
@@ -5582,6 +5602,9 @@ function applyArPose(p, st, arFrame) {
   /* Where the camera stood, in metres, in that session's own world frame. */
   st.arPos = { x: arFrame.pose.pos.x, y: arFrame.pose.pos.y, z: arFrame.pose.pos.z };
   st.arSession = arFrame.sessionId || null;
+  /* factory intrinsics for THIS frame, already scaled by the shell to the
+     pixels it saved — the lens problem, closed per shot */
+  if (arFrame.fx > 0) st.fPx = arFrame.fx;
 
   /* THE POINT OF GOING NATIVE. In ray mode a station's plan frame is already
      world-aligned — east and north — with the camera at its origin, so placing

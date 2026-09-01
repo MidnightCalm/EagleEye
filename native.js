@@ -210,6 +210,19 @@
 
   N.resetTracking = function () { send({ cmd: 'reset' }); };
 
+  /* Which camera ARKit is tracking on, and whether the ultra-wide is on offer.
+     A lens change is a new set of intrinsics, so the cached lens is dropped and
+     the next pose rewrites it. */
+  N.lensDevice = null; N.ultraWide = false; N.ultraWideAvailable = false;
+  window.__eeNativeLens = function (device, w, h, uwAvailable) {
+    N.lensDevice = device || null;
+    N.ultraWide = !!(device && String(device).indexOf('UltraWide') >= 0);
+    N.ultraWideAvailable = !!uwAvailable;
+    N.lens = null;
+    if (window.ui && ui.cap && window.render) render();
+  };
+  N.setLens = function (ultraWide) { send({ cmd: 'lens', ultraWide: !!ultraWide }); };
+
   /* The hardware shutter — Camera Control, or either volume button. It fires
      wherever the app happens to be, so it checks that a shot is actually what
      the screen is offering rather than trusting the press. */
@@ -250,4 +263,6 @@
   wrapRender();
 
   send({ cmd: 'ready' });
+  /* the page's lens preference, before any capture can have happened */
+  N.setLens(!!(window.db && db.settings && db.settings.arUltraWide));
 })();
