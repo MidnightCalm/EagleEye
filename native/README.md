@@ -188,6 +188,21 @@ Same two commands the runner uses.
    at known heights. Confirm, name, export. Plus DXF for CAD, and the LiDAR mesh
    as a bonus where sunlight allows.
 
+## The native capture screen
+
+Shipped in 1.34.0, and the first screen to leave the web view. `CaptureViewController`
+owns the AR view, the HUD, the walking recorder, the shutter (on screen, Camera
+Control, or a volume button), and — the point of going native — the proposals drawn
+**in the scene** by SceneKit: wireframe boxes standing on the deck, the parapet as a
+line loop, purple while proposed and gold once kept, in true perspective as you walk.
+The page keeps the model: it receives finished stations (pose, intrinsics, file name —
+no image ever crosses the bridge), computes proposals from the plane stream, and pushes
+them back to be drawn. Closing the screen lands on the plan.
+
+Division of labour from here: screens where the bridge serves worst go native first;
+`geo.js` stays the geometry engine; the web view keeps plan, list, sheets and export
+until each is worth porting.
+
 ## Phase 3, so far
 
 Shipped in 1.32.0: **review mode** (proposals dashed on the plan, Keep / Discard per

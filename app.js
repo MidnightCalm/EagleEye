@@ -8,7 +8,7 @@
    of a warehouse. Photographs plus a known reference survive full sun. */
 'use strict';
 
-var VERSION = '1.33.0';
+var VERSION = '1.34.0';
 var KEY = 'eagleeye.v1';
 
 /* ================= persistence ================= */
@@ -2248,6 +2248,49 @@ function discardAllProposals() {
   touchProject(p); save();
   if (ui.plan) ui.plan.fitted = false;
   toast((before - p.objects.length) + ' discarded');
+  render();
+}
+
+/* A shot banked by the native capture screen. The file is already on disk
+   and the pose already known, so no canvas, no blob and no camera element are
+   involved: the station is built from what the shell sent. */
+function bankNativeShot(frame) {
+  var p = currentProject();
+  if (!p || !frame || !frame.pose) return null;
+  var st = {
+    id: uid('s'), createdAt: Date.now(),
+    imgW: frame.w, imgH: frame.h, screenAngle: 0, angleFix: 0,
+    att: {
+      alpha: frame.pose.alpha, beta: frame.pose.beta, gamma: frame.pose.gamma,
+      heading: ui.sensors ? ui.sensors.heading : null,
+      headingAcc: ui.sensors ? ui.sensors.headingAcc : null,
+      preTap: true, wobble: 0, arkit: true
+    },
+    gps: ui.gps ? Object.assign({}, ui.gps) : null,
+    cam: {
+      label: 'ARKit ' + ((window.EENative && EENative.ultraWide) ? 'ultra-wide' : 'wide') + ' (native capture)',
+      w: frame.w, h: frame.h, id: frame.sessionId || ''
+    },
+    deckN: (p.deck && p.deck.n) ? p.deck.n.slice() : null,
+    cal: null, reg: null
+  };
+  if (frame.photoId) st.photoFile = frame.photoId; else st.photoGone = true;
+  applyArPose(p, st, frame);
+  p.stations.push(st);
+  ensureOrigin(p);
+  touchProject(p); save();
+  return st;
+}
+
+/* The native capture screen closed: land on the plan, where the walk's
+   proposals and shots already are. */
+function onNativeCaptureClosed(banked) {
+  stopGps();
+  view.screen = 'project'; view.tab = 'plan';
+  if (ui.plan) ui.plan.fitted = false;
+  if (window.refreshStorage) refreshStorage();
+  toast(banked ? banked + ' frame' + (banked === 1 ? '' : 's') + ' banked and placed. Review the proposals.'
+               : 'Walk recorded \u2014 the proposals are on the plan.');
   render();
 }
 
@@ -5217,6 +5260,7 @@ function handle(el, e) {
     case 'rec-photos': {
       db.settings.recordPhotos = el.dataset.v || 'all';
       save();
+      if (window.EENative && EENative.sendPrefs) EENative.sendPrefs();
       return render();
     }
     case 'auto-cap': {
@@ -5449,11 +5493,21 @@ function saveSettings() {
   var pl = EE.toM(parseFloat(($('#set-phl') || {}).value), s.unit);
   if (pw > 0.02 && pw < 0.3) s.phoneW = pw;
   if (pl > 0.02 && pl < 0.4) s.phoneL = pl;
-  save(); ui.sheet = null; toast('Settings saved'); render();
+  save(); ui.sheet = null; toast('Settings saved');
+  if (window.EENative && EENative.sendPrefs) EENative.sendPrefs();
+  render();
 }
 
 /* ---------- capture ---------- */
 function openCapture() {
+  /* In the shell the capture screen is native: the AR view, the recorder and
+     the shutter live in Swift, the proposals are drawn in the scene, and this
+     page only receives finished shots. */
+  if (window.EENative && EENative.active && EENative.openCapture) {
+    startGps();
+    EENative.openCapture();
+    return;
+  }
   ui.cap = { stream: null, ready: false, err: null };
   view.screen = 'capture';
   startGps();

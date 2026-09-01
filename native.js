@@ -131,6 +131,9 @@
       proposeTimer = setTimeout(function () {
         proposeTimer = 0;
         try { proposeFromPlanes(); } catch (e) { }
+        /* the native screen may be up while the page is on another screen and
+           never renders, so proposals go across from here as well */
+        try { if (window.currentProject) N.sendProposals(currentProject()); } catch (e2) { }
       }, 1000);
     }
   };
@@ -223,6 +226,40 @@
   };
   N.setLens = function (ultraWide) { send({ cmd: 'lens', ultraWide: !!ultraWide }); };
 
+  /* ---- the native capture screen ----
+
+     The page keeps the model; the shell owns the screen. Capture opens it,
+     the shell banks frames and hands back finished stations, proposals are
+     pushed across to be drawn in the scene, and closing lands on the plan. */
+  N.openCapture = function () { send({ cmd: 'openCapture' }); };
+  N.sendPrefs = function () {
+    var s = (window.db && db.settings) || {};
+    send({ cmd: 'prefs', recordPhotos: s.recordPhotos || 'all', maxPx: s.maxPx || 1440 });
+  };
+  N.proposalsSig = '';
+  N.sendProposals = function (p, force) {
+    if (!p || !p.objects) return;
+    var items = p.objects.filter(function (o) { return o.world; }).map(function (o) {
+      var it = { id: o.id, kind: o.kind, proposed: !!o.proposed, h: o.h || 0 };
+      if (o.kind === 'rect') { it.cx = o.cx; it.cy = o.cy; it.w = o.w; it.l = o.l; it.rot = o.rot; }
+      else it.pts = (o.pts || []).map(function (q) { return { x: q.x, y: q.y }; });
+      return it;
+    });
+    var floorZ = N.floorY == null ? 0 : N.floorY;
+    var sig = JSON.stringify([floorZ, items]);
+    if (!force && sig === N.proposalsSig) return;
+    N.proposalsSig = sig;
+    send({ cmd: 'proposals', floorZ: floorZ, items: items });
+  };
+  window.__eeNativeBank = function (m, fx, w, h, sess, photoId) {
+    var pose = EE.arkitPose(m);
+    if (!pose || !window.bankNativeShot) return;
+    bankNativeShot({ pose: pose, fx: fx, w: w, h: h, sessionId: sess || N.sessionId, photoId: photoId || null });
+  };
+  window.__eeNativeCaptureClosed = function (banked) {
+    if (window.onNativeCaptureClosed) onNativeCaptureClosed(banked | 0);
+  };
+
   /* The hardware shutter — Camera Control, or either volume button. It fires
      wherever the app happens to be, so it checks that a shot is actually what
      the screen is offering rather than trusting the press. */
@@ -254,6 +291,7 @@
           document.documentElement.classList.toggle('ee-ar-live', want);
           N.preview(want);
         }
+        if (window.currentProject) { var cp = currentProject(); if (cp) N.sendProposals(cp); }
       } catch (e) { }
       return r;
     };
@@ -265,4 +303,5 @@
   send({ cmd: 'ready' });
   /* the page's lens preference, before any capture can have happened */
   N.setLens(!!(window.db && db.settings && db.settings.arUltraWide));
+  N.sendPrefs();
 })();

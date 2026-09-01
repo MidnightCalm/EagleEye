@@ -50,6 +50,16 @@ final class SurveyViewController: UIViewController {
     /// restart moves the world origin, and a survey in progress must not.
     private var preferUltraWide = false
     private var capturedAny = false
+
+    /// The native capture screen, while it is up. It borrows the AR view and
+    /// gives it back on dismissal.
+    private var captureVC: CaptureViewController?
+    /// A deliberate shutter press on that screen, served from the next frame.
+    private var pendingBank = false
+    /// The page's recording preferences, mirrored so the native recorder
+    /// behaves exactly as the page's did.
+    private var recordPhotos = "all"
+    private var maxPxPref = 1440
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     /// Pose pushes per second. 30 is smooth for an overlay and leaves the web
@@ -220,6 +230,48 @@ final class SurveyViewController: UIViewController {
         return (data.base64EncodedString(), data, Int(size.width), Int(size.height))
     }
 
+    /// A frame banked by the native screen: saved to disk, then handed to the
+    /// page as a finished station — pose, intrinsics, file name — with no
+    /// image crossing the bridge at all.
+    private func bankFrame(_ frame: ARFrame, maxPx: Int) {
+        let m = frame.camera.transform.jsArray
+        let k = frame.camera.intrinsics
+        let captureLong = max(frame.camera.imageResolution.width, frame.camera.imageResolution.height)
+        guard let shot = portraitJPEG(from: frame.capturedImage, maxPx: maxPx) else { return }
+        let fx = Double(k.columns.0.x) * Double(max(shot.width, shot.height)) / Double(captureLong)
+        let photoId = savePhoto(shot.data, id: "b" + String(UUID().uuidString.prefix(12)))
+        capturedAny = true
+        evaluate("window.__eeNativeBank && window.__eeNativeBank("
+                 + "\(m), \(fx), \(shot.width), \(shot.height), "
+                 + "\(sessionId.jsQuoted), \(photoId.jsQuoted));")
+    }
+
+    // MARK: - the native capture screen
+
+    private func presentCapture() {
+        guard arkitEnabled, captureVC == nil else { return }
+        arView.removeFromSuperview()
+        let vc = CaptureViewController(arView: arView)
+        vc.prefs = CaptureViewController.Prefs(recordPhotos: recordPhotos, maxPx: maxPxPref)
+        vc.onShutter = { [weak self] in self?.pendingBank = true }
+        vc.onClose = { [weak self] banked in self?.dismissCapture(banked: banked) }
+        captureVC = vc
+        present(vc, animated: true)
+    }
+
+    private func dismissCapture(banked: Int) {
+        guard let vc = captureVC else { return }
+        vc.dismiss(animated: true) { [weak self] in
+            guard let self = self else { return }
+            self.arView.removeFromSuperview()
+            self.arView.frame = self.view.bounds
+            self.arView.isHidden = true
+            self.view.insertSubview(self.arView, at: 0)
+            self.captureVC = nil
+            self.evaluate("window.__eeNativeCaptureClosed && window.__eeNativeCaptureClosed(\(banked));")
+        }
+    }
+
     /// Photographs live in the app's Documents directory as ordinary files —
     /// backed up, unlimited but for the device, and readable by the scheme
     /// handler below. Returns the name the page should remember, or "" if the
@@ -270,6 +322,16 @@ extension SurveyViewController: ARSessionDelegate {
                 evaluate("window.__eeNativeFrame && window.__eeNativeFrame("
                          + "\(req.id.jsQuoted), \(shot.b64.jsQuoted), \(m), \(fx), "
                          + "\(shot.width), \(shot.height), \(sessionId.jsQuoted), \(photoId.jsQuoted));")
+            }
+        }
+
+        if let vc = captureVC {
+            let word = trackingWord(frame.camera.trackingState)
+            let wantAuto = vc.tick(frame: frame, tracking: word, surfaces: planeLastSent.count)
+            if wantAuto || pendingBank {
+                pendingBank = false
+                bankFrame(frame, maxPx: maxPxPref)
+                vc.noteBanked()
             }
         }
 
@@ -361,6 +423,16 @@ extension SurveyViewController: WKScriptMessageHandler {
                 let maxPx = (body["maxPx"] as? Int) ?? 1440
                 pendingCaptures.append((id: id, maxPx: maxPx))
             }
+        case "openCapture":
+            presentCapture()
+        case "prefs":
+            recordPhotos = (body["recordPhotos"] as? String) ?? "all"
+            maxPxPref = (body["maxPx"] as? Int) ?? 1440
+            captureVC?.prefs = CaptureViewController.Prefs(recordPhotos: recordPhotos, maxPx: maxPxPref)
+        case "proposals":
+            let items = (body["items"] as? [[String: Any]]) ?? []
+            let floorZ = (body["floorZ"] as? Double) ?? 0
+            captureVC?.setProposals(items, floorZ: floorZ)
         case "lens":
             // Honoured only before the first capture of a session: switching
             // the tracked camera restarts tracking and moves the world origin,
@@ -382,7 +454,9 @@ extension SurveyViewController: WKScriptMessageHandler {
             // everywhere else the page paints its own ground and the AR view is
             // wasted power behind it.
             let on = (body["on"] as? Bool) ?? false
-            DispatchQueue.main.async { self.arView?.isHidden = !on }
+            DispatchQueue.main.async {
+                if self.captureVC == nil { self.arView?.isHidden = !on }
+            }
         default:
             break
         }
