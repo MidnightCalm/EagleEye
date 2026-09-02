@@ -60,6 +60,12 @@ final class SurveyViewController: UIViewController {
     /// behaves exactly as the page's did.
     private var recordPhotos = "all"
     private var maxPxPref = 1440
+
+    /// The running configuration, kept so the capture screen can switch mesh
+    /// reconstruction on and off WITHOUT resetting tracking: re-running the
+    /// session with a changed configuration and no reset options keeps the
+    /// world origin where it is.
+    private var currentConfig: ARWorldTrackingConfiguration?
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     /// Pose pushes per second. 30 is smooth for an overlay and leaves the web
@@ -175,6 +181,7 @@ final class SurveyViewController: UIViewController {
             cfg.videoFormat = uw
         }
         session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
+        currentConfig = cfg
         capturedAny = false
 
         let active = cfg.videoFormat
@@ -248,10 +255,25 @@ final class SurveyViewController: UIViewController {
 
     // MARK: - the native capture screen
 
+    /// The LiDAR mesh is heavy — thermal load in direct sun is real — so it runs
+    /// only while the capture screen is up, and switching it on or off keeps
+    /// tracking and the world origin intact.
+    private var meshSupported: Bool {
+        ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification)
+    }
+
+    private func setMeshReconstruction(_ on: Bool) {
+        guard let cfg = currentConfig, meshSupported else { return }
+        cfg.sceneReconstruction = on ? .meshWithClassification : []
+        session.run(cfg)
+    }
+
     private func presentCapture() {
         guard arkitEnabled, captureVC == nil else { return }
         arView.removeFromSuperview()
         let vc = CaptureViewController(arView: arView)
+        vc.meshAvailable = meshSupported
+        setMeshReconstruction(true)
         vc.prefs = CaptureViewController.Prefs(recordPhotos: recordPhotos, maxPx: maxPxPref)
         vc.onShutter = { [weak self] in self?.pendingBank = true }
         vc.onClose = { [weak self] banked in self?.dismissCapture(banked: banked) }
@@ -263,6 +285,8 @@ final class SurveyViewController: UIViewController {
         guard let vc = captureVC else { return }
         vc.dismiss(animated: true) { [weak self] in
             guard let self = self else { return }
+            self.setMeshReconstruction(false)
+            self.arView.delegate = nil
             self.arView.removeFromSuperview()
             self.arView.frame = self.view.bounds
             self.arView.isHidden = true

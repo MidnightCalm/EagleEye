@@ -199,6 +199,17 @@ The page keeps the model: it receives finished stations (pose, intrinsics, file 
 no image ever crosses the bridge), computes proposals from the plane stream, and pushes
 them back to be drawn. Closing the screen lands on the plan.
 
+**The see-through** (1.35.0): a pill on the capture screen cycles what ARKit sees,
+drawn as it sees it. *Surfaces* — every plane anchor as a translucent fill the instant
+it is found (deck faint, unit tops purple, walls gold) plus the feature-point cloud
+wherever ARKit has visual lock. *Mesh* — on LiDAR phones, the reconstructed geometry
+as a live wireframe, which is what tells a unit apart from a flat plane in front of
+it: a captured unit shows its sides. *Hidden* — camera and proposals only. Sparse
+dots or missing mesh over something is the honest signal that nothing has been
+captured there yet — move closer, slower, or accept that it is beyond LiDAR's reach
+in sun. Mesh reconstruction runs only while the screen is up, switched on and off
+without resetting tracking.
+
 Division of labour from here: screens where the bridge serves worst go native first;
 `geo.js` stays the geometry engine; the web view keeps plan, list, sheets and export
 until each is worth porting.

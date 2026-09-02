@@ -34,6 +34,32 @@ final class CaptureViewController: UIViewController {
     let arView: ARSCNView
     private let proposalsNode = SCNNode()
 
+    // MARK: - the see-through
+
+    /// What ARKit sees, drawn as it sees it. Three layers, cycled by one pill:
+    ///   SURFACES  every plane anchor as a translucent fill the instant ARKit
+    ///             finds it, plus the feature-point cloud wherever it has
+    ///             visual lock — before the page has processed anything;
+    ///   MESH      on LiDAR phones, the reconstructed geometry as a wireframe,
+    ///             which is what tells a unit apart from a flat plane in front
+    ///             of it: a captured unit shows its sides;
+    ///   HIDDEN    just the camera and the proposals.
+    /// Sparse dots or missing mesh over something is the honest signal that
+    /// nothing has been captured there yet.
+    enum SeeMode { case surfaces, mesh, hidden }
+    private(set) var seeMode: SeeMode = .surfaces
+    /// Set by the host before presenting: whether this phone reconstructs a mesh.
+    var meshAvailable = false
+    /// The deck height the page has settled on, so the deck's own plane can be
+    /// drawn faintly rather than shouting like a unit top.
+    private var floorZ: Double = 0
+    private var floorKnown = false
+
+    private let pointsNode = SCNNode()
+    private var pointsAt: TimeInterval = 0
+    private var meshFaces = 0
+    private let seeButton = UIButton(type: .system)
+
     private(set) var recording = false
     private(set) var banked = 0
     private(set) var walked: Float = 0
@@ -88,6 +114,8 @@ final class CaptureViewController: UIViewController {
         arView.isHidden = false
         view.addSubview(arView)
         arView.scene.rootNode.addChildNode(proposalsNode)
+        arView.scene.rootNode.addChildNode(pointsNode)
+        arView.delegate = self
 
         buildHUD()
 
@@ -124,6 +152,13 @@ final class CaptureViewController: UIViewController {
             walked += simd_distance(simd_float2(pos.x, pos.z), simd_float2(lp.x, lp.z))
         }
         lastTickPos = pos
+
+        // the dot cloud, ten times a second — enough to read, cheap to build
+        let nowPts = CACurrentMediaTime()
+        if seeMode != .hidden, nowPts - pointsAt > 0.1 {
+            pointsAt = nowPts
+            updatePoints(frame.rawFeaturePoints?.points ?? [])
+        }
 
         defer { refreshHUD() }
 
@@ -162,6 +197,9 @@ final class CaptureViewController: UIViewController {
     /// on the deck and a line loop at its edge. ARKit's world is x east, y up,
     /// z south, so app (x, y, z) lands at scene (x, z, -y).
     func setProposals(_ items: [[String: Any]], floorZ: Double) {
+        self.floorZ = floorZ
+        floorKnown = true
+        recolorPlanes()
         proposalsNode.childNodes.forEach { $0.removeFromParentNode() }
         var nProposed = 0
         for it in items {
@@ -211,6 +249,16 @@ final class CaptureViewController: UIViewController {
         onShutter?()
     }
 
+    @objc private func seeTapped() {
+        switch seeMode {
+        case .surfaces: seeMode = meshAvailable ? .mesh : .hidden
+        case .mesh: seeMode = .hidden
+        case .hidden: seeMode = .surfaces
+        }
+        applySeeMode()
+        refreshHUD()
+    }
+
     @objc private func recordTapped() {
         recording.toggle()
         lastBankPos = nil
@@ -232,6 +280,12 @@ final class CaptureViewController: UIViewController {
 
         surfacesValue.text = "\(surfaces)"
         proposedValue.text = "\(proposed)"
+
+        switch seeMode {
+        case .surfaces: seeButton.setTitle("◈ Surfaces", for: .normal)
+        case .mesh: seeButton.setTitle("◈ Mesh · \(meshFaces) faces", for: .normal)
+        case .hidden: seeButton.setTitle("◇ Hidden", for: .normal)
+        }
         walkedValue.text = "\(Int(walked.rounded())) m"
 
         shutterButton.isEnabled = trackingNormal
@@ -276,6 +330,15 @@ final class CaptureViewController: UIViewController {
         trackingChip.layer.borderWidth = 1
         trackingChip.clipsToBounds = true
         trackingChip.insets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+
+        seeButton.titleLabel?.font = mono
+        seeButton.setTitleColor(Palette.ink2, for: .normal)
+        seeButton.backgroundColor = Palette.chip
+        seeButton.layer.cornerRadius = 12
+        seeButton.layer.borderWidth = 1
+        seeButton.layer.borderColor = Palette.line.cgColor
+        seeButton.contentEdgeInsets = UIEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+        seeButton.addTarget(self, action: #selector(seeTapped), for: .touchUpInside)
 
         closeButton.setTitle("✕", for: .normal)
         closeButton.titleLabel?.font = UIFont.systemFont(ofSize: 20)
@@ -339,7 +402,8 @@ final class CaptureViewController: UIViewController {
         column.spacing = 12
         column.alignment = .center
 
-        [trackingChip, closeButton, foot, column, shutterInner].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        [trackingChip, seeButton, closeButton, foot, column, shutterInner].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        view.addSubview(seeButton)
         stats.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(trackingChip)
         view.addSubview(closeButton)
@@ -350,6 +414,9 @@ final class CaptureViewController: UIViewController {
         NSLayoutConstraint.activate([
             trackingChip.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
             trackingChip.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 14),
+
+            seeButton.topAnchor.constraint(equalTo: trackingChip.bottomAnchor, constant: 8),
+            seeButton.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 14),
 
             closeButton.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
             closeButton.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -14),
@@ -419,6 +486,106 @@ final class CaptureViewController: UIViewController {
         return m
     }
 
+    // MARK: - the see-through, drawn
+
+    private static let planeFillName = "ee-plane-fill"
+    private static let planeEdgeName = "ee-plane-edge"
+    private static let meshName = "ee-mesh"
+
+    private func updatePoints(_ pts: [simd_float3]) {
+        pointsNode.childNodes.forEach { $0.removeFromParentNode() }
+        guard !pts.isEmpty else { return }
+        let verts = pts.map { SCNVector3($0.x, $0.y, $0.z) }
+        let element = SCNGeometryElement(indices: (0..<Int32(verts.count)).map { $0 }, primitiveType: .point)
+        element.pointSize = 4
+        element.minimumPointScreenSpaceRadius = 2
+        element.maximumPointScreenSpaceRadius = 4
+        let geometry = SCNGeometry(sources: [SCNGeometrySource(vertices: verts)], elements: [element])
+        let m = SCNMaterial()
+        m.diffuse.contents = Palette.purple.withAlphaComponent(0.85)
+        m.lightingModel = .constant
+        m.writesToDepthBuffer = false
+        geometry.materials = [m]
+        pointsNode.addChildNode(SCNNode(geometry: geometry))
+    }
+
+    /// A plane's colour says what it is: the deck faint, a unit top purple, a
+    /// wall gold. Before the page has settled on a deck, every horizontal plane
+    /// is a candidate and reads purple.
+    private func planeColor(_ plane: ARPlaneAnchor) -> UIColor {
+        if plane.alignment == .vertical { return Palette.gold }
+        let y = Double(plane.transform.columns.3.y)
+        if floorKnown && abs(y - floorZ) < 0.2 { return Palette.ink }
+        if plane.classification == .floor { return Palette.ink }
+        return Palette.purple
+    }
+
+    private func style(fill: SCNNode, edge: SCNNode, for plane: ARPlaneAnchor) {
+        let c = planeColor(plane)
+        let isDeck = (c == Palette.ink)
+        if let g = fill.geometry {
+            let m = SCNMaterial()
+            m.diffuse.contents = c.withAlphaComponent(isDeck ? 0.06 : 0.18)
+            m.lightingModel = .constant
+            m.isDoubleSided = true
+            m.writesToDepthBuffer = false
+            g.materials = [m]
+        }
+        if let g = edge.geometry {
+            let m = SCNMaterial()
+            m.diffuse.contents = c.withAlphaComponent(isDeck ? 0.25 : 0.9)
+            m.lightingModel = .constant
+            m.fillMode = .lines
+            m.isDoubleSided = true
+            m.writesToDepthBuffer = false
+            g.materials = [m]
+        }
+    }
+
+    private func recolorPlanes() {
+        arView.scene.rootNode.enumerateChildNodes { node, _ in
+            guard let fill = node.childNode(withName: Self.planeFillName, recursively: false),
+                  let edge = node.childNode(withName: Self.planeEdgeName, recursively: false),
+                  let plane = self.arView.anchor(for: node) as? ARPlaneAnchor else { return }
+            self.style(fill: fill, edge: edge, for: plane)
+        }
+    }
+
+    private func applySeeMode() {
+        let showPlanes = seeMode != .hidden
+        let showMesh = seeMode == .mesh
+        pointsNode.isHidden = !showPlanes
+        if !showPlanes { pointsNode.childNodes.forEach { $0.removeFromParentNode() } }
+        arView.scene.rootNode.enumerateChildNodes { node, _ in
+            switch node.name {
+            case Self.planeFillName, Self.planeEdgeName: node.isHidden = !showPlanes
+            case Self.meshName: node.isHidden = !showMesh
+            default: break
+            }
+        }
+    }
+
+    /// ARKit's reconstructed mesh, as SceneKit geometry: the vertex buffer and
+    /// the face buffer are handed over directly, no copying of vertices.
+    private static func meshGeometry(_ mesh: ARMeshGeometry) -> SCNGeometry {
+        let v = mesh.vertices
+        let source = SCNGeometrySource(buffer: v.buffer, vertexFormat: v.format, semantic: .vertex,
+                                       vertexCount: v.count, dataOffset: v.offset, dataStride: v.stride)
+        let f = mesh.faces
+        let data = Data(bytes: f.buffer.contents(), count: f.buffer.length)
+        let element = SCNGeometryElement(data: data, primitiveType: .triangles,
+                                         primitiveCount: f.count, bytesPerIndex: f.bytesPerIndex)
+        let geometry = SCNGeometry(sources: [source], elements: [element])
+        let m = SCNMaterial()
+        m.diffuse.contents = Palette.ink.withAlphaComponent(0.45)
+        m.lightingModel = .constant
+        m.fillMode = .lines
+        m.isDoubleSided = true
+        m.writesToDepthBuffer = false
+        geometry.materials = [m]
+        return geometry
+    }
+
     private static func angleDeg(_ a: simd_quatf, _ b: simd_quatf) -> Float {
         let d = min(1, abs(simd_dot(a.vector, b.vector)))
         return acos(d) * 2 * 180 / .pi
@@ -429,6 +596,57 @@ final class CaptureViewController: UIViewController {
         if let i = v as? Int { return Double(i) }
         if let n = v as? NSNumber { return n.doubleValue }
         return nil
+    }
+}
+
+// MARK: - what ARKit sees, as it sees it
+
+extension CaptureViewController: ARSCNViewDelegate {
+
+    func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
+        if let plane = anchor as? ARPlaneAnchor {
+            guard let device = renderer.device,
+                  let fillGeo = ARSCNPlaneGeometry(device: device),
+                  let edgeGeo = ARSCNPlaneGeometry(device: device) else { return }
+            fillGeo.update(from: plane.geometry)
+            edgeGeo.update(from: plane.geometry)
+            let fill = SCNNode(geometry: fillGeo)
+            fill.name = Self.planeFillName
+            let edge = SCNNode(geometry: edgeGeo)
+            edge.name = Self.planeEdgeName
+            style(fill: fill, edge: edge, for: plane)
+            let hidden = (seeMode == .hidden)
+            fill.isHidden = hidden
+            edge.isHidden = hidden
+            node.addChildNode(fill)
+            node.addChildNode(edge)
+        } else if let mesh = anchor as? ARMeshAnchor {
+            let child = SCNNode(geometry: Self.meshGeometry(mesh.geometry))
+            child.name = Self.meshName
+            child.isHidden = (seeMode != .mesh)
+            node.addChildNode(child)
+            meshFaces += mesh.geometry.faces.count
+        }
+    }
+
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        if let plane = anchor as? ARPlaneAnchor {
+            if let fill = node.childNode(withName: Self.planeFillName, recursively: false),
+               let g = fill.geometry as? ARSCNPlaneGeometry { g.update(from: plane.geometry) }
+            if let edge = node.childNode(withName: Self.planeEdgeName, recursively: false),
+               let g = edge.geometry as? ARSCNPlaneGeometry { g.update(from: plane.geometry) }
+        } else if let mesh = anchor as? ARMeshAnchor,
+                  let child = node.childNode(withName: Self.meshName, recursively: false) {
+            let before = (child.geometry?.elements.first?.primitiveCount) ?? 0
+            child.geometry = Self.meshGeometry(mesh.geometry)
+            meshFaces += mesh.geometry.faces.count - before
+        }
+    }
+
+    func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
+        if let mesh = anchor as? ARMeshAnchor {
+            meshFaces = max(0, meshFaces - mesh.geometry.faces.count)
+        }
     }
 }
 
